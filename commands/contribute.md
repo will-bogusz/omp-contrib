@@ -40,7 +40,7 @@ The subject is either a session transcript or a description.
 - A `.jsonl` path: read it with `read` and jq filters, not whole. Start with the user's prompts (`?q=select(.type=="message" and .message.role=="user") | .message.content[0].text&raw=true`), then failing tool calls (`?q=select(.message.role=="toolResult" and .message.isError) | {toolName: .message.toolName, text: .message.content[0].text[0:400]}`), then the assistant turns around the moment things went wrong. The `omp` version is in each line's `runtime.version`.
 - A description: ask for the session only if a reproduction needs it; otherwise find the code path from the description.
 
-Then state in two sentences what omp did, what it should have done, and the evidence. From here the skill's invariants hold: the duplicate scan comes first, the fix is made in a worktree on `<branch_prefix><topic>` (never in the user's checkout), reproduced on `origin/main` before and passing after, reviewed once by an independent reviewer, checked with `precheck`, and queued with `pr-queue add`. Ask the user for the own-words sentence when the body is drafted; never write one for them. If the subject turns out to be expected behaviour, a duplicate of an open PR or issue, or not omp's code, say so with the evidence and stop.
+Then state in two sentences what omp did, what it should have done, and the evidence, and run the skill's *Fixing something omp did wrong* chain from its first step, the duplicate scan, before reading code for a fix. If the subject turns out to be expected behaviour, a duplicate of an open PR or issue, or not omp's code, say so with the evidence and stop.
 
 ## Hunt
 

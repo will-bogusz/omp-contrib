@@ -8,6 +8,12 @@ An [omp](https://github.com/can1357/oh-my-pi) plugin that turns something omp go
 omp plugin install github:will-bogusz/omp-contrib
 ```
 
+While the repository is private, `github:` cannot fetch it (bun downloads an unauthenticated tarball); with collaborator access, install over SSH instead:
+
+```sh
+omp plugin install git+ssh://git@github.com/will-bogusz/omp-contrib.git
+```
+
 Then, in omp:
 
 ```
@@ -26,7 +32,7 @@ Each item is proposed and needs your approval first.
 | What | Where |
 |---|---|
 | Config: your choices and the reason for each | `~/.config/omp-contrib/config.toml` (`$OMP_CONTRIB_CONFIG`; `%APPDATA%` on Windows) |
-| Caches: gh login, roboomp tier, poll state, GitHub cost log | `~/.cache/omp-contrib/` |
+| Caches: gh login, roboomp tier, poll state, GitHub cost log, reviewer routing log | `~/.cache/omp-contrib/` |
 | Missing tools, through your package manager: `gh`, `bun`, `uv`, Python ≥ 3.11; optional `ffmpeg`, `pngquant`, `oxipng`, rustup + `cargo-xwin` | system |
 | An oh-my-pi clone if you have none; a fork on GitHub (`gh repo fork`) and a `fork` remote | your clone, your GitHub account |
 | The queue branch `omp-queue` on your fork | your fork |
@@ -37,9 +43,13 @@ Each item is proposed and needs your approval first.
 
 Builds run on this machine by default. Platforms it can't build go to an ssh host you name, GitHub Actions on your fork, or none (then the PR says that platform is unchecked).
 
+## Which model to drive it with
+
+Measured end to end (intake, duplicate scan, worktree fix, before/after repro, one independent review, precheck, queue): Claude Opus 5.5 and GPT-6.1 Sol complete the flow; Haiku 5.5 fixes the bug in a worktree but stops before review and queueing. Drive it with a frontier model; a small model is fine as the reviewer or for behaviour checks.
+
 ## What it does not install
 
-No subagent profiles, so omp's bundled `reviewer` stays yours. It adds an extension that moves that reviewer to a model family other than your session's. It adds no always-on rules: `omp-pr-authoring` loads only when the skill asks for it. It installs no background services unless you enable the watcher. It never posts to a human (a maintainer, an issue, a discussion) without your approval of the exact text.
+No subagent profiles, so omp's bundled `reviewer` stays yours. It adds two extensions: one moves that reviewer to a model family other than your session's; the other, only in a session working on a contribution (`/contribute`, or once the agent reads the skill), refuses edits in your oh-my-pi checkout itself and points the agent to a worktree; other sessions are never blocked. It adds no always-on rules: `omp-pr-authoring` loads only when the skill asks for it. It installs no background services unless you enable the watcher. It never posts to a human (a maintainer, an issue, a discussion) without your approval of the exact text.
 
 ## Uninstall
 

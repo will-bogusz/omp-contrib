@@ -285,6 +285,23 @@ class QueueTest(unittest.TestCase):
         p_tip = sh(self.sim.work, "git", "rev-parse", "octo-fork/p").stdout.strip()
         self.assertEqual(self.manifest()["c"]["base"], p_tip, "base is the parent's tip")
 
+    def test_a_local_manifest_is_a_dry_run(self):
+        # A verification run's `add … --manifest F` (flag after the command) pushed its branch to the
+        # fork, and it offered `open … --manifest F`, which would open a real PR from a dry run.
+        self.sim.branch("octo-fork/dry", line=3, text="D3", push=False)
+        manifest = os.path.join(self.dir, "dry.json")
+        code, out = self.run_pq("add", "octo-fork/dry", "--title", "fix(a): dry", "--body", self.body,
+                                "--manifest", manifest)
+        self.assertEqual(code, 0, out)
+        with open(manifest) as f:
+            self.assertIn("dry", {e["id"] for e in json.load(f)["entries"]})
+        pushed = sh(self.sim.work, "git", "ls-remote", "fork", "refs/heads/octo-fork/dry").stdout
+        self.assertEqual(pushed, "", "a dry run never pushes its branch")
+        for argv in (["open", "dry", "--user-approved"], ["requeue", "101"]):
+            code, out = self.run_pq("--manifest", manifest, *argv)
+            self.assertEqual(code, 1, out)
+            self.assertIn("refused with --manifest", out)
+
     def test_a_child_is_judged_against_main_with_its_open_need_merged_in(self):
         # inflight-epoch (2026-10-14) sits on open #15762 and edits next to it: against main alone
         # its own commits "conflicted" with #15762's lines, though main + #15762 + it merges clean.

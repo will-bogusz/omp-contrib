@@ -69,4 +69,5 @@ reoffer = true                        # false: the choice holds regardless; doct
 
 Python: `import omp_config; cfg = omp_config.load()` (see the module docstring for the API).
 TypeScript (extension, charts): `charts/lib/config.mjs`.
-Change a value by editing the file or rerunning `/contribute setup`; `scripts/doctor` validates it.
+Change a value with `scripts/doctor --set KEY VALUE` (validated, keeps the file's other lines), by
+editing the file, or by rerunning `/contribute setup`; `scripts/doctor` validates it.

@@ -18,6 +18,13 @@ reviewer of another model family than the session's (the plugin's reviewer-famil
    one resolves `@oh-my-pi/*`, the natives addon included, to that checkout: a live run skips our
    change in any other package, an addon copied into `<worktree>/packages/natives/native/` is
    ignored, and a Rust change's live check tests `main`.
+   `bun run prepare` only generates the export viewer's tool views; the natives addon
+   (`packages/natives/native/pi_natives.<platform>.node`) is gitignored, so a fresh worktree has
+   none and anything loading `@oh-my-pi/pi-natives` fails. Copy the checkout's built addon into
+   `<worktree>/packages/natives/native/` (a copy, never a symlink: the checkout's file changes
+   under you on its next build). A workspace load skips the version check, but an addon older
+   than the worktree's JS fails on a missing export ("export `X` is missing … rebuild it"): then,
+   and for any change in Rust, build it in the worktree with `bun run build:native`.
    Conventional commits scoped to the package (`fix(catalog):`, `feat(ai,catalog):`), each with
    its tests and changelog line. A commit message names other work as "PR N" or by title,
    never `#N`, since each fork push of a commit naming `#N` lands on that upstream PR's timeline
@@ -68,11 +75,13 @@ reviewer of another model family than the session's (the plugin's reviewer-famil
     Accepted cost: in one round the maintainer's only code fixups landed on the two PRs whose last
     fixes went out unreviewed (#14751, #14754), and 9 of 36 later re-reviews had caught a
     regression introduced by a fix.
-  - **Check the reviewer's family.** The extension's note does not reach you when the reviewer
-    runs in the background; the job result carries only `resolvedModel`. After the reviewer
-    returns, compare the family of its `resolvedModel` with the session model's. If they are the
-    same family (only one family available, or no override applied), the review still counts, and
-    the PR's Testing section says the independent review was same-family.
+  - **Check the reviewer's family.** The extension's note shows in the task UI only; a background
+    reviewer's result reaches you without it or the resolved model. The extension appends each
+    decision to `~/.cache/omp-contrib/reviewer-routes.jsonl` (`$XDG_CACHE_HOME`; `%LOCALAPPDATA%`
+    on Windows): after the reviewer returns, read the line written when you spawned it (`at`,
+    `session`, `model`, `note`). A `same-family review` note (only one family available), or no
+    line at all (the extension did not run), means the review still counts and the PR's Testing
+    section says the independent review was same-family.
 4. **Write the body, then queue it.** Derive the body from [framing.md](framing.md), read whole:
    its rules, *Visuals* and the own-words sentence. **Ask the user for the own-words sentence**
    (framing.md, *The own-words sentence*): upstream's `AGENTS.md` says never to generate a

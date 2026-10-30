@@ -1,6 +1,6 @@
 ---
 name: omp-contrib
-description: Fixing or changing oh-my-pi (omp) upstream as a PR on can1357/oh-my-pi. Use when omp did something wrong ("omp did X wrong", "the edit tool broke", "is this an omp bug?"), when asked to fix something upstream or turn a session .jsonl into a fix, and for any oh-my-pi PR or issue work (status, bot reviews, change requests, the queue).
+description: MUST read first whenever the user reports something omp (oh-my-pi) does wrong or asks to fix omp ("omp did X wrong", "omp keeps …", "the edit tool broke", "is this an omp bug?", "fix it upstream"), including when the session is inside an oh-my-pi checkout; such fixes land as reviewed PRs on can1357/oh-my-pi through this skill, never as direct edits to the checkout. Also for turning a session .jsonl into a fix and for any oh-my-pi PR or issue work (status, bot reviews, change requests, the queue).
 ---
 
 # Contributing to can1357/oh-my-pi
@@ -25,6 +25,10 @@ This file routes: open the reference for the phase you are in. Each rule's sourc
 - The duplicate scan comes first, before any fix, body or issue.
 - Work on oh-my-pi worth keeping becomes a PR on can1357/oh-my-pi; nothing is carried locally,
   and a fix we can make is never filed as an issue, before or after.
+- A request to fix something upstream (`/contribute`, "fix it upstream") is the user asking for
+  commits: commit on `<branch_prefix><topic>` in its worktree, which `review-stamp`, `precheck` and
+  `pr-queue add` all read. That ask satisfies upstream `AGENTS.md`'s "never commit unless asked";
+  never commit in the user's checkout (`paths.checkout`).
 - Never tag Codex, request reviews, or bump a stalled PR. A P2's maintainer decision rides on its
   PR (the body names it, our answer to roboomp's question argues it): report the PR to the user
   as waiting on a maintainer round. Draft a message to a maintainer only when the user asks or
@@ -53,10 +57,11 @@ This file routes: open the reference for the phase you are in. Each rule's sourc
   [references/review-brief.md](references/review-brief.md) (what `main` did on every path the diff
   touches), stamped with `scripts/review-stamp`. The reviewer is omp's bundled `reviewer` agent
   (pinned to `@slow`); the plugin's reviewer-family extension moves it to another model family
-  when `@slow` is the session's own (or `models.reviewer` is set). After it returns, compare the
-  family of the job's `resolvedModel` with the session's: same family → the PR's Testing section
-  says the review was same-family. One round per PR, total: its fixes, bot fixes and
-  change-request fixes are not reviewed again.
+  when `@slow` is the session's own (or `models.reviewer` is set). After it returns, read its
+  routing line in `~/.cache/omp-contrib/reviewer-routes.jsonl` (workflow.md step 3): same family →
+  the PR's Testing section says the review was same-family. One round per PR, total: its fixes,
+  bot fixes and change-request fixes are not reviewed again, so never spawn a second reviewer to
+  confirm them.
 - The opener waits for the bots and settles every finding, review-body note included, before
   reporting done; once Codex has reviewed a PR, every agent that pushes to it waits for Codex's
   review of that push. Before a PR goes to the maintainer we aim for a clean Codex pass on its
@@ -73,6 +78,24 @@ This file routes: open the reference for the phase you are in. Each rule's sourc
 - While writing a body, each idea a figure would show better than its text or table gets that
   figure in the same draft; text needs no stated reason. Writing the body is workflow step 4;
   the form is framing.md's *Visuals*.
+
+## Fixing something omp did wrong
+
+One chain, whether the ask came as `/contribute` or as a plain "can you fix it upstream?", run
+in order (each step's reference is under *Phases*):
+
+1. Duplicate scan, before reading code for a fix. A merged fix, an open PR, expected behaviour or
+   code outside omp ends the chain: report it with the evidence.
+2. Worktree `<paths.worktrees>/<topic>` on `<github.branch_prefix><topic>` from `origin/main`
+   (workflow step 2); never edit the user's checkout.
+3. Reproduce on `origin/main`, fix, show it passing, commit.
+4. One `reviewer` with review-brief.md as its brief; `review-stamp` its verdict; fix its findings.
+5. Body (framing.md), `precheck`, `pr-queue add`.
+6. Ask the user for the own-words sentence; stop before `pr-queue open` while supervised opens
+   remain.
+
+Where pushing is not allowed, the chain still runs to `pr-queue --manifest <file> add … --no-push`:
+only the push and `open` wait.
 
 ## Phases
 

@@ -110,8 +110,8 @@ usage: pr-queue [--repo DIR] [--manifest FILE] COMMAND ...
 
 The manifest is `queue.json` on the fork's queue branch (`github.queue_branch`; bodies under `bodies/`), read and
 written by every host with the fork remote; --manifest FILE keeps it in a local file instead (dry
-runs). Every write renders QUEUE.md beside it in the same commit, its groups from the last cached
-plan. Reference: references/queue.md.
+runs: no branch is pushed, and `open` and `requeue` refuse). Every write renders QUEUE.md beside it
+in the same commit, its groups from the last cached plan. Reference: references/queue.md.
 """
 import argparse
 import datetime
@@ -1520,9 +1520,18 @@ def main(argv, github=None):
     parser.add_argument("--repo", default=CHECKOUT)
     parser.add_argument("--manifest", help="a local manifest file instead of the fork's queue branch")
     sub = parser.add_subparsers(dest="command", required=True)
-    p = sub.add_parser("sync")
+    # --repo and --manifest also work after the command (`add B --manifest F`); SUPPRESS keeps the
+    # value given before the command when they are not repeated after it.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--repo", default=argparse.SUPPRESS)
+    common.add_argument("--manifest", default=argparse.SUPPRESS)
+
+    def command(name):
+        return sub.add_parser(name, parents=[common])
+
+    p = command("sync")
     p.add_argument("--no-fetch", action="store_true")
-    p = sub.add_parser("add")
+    p = command("add")
     p.add_argument("branch")
     p.add_argument("--title", required=True)
     p.add_argument("--area")
@@ -1533,7 +1542,7 @@ def main(argv, github=None):
     p.add_argument("--id")
     p.add_argument("--p2-decision")
     p.add_argument("--no-push", action="store_true")
-    p = sub.add_parser("set")
+    p = command("set")
     p.add_argument("key")
     for field in ("title", "area", "priority", "body", "base", "state", "note", "pr", "branch"):
         p.add_argument(f"--{field}")
@@ -1543,45 +1552,55 @@ def main(argv, github=None):
     p.add_argument("--unhold", action="store_true")
     p.add_argument("--p2-decision")
     p.add_argument("--no-p2-decision", action="store_true")
-    p = sub.add_parser("approve")
+    p = command("approve")
     p.add_argument("key")
-    p = sub.add_parser("built")
+    p = command("built")
     p.add_argument("key")
     p.add_argument("others", nargs="+", metavar="with")
     p.add_argument("--no-fetch", action="store_true")
-    p = sub.add_parser("tree")
+    p = command("tree")
     p.add_argument("sha", nargs="?")
     p.add_argument("--record", action="store_true")
     p.add_argument("--rust", action="store_true")
     p.add_argument("--no-fetch", action="store_true")
-    p = sub.add_parser("show")
+    p = command("show")
     p.add_argument("key", nargs="?")
     p.add_argument("--json", action="store_true")
-    p = sub.add_parser("body-home")
+    p = command("body-home")
     p.add_argument("number")
-    p = sub.add_parser("advance")
+    p = command("advance")
     p.add_argument("keys", nargs="*")
     p.add_argument("--no-push", action="store_true")
     p.add_argument("--no-fetch", action="store_true")
     for name in ("plan", "audit"):
-        p = sub.add_parser(name)
+        p = command(name)
         p.add_argument("--json", action="store_true")
         p.add_argument("--no-fetch", action="store_true")
-    p = sub.add_parser("open")
+    p = command("open")
     p.add_argument("key")
     p.add_argument("--user-approved", action="store_true")
     p.add_argument("--no-fetch", action="store_true")
-    p = sub.add_parser("pause")
+    p = command("pause")
     p.add_argument("reason")
-    sub.add_parser("unpause")
-    p = sub.add_parser("requeue")
+    command("unpause")
+    p = command("requeue")
     p.add_argument("number")
     p.add_argument("--needs", nargs="*")
     p.add_argument("--base")
     p.add_argument("--no-fetch", action="store_true")
-    p = sub.add_parser("watch")
+    p = command("watch")
     p.add_argument("--no-fetch", action="store_true")
     args = parser.parse_args(argv)
+    if args.manifest:
+        # A local manifest is a dry run (queue.md): its entries never reach the fork or GitHub. One
+        # verification run's `add --manifest` pushed its branch to the fork, and its report offered
+        # `open … --manifest`, which would have opened a real PR from the dry run's queue.
+        if args.command in ("open", "requeue"):
+            print(f"pr-queue {args.command}: refused with --manifest, a dry run's local queue; "
+                  "queue the branch on the fork's queue (no --manifest) to open it", file=sys.stderr)
+            sys.exit(1)
+        if hasattr(args, "no_push"):
+            args.no_push = True
     repo = os.path.abspath(os.path.expanduser(args.repo))
     store = Store(repo, os.path.abspath(args.manifest) if args.manifest else None)
     gh = github or GitHub()

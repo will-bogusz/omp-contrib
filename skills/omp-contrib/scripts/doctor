@@ -3,6 +3,7 @@
 
 usage: doctor [--json] [--probe-hosts] [--area AREA ...]
        doctor --fix AREA [--dry-run]
+       doctor [--set KEY VALUE ...] [--record DECISION VALUE REASON [--no-reoffer]]
        doctor --record-validated [--ref REF]
   --json          one JSON object: {configured, config_path, checks: [{area, id, status, detail, fix?,
                   decision?, reoffer?}], summary, ...}. status is ok | missing | degraded | unknown;
@@ -19,6 +20,13 @@ usage: doctor [--json] [--probe-hosts] [--area AREA ...]
                     omp-settings  `omp config set` the three settings below that are short
                   nothing here installs system packages: the agent proposes those to the user
   --dry-run       with --fix: print the steps, run none
+  --set KEY VALUE write one config key (e.g. `--set build.linux ci`, `--set watch.enabled false`,
+                  `--set models.behaviour a/x,b/y`); repeatable
+  --record DECISION VALUE REASON
+                  write [choices.DECISION] with value, reason and today's date; with --no-reoffer the
+                  choice holds regardless (doctor never re-offers the ideal)
+                  Both edit the config file in place, keeping its other keys and comments, and refuse a
+                  result that does not follow config.md.
   --record-validated
                   write the hashes of upstream's contribution documents at REF (default origin/main)
                   into validated.json beside this script: run after checking the skill against them
@@ -319,7 +327,7 @@ def package_hint(name, here):
     brew = {"gh": "gh", "uv": "uv", "bun": "oven-sh/bun/bun", "ffmpeg": "ffmpeg", "pngquant": "pngquant",
             "oxipng": "oxipng", "git": "git", "python3": "python@3.13", "docker": "--cask docker"}
     apt = {"gh": "gh", "ffmpeg": "ffmpeg", "pngquant": "pngquant", "git": "git", "python3": "python3",
-           "docker": "docker.io"}
+           "docker": "docker.io", "unzip": "unzip"}
     script = {"uv": "curl -LsSf https://astral.sh/uv/install.sh | sh", "bun": "curl -fsSL https://bun.sh/install | bash",
               "rustup": "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh",
               "oxipng": "cargo install --locked oxipng"}
@@ -333,6 +341,10 @@ def package_hint(name, here):
         for mgr, cmd in (("apt-get", "sudo apt-get install -y"), ("dnf", "sudo dnf install -y"), ("pacman", "sudo pacman -S")):
             if shutil.which(mgr):
                 return f"{cmd} {apt[name]}"
+    if name == "bun" and here != "windows" and not shutil.which("unzip"):  # bun's install script unpacks with unzip
+        return f"{package_hint('unzip', here)} && {script['bun']}"
+    if name == "oxipng" and not shutil.which("cargo"):
+        return f"{script['rustup']}, then: {script['oxipng']}"
     return script.get(name, f"install {name} with your package manager")
 
 
@@ -412,6 +424,20 @@ class Doctor:
         with concurrent.futures.ThreadPoolExecutor(len(names)) as pool:
             found = dict(zip(names, pool.map(lambda n: version(n, *names[n]), names)))
         self.facts["tools"] = found
+        # Install scripts put these in the user's home and add the dir to a shell profile that already-running
+        # shells (and the omp session that ran the install) never read.
+        home_dirs = {"bun": "~/.bun/bin", "uv": "~/.local/bin", "cargo": "~/.cargo/bin"}
+        off_path = {n: os.path.expanduser(d) for n, d in home_dirs.items()
+                    if not found[n] and os.access(os.path.join(os.path.expanduser(d), n), os.X_OK)}
+
+        def absent(name, why):
+            """(detail, fix) for a tool that is not on PATH."""
+            if name in off_path:
+                d = off_path[name]
+                return (f"installed in {d} but not on PATH",
+                        f'export PATH="{d}:$PATH" (and add it to your shell profile; restart omp so its sessions get it)')
+            return why, package_hint(name, self.here)
+
         required = {"git": "the whole flow", "gh": "every GitHub read and the PR itself", "bun": "oh-my-pi's build and tests, charts"}
         optional = {"uv": ("pr-images (GitHub attachments)", "image-upload"),
                     "ffmpeg": ("animated captures and video frames for PR images", "chart-tools"),
@@ -422,7 +448,15 @@ class Doctor:
             if found[name]:
                 self.add("tools", f"tools.{name}", "ok", found[name])
             else:
-                self.add("tools", f"tools.{name}", "missing", f"needed for {why}", package_hint(name, self.here))
+                self.add("tools", f"tools.{name}", "missing", *absent(name, f"needed for {why}"))
+        if found["git"]:
+            ident = {k: run("git", "config", f"user.{k}", timeout=5)[1] for k in ("name", "email")}
+            if all(ident.values()):
+                self.add("tools", "tools.git-identity", "ok", f"{ident['name']} <{ident['email']}>")
+            else:
+                self.add("tools", "tools.git-identity", "missing",
+                         "git user.name/user.email unset: every commit fails, including pr-queue's queue updates",
+                         'git config --global user.name "Your Name" && git config --global user.email "you@example.com"')
         py = found["python3"]
         m = re.search(r"(\d+)\.(\d+)", py or "")
         if m and (int(m.group(1)), int(m.group(2))) >= (3, 11):
@@ -434,8 +468,8 @@ class Doctor:
             if found[name]:
                 self.add("tools", f"tools.{name}", "ok", found[name], decision=decision)
             else:
-                self.add("tools", f"tools.{name}", "degraded" if decision else "unknown", f"not installed: {why}",
-                         package_hint(name, self.here), decision=decision)
+                self.add("tools", f"tools.{name}", "degraded" if decision else "unknown", *absent(name, f"not installed: {why}"),
+                         decision=decision)
         # gh auth: `gh auth token` reads the local keychain; the login comes from omp_config's cached lookup.
         if found["gh"]:
             code, _, err = run("gh", "auth", "token", timeout=5)
@@ -455,8 +489,9 @@ class Doctor:
             self.add("tools", "tools.rust", "ok", f"{found['cargo']}; targets: {', '.join(targets) or 'host only'}"
                      + ("; cargo-xwin" if xwin else ""), decision="build-hosts")
         else:
-            self.add("tools", "tools.rust", "degraded", "no cargo: Rust diffs need an ssh or ci build host",
-                     package_hint("rustup", self.here), decision="build-hosts")
+            detail, fix = absent("cargo", "no cargo: Rust diffs need an ssh or ci build host")
+            self.add("tools", "tools.rust", "degraded", detail, fix if "cargo" in off_path else package_hint("rustup", self.here),
+                     decision="build-hosts")
 
     def repo(self):
         cfg = self.cfg
@@ -808,7 +843,10 @@ class Doctor:
         if run("bun", "--version", timeout=5)[0] != 0:
             self.add("tools", "tools.charts", "degraded", "charts need bun (see tools.bun)", decision="chart-tools")
             return
-        code, out, err = run("bun", "-e", "import { defaultChrome } from './lib/page.mjs'; console.log(defaultChrome())", cwd=charts, timeout=10)
+        # Caught in the script: an uncaught error makes bun end stderr with its own "Bun vX (OS)" banner.
+        code, out, err = run("bun", "-e", "import { defaultChrome } from './lib/page.mjs'; "
+                             "try { console.log(defaultChrome()) } catch (e) { console.error(e.message); process.exit(1) }",
+                             cwd=charts, timeout=10)
         if code == 0 and out:
             self.add("tools", "tools.charts", "ok", f"Chrome for charts: {out.splitlines()[-1]}", decision="chart-tools")
         else:
@@ -947,6 +985,62 @@ def fix(area, dry):
     return False
 
 
+def parse_value(section, key, text):
+    """A --set VALUE typed by the key's schema: bool, int, list (JSON or comma-separated), else the text."""
+    want = SCHEMA.get(section, {}).get(key)
+    if want is bool:
+        if text.lower() not in ("true", "false"):
+            raise ValueError(f"{section}.{key}: expected true or false, got {text!r}")
+        return text.lower() == "true"
+    if want is int:
+        return int(text)
+    if want is list:
+        return json.loads(text) if text.lstrip().startswith("[") else [v.strip() for v in text.split(",") if v.strip()]
+    return text
+
+
+def write_config(sets, record=None, no_reoffer=False):
+    """--set / --record: edit the config file in place through omp_config.set_value; restore it when the
+    result does not validate."""
+    path = omp_config.config_path()
+    try:
+        with open(path) as f:
+            before = f.read()
+    except FileNotFoundError:
+        before = None
+    writes = []
+    try:
+        for key, text in sets:
+            section, _, name = key.rpartition(".")
+            if not section:
+                raise ValueError(f"{key}: expected section.key (references/config.md)")
+            writes.append((section, name, parse_value(section, name, text)))
+    except ValueError as e:
+        print(e, file=sys.stderr)
+        return False
+    if record:
+        decision, value, reason = record
+        section = f"choices.{decision}"
+        writes += [(section, "value", value), (section, "reason", reason), (section, "at", time.strftime("%Y-%m-%d"))]
+        if no_reoffer:
+            writes.append((section, "reoffer", False))
+    for section, name, value in writes:
+        omp_config.set_value(section, name, value, path)
+    errors = validate_config(omp_config.load(reload=True).data)
+    if errors:
+        if before is None:
+            os.remove(path)
+        else:
+            with open(path, "w") as f:
+                f.write(before)
+        omp_config.load(reload=True)
+        print(f"{path} left unchanged:\n  " + "\n  ".join(errors), file=sys.stderr)
+        return False
+    for section, name, value in writes:
+        print(f"-> {section}.{name} = {omp_config._toml(value)}")
+    return True
+
+
 def _split_set(line):
     """`omp config set KEY VALUE` (VALUE maybe single-quoted JSON) → [KEY, VALUE]."""
     rest = line.removeprefix("omp config set ").strip()
@@ -994,6 +1088,9 @@ def main(argv=None):
     ap.add_argument("--fix")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--record-validated", action="store_true")
+    ap.add_argument("--set", nargs=2, action="append", default=[], metavar=("KEY", "VALUE"))
+    ap.add_argument("--record", nargs=3, metavar=("DECISION", "VALUE", "REASON"))
+    ap.add_argument("--no-reoffer", action="store_true")
     ap.add_argument("--ref", default="origin/main")
     args = ap.parse_args(argv)
     if args.record_validated:
@@ -1001,6 +1098,8 @@ def main(argv=None):
         return 0
     if args.fix:
         return 0 if fix(args.fix, args.dry_run) else 1
+    if args.set or args.record:
+        return 0 if write_config(args.set, args.record, args.no_reoffer) else 1
     report = Doctor(probe_hosts=args.probe_hosts).run(args.area)
     print(json.dumps(report, indent=1, default=str) if args.json else render(report))
     return 1 if report["summary"]["missing"] else 0

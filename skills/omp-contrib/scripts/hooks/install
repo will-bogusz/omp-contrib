@@ -16,6 +16,9 @@ import omp_config  # noqa: E402
 
 
 def main(argv):
+    if argv and argv[0] in ("-h", "--help"):
+        print(__doc__)
+        return
     repo = os.path.expanduser(argv[0]) if argv else omp_config.load().checkout
     p = subprocess.run(["git", "rev-parse", "--path-format=absolute", "--git-path", "hooks"], cwd=repo,
                        capture_output=True, text=True)

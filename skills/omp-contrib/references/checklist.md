@@ -8,7 +8,7 @@ Part of the `omp-contrib` skill; phase names in *italics* are listed in `../SKIL
 - [ ] A change that is P2 by design is queued with its one maintainer decision (`pr-queue add --p2-decision`), and under `autonomy.open_p2 = "hold"` the user has approved it (`pr-queue approve`; queue.md, *P2 decisions*).
 - [ ] Title is a Conventional Commit describing what the user observed or can now do.
 - [ ] Diff self-reviewed and exercised live; the own-words line, in the user's own words (asked from them, never written for them), is first under `## What`.
-- [ ] The one independent "what did `main` do" review run by omp's `reviewer` agent (workflow step 3, [review-brief.md](review-brief.md)) and stamped (`../scripts/review-stamp`); its `resolvedModel` compared with the session's family, and Testing says "same-family review" when they match; each finding fixed (behaviour fixes with a test that fails on revert) or answered, without a second round.
+- [ ] The one independent "what did `main` do" review run by omp's `reviewer` agent (workflow step 3, [review-brief.md](review-brief.md)) and stamped (`../scripts/review-stamp`); its family read from `reviewer-routes.jsonl` (workflow step 3, *Check the reviewer's family*), and Testing says "same-family review" when it matches the session's; each finding fixed (behaviour fixes with a test that fails on revert) or answered, without a second round.
 - [ ] Body opens with the user-visible problem in omp terms; primer only if needed; decisions,
       maintenance cost and non-goals stated; reading order for large diffs.
 - [ ] Testing names the scenario exercised live and its result, plus the command and a negative control.

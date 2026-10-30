@@ -11,7 +11,8 @@ through the `github.fork_remote` remote), with stored bodies under `bodies/<id>.
 with that remote reads and writes the same queue, and every change is a commit there
 (`git log <fork_remote>/<queue_branch>` is its history). Change it only through `pr-queue`, which
 re-applies a write that raced another machine. `--manifest FILE` uses a local file instead, for dry
-runs. The branch starts empty the first time `pr-queue` writes to it.
+runs: no branch is pushed, and `open` and `requeue` refuse. The branch starts empty the first time
+`pr-queue` writes to it.
 
 One entry per change of ours that is queued or open; merged and closed ones stay as history.
 

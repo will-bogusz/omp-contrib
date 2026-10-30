@@ -14,22 +14,27 @@ defaults.
    names its `decision`; walk only records with no `[choices.<id>]` yet, a check that is not `ok`,
    or `reoffer: true`. A rerun of `/contribute setup` with everything recorded asks which record
    the user wants to change.
-2. Walk the records below in order (later ones depend on earlier: `ci` builds need the fork). For
+2. Walk the records below in order (later ones depend on earlier: `ci` builds need the fork, so
+   apply the github record before asking build-hosts). For
    each: say in a sentence what it protects, state what the probe found, recommend the best
    option this machine supports **with its reason and the cost of each lower option**, and let
    the user tweak. Group records whose probes all came back ideal into one confirmation; spend
-   the user's attention on the ones that need a choice.
-3. Write each outcome with `omp_config.set_value` (from `scripts/`: `python3 -c 'import
-   omp_config; omp_config.set_value("build", "linux", "ci")'`) or by editing the file: the values,
-   then `[choices.<id>]` with `value`, `reason` (the user's reason, or the probe fact that made the
-   recommendation stick), `at` (today). Set `reoffer = false` when the user says the choice holds
-   regardless; otherwise doctor re-offers the ideal once it becomes available, and never re-asks
-   while the recorded reason still holds.
+   the user's attention on the ones that need a choice. autonomy is always explained and asked,
+   never recorded as a default the user did not see.
+3. Write each outcome with `scripts/doctor --set KEY VALUE` (e.g. `--set build.linux ci`) and
+   `scripts/doctor --record <id> VALUE REASON` (`[choices.<id>]` with `value`, `reason`: the user's
+   reason, or the probe fact that made the recommendation stick, and today's `at`). Both edit the
+   file in place and refuse an invalid result; never rewrite the whole file, which may hold keys
+   the user set. Add `--no-reoffer` when the user says the choice holds regardless; otherwise
+   doctor re-offers the ideal once it becomes available, and never re-asks while the recorded
+   reason still holds.
 4. Commands that change the machine outside the config (installs, `gh repo fork`, `omp config
-   set`, unit files) run only after the user approves them; show the exact command first. doctor
-   never installs packages itself: its `fix` field is a proposal. Safe local repairs go through
-   `scripts/doctor --fix <hook|fork|queue-branch|omp-settings>`, which prints each step
-   (`--dry-run` to preview).
+   set`, unit files, PATH or profile edits) run only after the user approves them; show the exact
+   command first. doctor never installs packages itself: its `fix` field is a proposal. After
+   installing tools, rerun doctor before acting on rows probed without them (e.g. `gh` may already
+   be logged in through `GH_TOKEN`). Never ask the user to paste a token into the chat. Safe local
+   repairs go through `scripts/doctor --fix <hook|fork|queue-branch|omp-settings>`, which prints
+   each step (`--dry-run` to preview).
 5. Rerun `scripts/doctor` and resolve or explain every remaining `missing`.
 6. Finish with a dry-run first hunt (*Dry run* below).
 
@@ -46,11 +51,12 @@ Each: **Intent** (what it protects) · **Ideal** · **Probe** (doctor check ids)
 - **Intent.** PRs come from the user's fork; the queue lives on a branch of that fork, so every
   machine of theirs sees the same queue; the hook keeps commits pushed to the fork from naming
   `#N`, which would put a cross-reference on upstream PR N's timeline that the maintainer sees.
-- **Ideal.** `gh` logged in as the user; an oh-my-pi clone with `origin` = upstream and a
-  `fork` remote; the queue branch (`github.queue_branch`) on the fork; the commit-msg hook linked
-  into the clone. Branches are named `<branch_prefix><topic>`, default `<login>/`.
-- **Probe.** `tools.gh-auth`, `repo.checkout`, `repo.origin`, `repo.fork`, `repo.queue-branch`,
-  `repo.hook`, `github.tier` (roboomp's per-hour review cap for this login; first-time
+- **Ideal.** `gh` logged in as the user; git's `user.name`/`user.email` set; an oh-my-pi clone
+  with `origin` = upstream and a `fork` remote; the queue branch (`github.queue_branch`) on the
+  fork; the commit-msg hook linked into the clone. Branches are named `<branch_prefix><topic>`,
+  default `<login>/`.
+- **Probe.** `tools.gh-auth`, `tools.git-identity`, `repo.checkout`, `repo.origin`, `repo.fork`,
+  `repo.queue-branch`, `repo.hook`, `github.tier` (roboomp's per-hour review cap for this login; first-time
   contributors get the smallest, so the queue's ready budget is smaller until a PR merges).
 - **Alternatives.** None for gh and the fork: the flow needs them. Checkout location is free
   (`paths.checkout`; worktrees at `paths.worktrees`, default `<checkout>-wt`). Without the hook:

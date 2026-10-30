@@ -244,5 +244,38 @@ class ReportTest(unittest.TestCase):
         self.assertEqual(D._split_set("omp config set task.maxRecursionDepth 3"), ["task.maxRecursionDepth", "3"])
 
 
+class WriteConfigTest(unittest.TestCase):
+    def test_set_and_record_keep_other_keys_and_reject_invalid_results(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = contrib_env.write_config(os.path.join(tmp, "c.toml"), '[github]\nqueue_branch = "q"  # mine\n')
+            with mock.patch.dict(os.environ, {"OMP_CONTRIB_CONFIG": path}), mock.patch("sys.stdout"), mock.patch("sys.stderr"):
+                self.assertEqual(D.main(["--set", "build.linux", "ci", "--set", "watch.enabled", "true",
+                                         "--set", "models.behaviour", "a/x, b/y",
+                                         "--record", "image-upload", "fork-links", "no Chrome here", "--no-reoffer"]), 0)
+                cfg = omp_config.load(reload=True)
+                self.assertEqual((cfg.queue_branch, cfg.build["linux"], cfg.watch_enabled, cfg.behaviour_models),
+                                 ("q", "ci", True, ["a/x", "b/y"]))
+                self.assertEqual(cfg.choices["image-upload"]["reason"], "no Chrome here")
+                self.assertIs(cfg.choices["image-upload"]["reoffer"], False)
+                self.assertIn("# mine", open(path).read())
+                before = open(path).read()
+                self.assertEqual(D.main(["--set", "images.upload", "none"]), 1)
+                self.assertEqual(D.main(["--set", "watch.enabled", "yes"]), 1)
+                self.assertEqual(open(path).read(), before)
+        omp_config.load(reload=True)
+
+
+class PackageHintTest(unittest.TestCase):
+    def test_bun_needs_unzip_and_oxipng_needs_cargo(self):
+        which = {"apt-get": "/usr/bin/apt-get"}
+        with mock.patch.object(D.shutil, "which", lambda name: which.get(name)):
+            self.assertEqual(D.package_hint("bun", "linux"),
+                             "sudo apt-get install -y unzip && curl -fsSL https://bun.sh/install | bash")
+            self.assertTrue(D.package_hint("oxipng", "linux").endswith(", then: cargo install --locked oxipng"))
+            which.update(unzip="/usr/bin/unzip", cargo="/usr/bin/cargo")
+            self.assertEqual(D.package_hint("bun", "linux"), "curl -fsSL https://bun.sh/install | bash")
+            self.assertEqual(D.package_hint("oxipng", "linux"), "cargo install --locked oxipng")
+
+
 if __name__ == "__main__":
     unittest.main()
