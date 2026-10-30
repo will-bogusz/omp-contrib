@@ -1,0 +1,443 @@
+{
+ "source": {
+  "scores": "source/scores.json (DriftCap/score_driftcap.py)",
+  "perCycle": "source/dry/*.compactions.json (DriftCap offline runs)",
+  "archive": "the study's working folder, archived with the PR's notes (not shipped)",
+  "note": "recall measured after 1, 3 and 5 compactions only; frames, bytes and truncated history exist for all 5"
+ },
+ "models": {
+  "claude-opus-5-5": {
+   "label": "Opus 5.5",
+   "caps": {
+    "17": {
+     "recall": {
+      "1": {
+       "pct": 90.32258064516128,
+       "n": 3,
+       "runs": [
+        87.09677419354838,
+        87.09677419354838,
+        96.7741935483871
+       ],
+       "spread": 9.677419354838712,
+       "sameAsCap": null
+      },
+      "3": {
+       "pct": 65.59139784946237,
+       "n": 3,
+       "runs": [
+        67.74193548387096,
+        64.51612903225806,
+        64.51612903225806
+       ],
+       "spread": 3.2258064516129004,
+       "sameAsCap": null
+      },
+      "5": {
+       "pct": 18.27956989247312,
+       "n": 3,
+       "runs": [
+        12.903225806451612,
+        19.35483870967742,
+        22.58064516129032
+       ],
+       "spread": 9.67741935483871,
+       "sameAsCap": null
+      }
+     },
+     "perCycle": {
+      "1": {
+       "frames": 17,
+       "imageBytes": 2892712,
+       "truncatedChars": 0,
+       "tokensAfter": 124907,
+       "MB": 2.892712
+      },
+      "2": {
+       "frames": 17,
+       "imageBytes": 2928484,
+       "truncatedChars": 0,
+       "tokensAfter": 124256,
+       "MB": 2.928484
+      },
+      "3": {
+       "frames": 17,
+       "imageBytes": 2819268,
+       "truncatedChars": 144751,
+       "tokensAfter": 118259,
+       "MB": 2.819268
+      },
+      "4": {
+       "frames": 17,
+       "imageBytes": 2879116,
+       "truncatedChars": 260619,
+       "tokensAfter": 117671,
+       "MB": 2.879116
+      },
+      "5": {
+       "frames": 17,
+       "imageBytes": 2774664,
+       "truncatedChars": 347502,
+       "tokensAfter": 123714,
+       "MB": 2.774664
+      }
+     }
+    },
+    "40": {
+     "recall": {
+      "1": {
+       "pct": 90.32258064516128,
+       "n": 3,
+       "runs": [
+        87.09677419354838,
+        87.09677419354838,
+        96.7741935483871
+       ],
+       "spread": 9.677419354838712,
+       "sameAsCap": 17
+      },
+      "3": {
+       "pct": 96.7741935483871,
+       "n": 1,
+       "runs": [
+        96.7741935483871
+       ],
+       "spread": null,
+       "sameAsCap": null
+      },
+      "5": {
+       "pct": 96.7741935483871,
+       "n": 1,
+       "runs": [
+        96.7741935483871
+       ],
+       "spread": null,
+       "sameAsCap": null
+      }
+     },
+     "perCycle": {
+      "1": {
+       "frames": 17,
+       "imageBytes": 2892712,
+       "truncatedChars": 0,
+       "tokensAfter": 124907,
+       "MB": 2.892712
+      },
+      "2": {
+       "frames": 21,
+       "imageBytes": 3649792,
+       "truncatedChars": 0,
+       "tokensAfter": 144348,
+       "MB": 3.649792
+      },
+      "3": {
+       "frames": 28,
+       "imageBytes": 4786116,
+       "truncatedChars": 0,
+       "tokensAfter": 173494,
+       "MB": 4.786116
+      },
+      "4": {
+       "frames": 33,
+       "imageBytes": 5772364,
+       "truncatedChars": 0,
+       "tokensAfter": 198026,
+       "MB": 5.772364
+      },
+      "5": {
+       "frames": 37,
+       "imageBytes": 6428064,
+       "truncatedChars": 0,
+       "tokensAfter": 224165,
+       "MB": 6.428064
+      }
+     }
+    },
+    "80": {
+     "recall": {
+      "1": {
+       "pct": 90.32258064516128,
+       "n": 3,
+       "runs": [
+        87.09677419354838,
+        87.09677419354838,
+        96.7741935483871
+       ],
+       "spread": 9.677419354838712,
+       "sameAsCap": 17
+      },
+      "3": {
+       "pct": 96.7741935483871,
+       "n": 1,
+       "runs": [
+        96.7741935483871
+       ],
+       "spread": null,
+       "sameAsCap": 40
+      },
+      "5": {
+       "pct": 96.7741935483871,
+       "n": 1,
+       "runs": [
+        96.7741935483871
+       ],
+       "spread": null,
+       "sameAsCap": 40
+      }
+     },
+     "perCycle": {
+      "1": {
+       "frames": 17,
+       "imageBytes": 2892712,
+       "truncatedChars": 0,
+       "tokensAfter": 124907,
+       "MB": 2.892712
+      },
+      "2": {
+       "frames": 21,
+       "imageBytes": 3649792,
+       "truncatedChars": 0,
+       "tokensAfter": 144348,
+       "MB": 3.649792
+      },
+      "3": {
+       "frames": 28,
+       "imageBytes": 4786116,
+       "truncatedChars": 0,
+       "tokensAfter": 173494,
+       "MB": 4.786116
+      },
+      "4": {
+       "frames": 33,
+       "imageBytes": 5772364,
+       "truncatedChars": 0,
+       "tokensAfter": 198026,
+       "MB": 5.772364
+      },
+      "5": {
+       "frames": 37,
+       "imageBytes": 6428064,
+       "truncatedChars": 0,
+       "tokensAfter": 224165,
+       "MB": 6.428064
+      }
+     }
+    }
+   }
+  },
+  "gpt-6-astra": {
+   "label": "gpt-6-astra",
+   "caps": {
+    "17": {
+     "recall": {
+      "1": {
+       "pct": 89.58333333333333,
+       "n": 2,
+       "runs": [
+        87.5,
+        91.66666666666666
+       ],
+       "spread": 4.1666666666666625,
+       "sameAsCap": null
+      },
+      "3": {
+       "pct": 27.083333333333332,
+       "n": 1,
+       "runs": [
+        27.083333333333332
+       ],
+       "spread": null,
+       "sameAsCap": null
+      },
+      "5": {
+       "pct": 20.833333333333336,
+       "n": 2,
+       "runs": [
+        20.833333333333336,
+        20.833333333333336
+       ],
+       "spread": 0.0,
+       "sameAsCap": null
+      }
+     },
+     "perCycle": {
+      "1": {
+       "frames": 17,
+       "imageBytes": 1744588,
+       "truncatedChars": 76906,
+       "tokensAfter": 105113,
+       "MB": 1.744588
+      },
+      "2": {
+       "frames": 17,
+       "imageBytes": 1656500,
+       "truncatedChars": 307709,
+       "tokensAfter": 111461,
+       "MB": 1.6565
+      },
+      "3": {
+       "frames": 17,
+       "imageBytes": 1712364,
+       "truncatedChars": 577035,
+       "tokensAfter": 112810,
+       "MB": 1.712364
+      },
+      "4": {
+       "frames": 17,
+       "imageBytes": 1625104,
+       "truncatedChars": 769412,
+       "tokensAfter": 108371,
+       "MB": 1.625104
+      },
+      "5": {
+       "frames": 17,
+       "imageBytes": 1712404,
+       "truncatedChars": 923270,
+       "tokensAfter": 112841,
+       "MB": 1.712404
+      }
+     }
+    },
+    "40": {
+     "recall": {
+      "1": {
+       "pct": 93.75,
+       "n": 2,
+       "runs": [
+        95.83333333333334,
+        91.66666666666666
+       ],
+       "spread": 4.166666666666674,
+       "sameAsCap": null
+      },
+      "3": {
+       "pct": 79.16666666666666,
+       "n": 1,
+       "runs": [
+        79.16666666666666
+       ],
+       "spread": null,
+       "sameAsCap": null
+      },
+      "5": {
+       "pct": 29.166666666666664,
+       "n": 2,
+       "runs": [
+        27.083333333333332,
+        31.25
+       ],
+       "spread": 4.166666666666669,
+       "sameAsCap": null
+      }
+     },
+     "perCycle": {
+      "1": {
+       "frames": 26,
+       "imageBytes": 2328724,
+       "truncatedChars": 0,
+       "tokensAfter": 150309,
+       "MB": 2.328724
+      },
+      "2": {
+       "frames": 33,
+       "imageBytes": 3563488,
+       "truncatedChars": 0,
+       "tokensAfter": 191825,
+       "MB": 3.563488
+      },
+      "3": {
+       "frames": 40,
+       "imageBytes": 4397592,
+       "truncatedChars": 134611,
+       "tokensAfter": 228362,
+       "MB": 4.397592
+      },
+      "4": {
+       "frames": 40,
+       "imageBytes": 4300272,
+       "truncatedChars": 326958,
+       "tokensAfter": 223923,
+       "MB": 4.300272
+      },
+      "5": {
+       "frames": 40,
+       "imageBytes": 4352272,
+       "truncatedChars": 480855,
+       "tokensAfter": 228393,
+       "MB": 4.352272
+      }
+     }
+    },
+    "80": {
+     "recall": {
+      "1": {
+       "pct": 93.75,
+       "n": 2,
+       "runs": [
+        95.83333333333334,
+        91.66666666666666
+       ],
+       "spread": 4.166666666666674,
+       "sameAsCap": 40
+      },
+      "3": {
+       "pct": 95.83333333333334,
+       "n": 1,
+       "runs": [
+        95.83333333333334
+       ],
+       "spread": null,
+       "sameAsCap": null
+      },
+      "5": {
+       "pct": 83.33333333333334,
+       "n": 1,
+       "runs": [
+        83.33333333333334
+       ],
+       "spread": null,
+       "sameAsCap": null
+      }
+     },
+     "perCycle": {
+      "1": {
+       "frames": 26,
+       "imageBytes": 2328724,
+       "truncatedChars": 0,
+       "tokensAfter": 150309,
+       "MB": 2.328724
+      },
+      "2": {
+       "frames": 42,
+       "imageBytes": 3745500,
+       "truncatedChars": 0,
+       "tokensAfter": 237041,
+       "MB": 3.7455
+      },
+      "3": {
+       "frames": 62,
+       "imageBytes": 5573564,
+       "truncatedChars": 0,
+       "tokensAfter": 338870,
+       "MB": 5.573564
+      },
+      "4": {
+       "frames": 75,
+       "imageBytes": 6728384,
+       "truncatedChars": 0,
+       "tokensAfter": 399743,
+       "MB": 6.728384
+      },
+      "5": {
+       "frames": 64,
+       "imageBytes": 7305996,
+       "truncatedChars": 0,
+       "tokensAfter": 348949,
+       "MB": 7.305996
+      }
+     }
+    }
+   }
+  }
+ }
+}

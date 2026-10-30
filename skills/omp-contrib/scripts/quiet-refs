@@ -1,0 +1,40 @@
+#!/usr/bin/env python3
+"""After a rebase run by hand, before its push: write the PR references in the messages of the commits
+the rebase created as `PR N` (omp_queue.quiet_refs), since a fork commit naming `#N` lands on
+upstream PR N's timeline. `pr-queue advance` does this itself.
+
+usage: quiet-refs [--onto REF] [--kept REF ...]
+  run in the worktree of the rebased branch
+  --onto REF   what the branch was rebased onto (default origin/main)
+  --kept REF   commits that stay as they are (default <fork remote>/<branch>, the pushed copy): commits it
+               holds were not replayed, and rewording them would make a push of its own"""
+import argparse
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import omp_config  # noqa: E402
+from omp_queue import git, quiet_replayed, rev  # noqa: E402
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(usage=__doc__.split("\n\n", 1)[1])
+    parser.add_argument("--onto", default="origin/main")
+    parser.add_argument("--kept", nargs="*")
+    args = parser.parse_args(argv)
+    cwd = os.getcwd()
+    if args.kept is None:
+        branch = git(cwd, "symbolic-ref", "--quiet", "--short", "HEAD")
+        if branch.returncode:
+            sys.exit("detached HEAD: pass --kept REF (or --kept for no pushed commits)")
+        args.kept = [f"refs/remotes/{omp_config.load().fork_remote}/{branch.stdout.strip()}"]
+    kept = [rev(cwd, ref) for ref in args.kept]
+    missing = [ref for ref, sha in zip(args.kept, kept) if not sha]
+    if missing:
+        sys.exit(f"no such ref: {', '.join(missing)} (pass --kept, or nothing when the branch was never pushed)")
+    count = quiet_replayed(cwd, args.onto, kept)
+    print(f"{count} commit message(s) reworded" if count else "no replayed commit names a PR as #N")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

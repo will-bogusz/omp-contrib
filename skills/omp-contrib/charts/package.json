@@ -1,0 +1,8 @@
+{
+ "name": "omp-charts",
+ "private": true,
+ "type": "module",
+ "dependencies": {
+  "puppeteer-core": "24"
+ }
+}

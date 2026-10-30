@@ -1,0 +1,33 @@
+{
+ "commit": "5d30c790b883ad0ae05dac2a4d2ccc8ecd103611",
+ "date": "2026-10-30",
+ "hashes": {
+  ".github/PULL_REQUEST_TEMPLATE.md": "2bed9a308cbb21fc",
+  "AGENTS.md#Changelog": "62e8847050e4107c",
+  "AGENTS.md#GitHub": "9d8aba80019fc20d",
+  "CONTRIBUTING.md": "e38561969763598b",
+  "python/robomp/src/prompts/completion_reminder.md": "ba2b1051158f7d92",
+  "python/robomp/src/prompts/directive.md": "5277c608a0cde6e2",
+  "python/robomp/src/prompts/dirty_state_reminder.md": "6a7ed217f7107426",
+  "python/robomp/src/prompts/finalized_issue_comment.md": "9cdd73edb3ef4e33",
+  "python/robomp/src/prompts/finalized_pr_comment.md": "857a36bfa1c3f57f",
+  "python/robomp/src/prompts/followup_comment.md": "82bab7eadff760fc",
+  "python/robomp/src/prompts/followup_release.md": "3b83b4dac5d700a0",
+  "python/robomp/src/prompts/followup_review.md": "8951f2b6178724c2",
+  "python/robomp/src/prompts/host_tools.toml": "a385cde6276d55af",
+  "python/robomp/src/prompts/kickoff_directive.md": "1dc9a2aafaca9a22",
+  "python/robomp/src/prompts/kickoff_issue.md": "0d81765ef2d194d1",
+  "python/robomp/src/prompts/kickoff_pr_review.md": "f369dbc2cd26ed86",
+  "python/robomp/src/prompts/kickoff_release.md": "861140c1c5e68b9d",
+  "python/robomp/src/prompts/question_autoclose_suffix.md": "dfa14c86012f7dc8",
+  "python/robomp/src/prompts/resume_triage.md": "2698aa2b55f8db88",
+  "python/robomp/src/prompts/review_completion_reminder.md": "a659f028e0839f6f",
+  "python/robomp/src/prompts/system_append.md": "e45233eef4ab7fe0",
+  "python/robomp/src/prompts/system_append_pr_review.md": "35fca9f98175b8b3",
+  "python/robomp/src/prompts/system_append_release.md": "af6bbf8faf417627",
+  "python/robomp/src/prompts/todo_phases.toml": "0cbd0b835567b399",
+  "python/robomp/src/prompts/unable_to_reproduce_comment.md": "7131c9a4f58d537b"
+ },
+ "note": "Hashes of upstream's contribution documents the skill was last checked against (doctor --record-validated). doctor flags any that changed at origin/main.",
+ "upstream": "can1357/oh-my-pi"
+}

@@ -1,0 +1,1010 @@
+#!/usr/bin/env python3
+"""Check this machine against what the omp-contrib flow needs, and repair the safe local parts.
+
+usage: doctor [--json] [--probe-hosts] [--area AREA ...]
+       doctor --fix AREA [--dry-run]
+       doctor --record-validated [--ref REF]
+  --json          one JSON object: {configured, config_path, checks: [{area, id, status, detail, fix?,
+                  decision?, reoffer?}], summary, ...}. status is ok | missing | degraded | unknown;
+                  `fix` is the command or step that resolves it; `decision` names the setup.md record
+                  that owns the choice; `reoffer` marks a recorded choice whose ideal became available
+  --probe-hosts   also ssh to every concrete Host in ~/.ssh/config (BatchMode, 4 s timeout) for
+                  reachability and OS; without it hosts are listed, not contacted
+  --area AREA     only these areas (config system tools repo github omp models browser hosts build
+                  upstream autonomy watcher sessions)
+  --fix AREA      a safe local repair, printing each step before it runs:
+                    hook          link scripts/hooks/commit-msg into the checkout (hooks/install)
+                    fork          `gh repo fork` the upstream (no clone) and add the fork remote
+                    queue-branch  create the queue branch on the fork with an empty manifest
+                    omp-settings  `omp config set` the three settings below that are short
+                  nothing here installs system packages: the agent proposes those to the user
+  --dry-run       with --fix: print the steps, run none
+  --record-validated
+                  write the hashes of upstream's contribution documents at REF (default origin/main)
+                  into validated.json beside this script: run after checking the skill against them
+
+Exit status: 0 when nothing is missing, 1 otherwise (degraded and unknown do not fail).
+Stays under ~5 s without --probe-hosts: no network calls besides `gh auth token` (local) and the
+cached `gh api user` lookup; upstream drift reads the local origin/main (as fresh as the last fetch).
+"""
+import argparse
+import concurrent.futures
+import glob
+import hashlib
+import json
+import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+SKILL = os.path.dirname(HERE)
+sys.path.insert(0, HERE)
+import omp_config  # noqa: E402
+
+VALIDATED = os.path.join(HERE, "validated.json")
+STATUSES = ("ok", "missing", "degraded", "unknown")
+PLATFORMS = ("linux", "macos", "windows")
+WINDOWS_TARGET = "x86_64-pc-windows-msvc"
+
+# The omp settings the flow relies on, with the value it needs and why (setup.md, omp-settings).
+SETTINGS = {
+    "task.maxRecursionDepth": (3, "main -> lead/task -> reviewer needs three levels; omp's default is 2"),
+    "task.agentSoftRequestBudget": (400, "a reviewer working through review-brief.md runs out at omp's default 200"),
+    "task.isolation.enabled": (True, "workers edit in their own worktrees instead of the shared checkout"),
+}
+
+# Upstream text the skill's rules were checked against; a change means a rule may be stale.
+UPSTREAM_FILES = ("CONTRIBUTING.md", ".github/PULL_REQUEST_TEMPLATE.md")
+UPSTREAM_SECTIONS = {"AGENTS.md": ("GitHub", "Changelog")}
+UPSTREAM_DIRS = ("python/robomp/src/prompts",)
+
+# ---------------------------------------------------------------------------------------------------
+# config validation (pure)
+
+SCHEMA = {
+    "github": {"upstream_repo": str, "maintainers": list, "fork_owner": str, "fork_remote": str,
+               "queue_branch": str, "branch_prefix": str},
+    "paths": {"checkout": str, "worktrees": str, "scratch_roots": list},
+    "build": {"linux": str, "macos": str, "windows": str},
+    "models": {"reviewer": str, "behaviour": list, "cold_read": str},
+    "images": {"upload": str},
+    "autonomy": {"open_p2": str, "supervised_opens": int},
+    "watch": {"enabled": bool},
+}
+ENUMS = {("images", "upload"): ("relay", "fork-links"), ("autonomy", "open_p2"): ("hold", "open")}
+DECISIONS = ("github", "build-hosts", "reviewer", "behaviour-models", "omp-settings", "image-upload",
+             "chart-tools", "autonomy", "watcher", "session-reader")
+CHOICE_KEYS = {"value": None, "reason": str, "at": str, "reoffer": bool}
+
+
+def validate_config(data):
+    """Problems in a parsed config file, as strings; [] when it follows config.md."""
+    errors = []
+    for section, table in data.items():
+        if section == "choices":
+            if not isinstance(table, dict):
+                errors.append("[choices] must be a table of [choices.<decision>] tables")
+                continue
+            for decision, choice in table.items():
+                where = f"[choices.{decision}]"
+                if decision not in DECISIONS:
+                    errors.append(f"{where}: unknown decision (setup.md records: {', '.join(DECISIONS)})")
+                if not isinstance(choice, dict):
+                    errors.append(f"{where} must be a table")
+                    continue
+                if "value" not in choice:
+                    errors.append(f"{where}: no `value`")
+                if not str(choice.get("reason", "")).strip():
+                    errors.append(f"{where}: no `reason` (doctor re-offers a choice it cannot tell was deliberate)")
+                for key, value in choice.items():
+                    if key not in CHOICE_KEYS:
+                        errors.append(f"{where}.{key}: unknown key")
+                    elif CHOICE_KEYS[key] and not isinstance(value, CHOICE_KEYS[key]):
+                        errors.append(f"{where}.{key}: expected {CHOICE_KEYS[key].__name__}")
+            continue
+        if section not in SCHEMA:
+            errors.append(f"[{section}]: unknown section")
+            continue
+        if not isinstance(table, dict):
+            errors.append(f"[{section}] must be a table")
+            continue
+        for key, value in table.items():
+            want = SCHEMA[section].get(key)
+            where = f"{section}.{key}"
+            if want is None:
+                errors.append(f"{where}: unknown key")
+            elif want is int and (isinstance(value, bool) or not isinstance(value, int)):
+                errors.append(f"{where}: expected an integer, got {value!r}")
+            elif want is not int and not isinstance(value, want):
+                errors.append(f"{where}: expected {want.__name__}, got {value!r}")
+            elif want is list and not all(isinstance(v, str) for v in value):
+                errors.append(f"{where}: expected a list of strings")
+            elif (section, key) in ENUMS and value not in ENUMS[(section, key)]:
+                errors.append(f"{where}: {value!r} is not one of {', '.join(ENUMS[(section, key)])}")
+            elif section == "build" and value and not omp_config.BUILD_VALUES.match(value):
+                errors.append(f"{where}: {value!r} is not local, ssh:<host>, ci or none")
+            elif section == "autonomy" and key == "supervised_opens" and value < 0:
+                errors.append(f"{where}: must be 0 or more")
+            elif section == "models" and key == "behaviour" and len(value) not in (0, 2):
+                errors.append(f"{where}: two models (of different families), or empty for the derived pair")
+    return errors
+
+
+# ---------------------------------------------------------------------------------------------------
+# upstream drift (pure parts)
+
+def markdown_section(text, heading):
+    """The `## heading` section of a markdown text, subsections included, up to the next `## `."""
+    out, inside = [], False
+    for line in text.splitlines(keepends=True):
+        m = re.match(r"^(#{1,6})\s+(.*?)\s*$", line)
+        if m and len(m.group(1)) <= 2:
+            if inside:
+                break
+            inside = len(m.group(1)) == 2 and m.group(2) == heading
+        if inside:
+            out.append(line)
+    return "".join(out)
+
+
+def sha(text):
+    return hashlib.sha256(text.encode()).hexdigest()[:16]
+
+
+def compare_drift(validated, current):
+    """{changed, added, removed}: upstream documents whose hash differs from the validated baseline."""
+    old, new = validated.get("hashes", {}), current
+    return {"changed": sorted(k for k in old if k in new and old[k] != new[k]),
+            "added": sorted(k for k in new if k not in old),
+            "removed": sorted(k for k in old if k not in new)}
+
+
+# ---------------------------------------------------------------------------------------------------
+# build placement (pure)
+
+def host_platform(system=None):
+    system = (system or platform.system()).lower()
+    return "macos" if system == "darwin" else "windows" if system.startswith(("windows", "cygwin", "msys")) else "linux"
+
+
+def uname_platform(uname):
+    """`uname -s` output of an ssh host → linux | macos | windows | None."""
+    s = (uname or "").strip().split()[0].lower() if (uname or "").strip() else ""
+    return {"linux": "linux", "darwin": "macos"}.get(s) or ("windows" if s.startswith(("mingw", "msys", "cygwin", "windows")) else None)
+
+
+def placement_status(plat, value, caps):
+    """(status, detail, fix) for running `plat`'s Rust check at `value`, given this machine's capabilities:
+    caps = {here, cargo, xwin, win_target, ssh: {host: platform|None}, ssh_probed, fork}."""
+    if value == "none":
+        return "degraded", f"{plat}: unchecked; precheck prints a NOTE and the PR's Testing section says so", None
+    if value == "local":
+        if not caps.get("cargo"):
+            return "missing", f"{plat}: local, but cargo is not installed", "install rustup (https://rustup.rs), then rerun doctor"
+        if plat == caps["here"]:
+            return "ok", f"{plat}: local", None
+        if plat == "windows" and caps["here"] != "windows":
+            missing = [n for n, ok in (("cargo-xwin", caps.get("xwin")), (f"rustup target {WINDOWS_TARGET}", caps.get("win_target"))) if not ok]
+            if missing:
+                return "missing", f"windows: local through cargo-xwin, but {' and '.join(missing)} is missing", \
+                    f"cargo install --locked cargo-xwin && rustup target add {WINDOWS_TARGET}"
+            return "ok", "windows: local through cargo-xwin", None
+        return "missing", f"{plat}: local, but this machine is {caps['here']}", f"set build.{plat} to ssh:<host>, ci or none (setup.md, build-hosts)"
+    if value.startswith("ssh:"):
+        host = value[4:]
+        if host not in caps.get("ssh", {}):
+            return "missing", f"{plat}: {value}, but {host} is not a Host in ~/.ssh/config", f"add {host} to ~/.ssh/config or change build.{plat}"
+        found = caps["ssh"][host]
+        if not caps.get("ssh_probed"):
+            return "ok", f"{plat}: {value} (not contacted; doctor --probe-hosts checks it)", None
+        if found is None:
+            return "degraded", f"{plat}: {value} did not answer `ssh -o BatchMode=yes {host} uname`", f"ssh {host} true  # fix keys/reachability, or change build.{plat}"
+        if found != plat:
+            return "missing", f"{plat}: {value} is a {found} host", f"point build.{plat} at a {plat} host, ci or none"
+        return "ok", f"{plat}: {value} ({found}, reachable)", None
+    if value == "ci":
+        if not caps.get("fork"):
+            return "missing", f"{plat}: ci, but there is no fork remote to run GitHub Actions on", "doctor --fix fork"
+        return "ok", f"{plat}: ci (GitHub Actions on the fork; Actions must be enabled there)", None
+    return "missing", f"{plat}: {value!r} is not local, ssh:<host>, ci or none", f"fix build.{plat}"
+
+
+def recommend_placement(plat, caps):
+    """The best value for build.<plat> this machine can support: local, a probed ssh host of that OS, ci, none."""
+    if caps.get("cargo") and (plat == caps["here"] or (plat == "windows" and caps.get("xwin") and caps.get("win_target"))):
+        return "local"
+    for host, found in sorted(caps.get("ssh", {}).items()):
+        if found == plat:
+            return f"ssh:{host}"
+    return "ci" if caps.get("fork") else "none"
+
+
+# ---------------------------------------------------------------------------------------------------
+# model families (pure)
+
+FAMILY_PREFIXES = (
+    ("anthropic", ("claude",)), ("openai", ("gpt", "o1", "o3", "o4", "codex", "chatgpt")),
+    ("google", ("gemini", "gemma")), ("xai", ("grok",)), ("moonshot", ("kimi",)), ("zhipu", ("glm",)),
+    ("deepseek", ("deepseek",)), ("qwen", ("qwen", "qwq")), ("minimax", ("minimax",)),
+    ("mistral", ("mistral", "devstral", "codestral", "ministral", "magistral", "mixtral", "pixtral")),
+    ("meta", ("llama",)),
+)
+# The lab's own providers (direct or by subscription). A behaviour run should measure the lab's model as
+# the lab serves it, not a reseller's variant; resellers count only when no own provider is logged in.
+OWN_PROVIDERS = {
+    "anthropic": ("anthropic",), "openai": ("openai", "openai-codex"),
+    "google": ("google", "google-antigravity", "google-gemini-cli", "google-vertex"), "xai": ("xai", "xai-oauth"),
+    "moonshot": ("moonshot", "kimi-code"), "zhipu": ("zai", "zhipu"), "deepseek": ("deepseek",),
+    "qwen": ("alibaba", "qwen"), "minimax": ("minimax",), "mistral": ("mistral",), "meta": ("meta",),
+}
+# Families most omp users drive with, first: a behaviour check is worth most on the models people run.
+FAMILY_ORDER = ("anthropic", "openai", "google", "xai", "moonshot", "zhipu", "deepseek", "qwen", "minimax", "mistral", "meta")
+
+
+def model_family(model_id):
+    """The lab lineage of a model id (`claude-haiku-5-5` → anthropic), or None for an unknown one."""
+    base = model_id.rsplit("/", 1)[-1].lower()
+    for family, prefixes in FAMILY_PREFIXES:
+        if any(base == p or base.startswith((p + "-", p + ".", p + "_")) or re.match(rf"^{p}\d", base) for p in prefixes):
+            return family
+    return None
+
+
+def families(models):
+    """{family: [model json, ...]} for the available models of known lineage."""
+    out = {}
+    for m in models:
+        fam = model_family(m.get("id", ""))
+        if fam:
+            out.setdefault(fam, []).append(m)
+    return out
+
+
+def behaviour_pair(models):
+    """Two selectors of different families for behaviour runs of prompt changes: per family the cheapest
+    priced reasoning model with >= 128k context, the lab's own provider before resellers; families with an
+    own provider first, then FAMILY_ORDER. [] with fewer than two families."""
+    picks = []
+    for fam, ms in families(models).items():
+        price = lambda m: (m.get("cost") or {}).get("input") or 0
+        usable = [m for m in ms if m.get("reasoning") and (m.get("contextWindow") or 0) >= 128_000 and price(m) > 0] or ms
+        own = [m for m in usable if m.get("provider") in OWN_PROVIDERS.get(fam, ())]
+        best = min(own or usable, key=lambda m: (price(m), m.get("selector", "")))
+        picks.append((not own, FAMILY_ORDER.index(fam) if fam in FAMILY_ORDER else 99,
+                      best.get("selector") or f"{best['provider']}/{best['id']}"))
+    picks.sort()
+    return [p[2] for p in picks[:2]] if len(picks) >= 2 else []
+
+
+# ---------------------------------------------------------------------------------------------------
+# recorded choices (pure)
+
+def is_configured(cfg):
+    """The setup wizard has run: the file exists, follows config.md, and records at least one choice."""
+    return bool(cfg.exists and not validate_config(cfg.data) and cfg.choices)
+
+
+def choice_reoffer(choice, ideal, ideal_available):
+    """True when a recorded choice differs from the ideal, the ideal is available now, and the choice did
+    not say it holds regardless (`reoffer = false`)."""
+    if not choice:
+        return False
+    return str(choice.get("value")) != str(ideal) and bool(ideal_available) and choice.get("reoffer", True) is not False
+
+
+# ---------------------------------------------------------------------------------------------------
+# probes
+
+def run(*args, cwd=None, timeout=10, env=None):
+    """(returncode, stdout, stderr); (None, "", reason) when the command is missing or hangs."""
+    try:
+        p = subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env)
+        return p.returncode, p.stdout.strip(), p.stderr.strip()
+    except FileNotFoundError:
+        return None, "", f"{args[0]}: not found"
+    except subprocess.TimeoutExpired:
+        return None, "", f"{args[0]}: timed out after {timeout}s"
+    except OSError as e:
+        return None, "", str(e)
+
+
+def package_hint(name, here):
+    """How to install a system tool on this OS: a hint for the agent to propose, never run by doctor."""
+    brew = {"gh": "gh", "uv": "uv", "bun": "oven-sh/bun/bun", "ffmpeg": "ffmpeg", "pngquant": "pngquant",
+            "oxipng": "oxipng", "git": "git", "python3": "python@3.13", "docker": "--cask docker"}
+    apt = {"gh": "gh", "ffmpeg": "ffmpeg", "pngquant": "pngquant", "git": "git", "python3": "python3",
+           "docker": "docker.io"}
+    script = {"uv": "curl -LsSf https://astral.sh/uv/install.sh | sh", "bun": "curl -fsSL https://bun.sh/install | bash",
+              "rustup": "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh",
+              "oxipng": "cargo install --locked oxipng"}
+    winget = {"gh": "GitHub.cli", "uv": "astral-sh.uv", "bun": "Oven-sh.Bun", "ffmpeg": "Gyan.FFmpeg", "git": "Git.Git",
+              "python3": "Python.Python.3.13", "rustup": "Rustlang.Rustup", "docker": "Docker.DockerDesktop"}
+    if here == "macos" and shutil.which("brew") and name in brew:
+        return f"brew install {brew[name]}"
+    if here == "windows" and name in winget:
+        return f"winget install {winget[name]}"
+    if here == "linux" and name in apt:
+        for mgr, cmd in (("apt-get", "sudo apt-get install -y"), ("dnf", "sudo dnf install -y"), ("pacman", "sudo pacman -S")):
+            if shutil.which(mgr):
+                return f"{cmd} {apt[name]}"
+    return script.get(name, f"install {name} with your package manager")
+
+
+class Doctor:
+    def __init__(self, probe_hosts=False):
+        self.cfg = omp_config.load()
+        self.probe_hosts = probe_hosts
+        self.here = host_platform()
+        self.checks = []
+        self.facts = {}
+
+    def add(self, area, id, status, detail, fix=None, decision=None, **extra):
+        assert status in STATUSES, status
+        row = {"area": area, "id": id, "status": status, "detail": detail}
+        if fix:
+            row["fix"] = fix
+        if decision:
+            row["decision"] = decision
+        row.update(extra)
+        self.checks.append(row)
+        return row
+
+    def choice(self, decision):
+        return self.cfg.choices.get(decision)
+
+    # -- areas ---------------------------------------------------------------------------------------
+    def config(self):
+        cfg = self.cfg
+        if not cfg.exists:
+            self.add("config", "config.file", "missing", f"no config at {cfg.path}: every key falls back to its default",
+                     "run the setup wizard: /contribute setup (references/setup.md)")
+            return
+        errors = validate_config(cfg.data)
+        if errors:
+            self.add("config", "config.file", "degraded", f"{cfg.path}: " + "; ".join(errors), f"edit {cfg.path} (references/config.md)")
+        else:
+            self.add("config", "config.file", "ok", cfg.path)
+        undecided = [d for d in DECISIONS if d not in cfg.choices]
+        if undecided:
+            self.add("config", "config.choices", "degraded", "no recorded choice for: " + ", ".join(undecided),
+                     "/contribute setup walks only these records")
+        else:
+            self.add("config", "config.choices", "ok", "every setup.md decision recorded")
+
+    def system(self):
+        ram = None
+        try:
+            if self.here == "macos":
+                ram = int(run("sysctl", "-n", "hw.memsize")[1]) / 2**30
+            elif self.here == "linux":
+                with open("/proc/meminfo") as f:
+                    ram = int(re.search(r"MemTotal:\s+(\d+)", f.read()).group(1)) / 2**20
+        except (ValueError, OSError, AttributeError):
+            pass
+        cores = os.cpu_count()
+        self.facts["system"] = {"os": self.here, "arch": platform.machine(), "ram_gb": round(ram) if ram else None, "cores": cores}
+        detail = f"{self.here} {platform.machine()}, {round(ram) if ram else '?'} GB RAM, {cores} cores"
+        if ram and ram < 24:
+            self.add("system", "system", "degraded", detail + ": a merged-tree build plus parallel workers can run out of memory",
+                     "keep task.maxConcurrency low for queue rounds (queue.md), or set an ssh build host")
+        else:
+            self.add("system", "system", "ok", detail)
+
+    def tools(self):
+        def version(name, *args):
+            path = shutil.which(name)
+            if not path:
+                return None
+            code, out, err = run(name, *args, timeout=5)
+            if code != 0:  # a shim on PATH whose target is gone (rustup/bun proxies) counts as missing
+                return None
+            return (out or err).splitlines()[0] if (out or err) else path
+
+        names = {"git": ("--version",), "gh": ("--version",), "uv": ("--version",), "bun": ("--version",),
+                 "ffmpeg": ("-version",), "pngquant": ("--version",), "oxipng": ("--version",), "cargo": ("--version",),
+                 "rustup": ("--version",), "docker": ("--version",), "python3": ("--version",)}
+        with concurrent.futures.ThreadPoolExecutor(len(names)) as pool:
+            found = dict(zip(names, pool.map(lambda n: version(n, *names[n]), names)))
+        self.facts["tools"] = found
+        required = {"git": "the whole flow", "gh": "every GitHub read and the PR itself", "bun": "oh-my-pi's build and tests, charts"}
+        optional = {"uv": ("pr-images (GitHub attachments)", "image-upload"),
+                    "ffmpeg": ("animated captures and video frames for PR images", "chart-tools"),
+                    "pngquant": ("smaller chart PNGs (skipped with a warning when missing)", "chart-tools"),
+                    "oxipng": ("smaller chart PNGs (skipped with a warning when missing)", "chart-tools"),
+                    "docker": ("only for reproducing Linux-only bugs locally", None)}
+        for name, why in required.items():
+            if found[name]:
+                self.add("tools", f"tools.{name}", "ok", found[name])
+            else:
+                self.add("tools", f"tools.{name}", "missing", f"needed for {why}", package_hint(name, self.here))
+        py = found["python3"]
+        m = re.search(r"(\d+)\.(\d+)", py or "")
+        if m and (int(m.group(1)), int(m.group(2))) >= (3, 11):
+            self.add("tools", "tools.python3", "ok", py)
+        else:
+            self.add("tools", "tools.python3", "missing", f"python3 >= 3.11 needed (tomllib); found {py or 'none'}",
+                     package_hint("python3", self.here))
+        for name, (why, decision) in optional.items():
+            if found[name]:
+                self.add("tools", f"tools.{name}", "ok", found[name], decision=decision)
+            else:
+                self.add("tools", f"tools.{name}", "degraded" if decision else "unknown", f"not installed: {why}",
+                         package_hint(name, self.here), decision=decision)
+        # gh auth: `gh auth token` reads the local keychain; the login comes from omp_config's cached lookup.
+        if found["gh"]:
+            code, _, err = run("gh", "auth", "token", timeout=5)
+            if code != 0:
+                self.add("tools", "tools.gh-auth", "missing", "gh is not logged in", "gh auth login", decision="github")
+            else:
+                login = self.cfg.fork_owner
+                self.add("tools", "tools.gh-auth", "ok" if login else "unknown",
+                         f"logged in as {login}" if login else "logged in; `gh api user` did not answer (offline?)", decision="github")
+        # Rust: the Windows cross-check needs cargo-xwin and the msvc target.
+        targets = []
+        if found["rustup"]:
+            targets = run("rustup", "target", "list", "--installed", timeout=5)[1].split()
+        xwin = bool(shutil.which("cargo-xwin"))
+        self.facts["rust"] = {"cargo": bool(found["cargo"]), "targets": targets, "xwin": xwin}
+        if found["cargo"]:
+            self.add("tools", "tools.rust", "ok", f"{found['cargo']}; targets: {', '.join(targets) or 'host only'}"
+                     + ("; cargo-xwin" if xwin else ""), decision="build-hosts")
+        else:
+            self.add("tools", "tools.rust", "degraded", "no cargo: Rust diffs need an ssh or ci build host",
+                     package_hint("rustup", self.here), decision="build-hosts")
+
+    def repo(self):
+        cfg = self.cfg
+        checkout = cfg.checkout
+        source = cfg.source("paths.checkout")
+        code, top, _ = run("git", "rev-parse", "--show-toplevel", cwd=checkout) if os.path.isdir(checkout) else (None, "", "")
+        remotes = {}
+        if code == 0:
+            for line in run("git", "remote", "-v", cwd=checkout)[1].splitlines():
+                parts = line.split()
+                if len(parts) >= 2:
+                    remotes[parts[0]] = parts[1]
+        upstream_name = cfg.upstream_repo.split("/")[-1]
+        upstream_remote = next((r for r, u in sorted(remotes.items(), key=lambda kv: kv[0] != "origin")
+                                if re.search(rf"github\.com[:/]+{re.escape(cfg.upstream_repo)}(\.git)?/?$", u, re.I)), None)
+        self.facts["repo"] = {"checkout": checkout, "remotes": remotes, "upstream_remote": upstream_remote}
+        if code != 0 or not any(upstream_name in u for u in remotes.values()):
+            self.add("repo", "repo.checkout", "missing",
+                     f"{checkout} ({source}) is not a clone of {cfg.upstream_repo}",
+                     f"gh repo clone {cfg.upstream_repo} <dir> && set paths.checkout (or run omp from inside the clone)",
+                     decision="github")
+            return False
+        self.add("repo", "repo.checkout", "ok", f"{top} ({source})", decision="github")
+        if upstream_remote == "origin":
+            self.add("repo", "repo.origin", "ok", f"origin = {remotes['origin']}")
+        elif upstream_remote:
+            self.add("repo", "repo.origin", "degraded", f"the upstream is remote {upstream_remote!r}, not origin: scripts read origin/main",
+                     f"git -C {checkout} remote rename origin <other> && git -C {checkout} remote rename {upstream_remote} origin")
+        else:
+            self.add("repo", "repo.origin", "missing", f"no remote points at {cfg.upstream_repo}",
+                     f"git -C {checkout} remote add origin https://github.com/{cfg.upstream_repo}.git")
+        fork = cfg.fork_remote
+        owner = cfg.fork_owner
+        fork_url = remotes.get(fork, "")
+        if fork_url and omp_config.url_owner(fork_url).lower() == (owner or "").lower() and owner:
+            self.add("repo", "repo.fork", "ok", f"{fork} = {fork_url}", decision="github")
+            has_fork = True
+        elif fork_url:
+            self.add("repo", "repo.fork", "degraded", f"remote {fork} = {fork_url}, owner is not {owner or '(unknown login)'}",
+                     "set github.fork_owner / github.fork_remote, or doctor --fix fork", decision="github")
+            has_fork = True
+        else:
+            self.add("repo", "repo.fork", "missing", f"no remote for {owner or '<your login>'}'s fork of {cfg.upstream_repo}",
+                     "doctor --fix fork", decision="github")
+            has_fork = False
+        self.facts["fork"] = has_fork
+        if has_fork:
+            ref = f"refs/remotes/{fork}/{cfg.queue_branch}"
+            if run("git", "rev-parse", "-q", "--verify", ref, cwd=checkout)[0] == 0:
+                self.add("repo", "repo.queue-branch", "ok", f"{fork}/{cfg.queue_branch} (as of the last fetch)")
+            else:
+                self.add("repo", "repo.queue-branch", "unknown",
+                         f"no {fork}/{cfg.queue_branch} locally: the first `pr-queue add` creates it, or it exists and was never fetched",
+                         "doctor --fix queue-branch")
+        hook = os.path.join(HERE, "hooks", "commit-msg")
+        code, hooks, _ = run("git", "rev-parse", "--path-format=absolute", "--git-path", "hooks", cwd=checkout)
+        target = os.path.join(hooks, "commit-msg") if code == 0 else ""
+        if target and os.path.realpath(target) == hook:
+            self.add("repo", "repo.hook", "ok", f"{target} -> this skill's hook", decision="github")
+        elif target and os.path.lexists(target):
+            self.add("repo", "repo.hook", "degraded", f"{target} is another hook ({os.path.realpath(target)})",
+                     "doctor --fix hook (keeps it as commit-msg.chained, run first)", decision="github")
+        else:
+            self.add("repo", "repo.hook", "missing", "no commit-msg hook: a commit naming #N lands on that PR's timeline",
+                     "doctor --fix hook", decision="github")
+        return True
+
+    def tier(self):
+        """roboomp's per-hour PR-review tier for the fork owner (omp_queue.roboomp_tier: config, else a
+        cached REST search for a merged PR upstream), which sets the queue's ready budget."""
+        login = self.cfg.fork_owner
+        if not login:
+            self.add("github", "github.tier", "unknown", "no GitHub login: roboomp's tier is unknown", "gh auth login", decision="github")
+            return
+        try:
+            import omp_queue
+            tier, cap = omp_queue.roboomp_tier(login)
+        except Exception as e:  # the helper is best-effort; doctor reports, never crashes on it
+            self.add("github", "github.tier", "unknown", f"tier lookup failed: {e}", decision="github")
+            return
+        self.facts["tier"] = {"tier": tier, "cap": cap}
+        self.add("github", "github.tier", "ok",
+                 f"roboomp tier for {login}: {tier} ({'no cap' if cap is None else f'{cap} reviewed PRs an hour'})"
+                 + ("; a first merged PR raises it" if tier == "first-time" else ""), decision="github")
+
+    def omp(self):
+        if not shutil.which("omp"):
+            self.add("omp", "omp", "missing", "omp is not on PATH", "install omp (https://github.com/can1357/oh-my-pi)")
+            return
+
+        def get(key):
+            code, out, err = run("omp", "config", "get", key, "--json", timeout=5)
+            try:
+                return json.loads(out).get("value") if code == 0 else None
+            except json.JSONDecodeError:
+                return None
+
+        keys = ["task.maxRecursionDepth", "task.agentSoftRequestBudget", "task.softRequestBudget", "task.isolation.enabled"]
+        with concurrent.futures.ThreadPoolExecutor(4) as pool:
+            values = dict(zip(keys, pool.map(get, keys)))
+        depth = values["task.maxRecursionDepth"]
+        budgets = values["task.agentSoftRequestBudget"] or {}
+        reviewer_budget = budgets.get("reviewer", values["task.softRequestBudget"] if values["task.softRequestBudget"] is not None else 200)
+        iso = values["task.isolation.enabled"]
+        self.facts["omp_settings"] = {"task.maxRecursionDepth": depth, "reviewer_budget": reviewer_budget,
+                                      "task.agentSoftRequestBudget": budgets, "task.isolation.enabled": iso}
+        rows = [("task.maxRecursionDepth", depth, isinstance(depth, int) and depth >= 3, "omp config set task.maxRecursionDepth 3"),
+                ("task.agentSoftRequestBudget.reviewer", reviewer_budget,
+                 isinstance(reviewer_budget, int) and (reviewer_budget == 0 or reviewer_budget >= 400),
+                 f"omp config set task.agentSoftRequestBudget '{json.dumps({**budgets, 'reviewer': 400}, separators=(',', ':'))}'"),
+                ("task.isolation.enabled", iso, iso is True, "omp config set task.isolation.enabled true")]
+        choice = self.choice("omp-settings")
+        for key, value, good, fix in rows:
+            why = SETTINGS[key.removesuffix(".reviewer")][1]
+            if good:
+                self.add("omp", f"omp.{key}", "ok", f"{key} = {value}", decision="omp-settings")
+            elif choice:
+                self.add("omp", f"omp.{key}", "ok", f"{key} = {value}; kept by choice: {choice.get('reason', '')}", decision="omp-settings")
+            else:
+                self.add("omp", f"omp.{key}", "degraded", f"{key} = {value}: {why}", fix, decision="omp-settings")
+
+    def models(self):
+        if not shutil.which("omp"):
+            return
+        code, out, err = run("omp", "models", "--json", timeout=15)
+        try:
+            models = json.loads(out)["models"] if code == 0 else []
+        except (json.JSONDecodeError, KeyError):
+            models = []
+        fams = families(models)
+        self.facts["families"] = {f: len(ms) for f, ms in sorted(fams.items())}
+        if not models:
+            self.add("models", "models.available", "missing", "omp lists no usable models: no provider is logged in",
+                     "omp then /login (or set a provider API key)")
+            return
+        self.add("models", "models.available", "ok", f"{len(models)} models; families: {', '.join(sorted(fams)) or 'none recognised'}")
+        cfg = self.cfg
+        ids = {m.get("selector") or f"{m['provider']}/{m['id']}" for m in models}
+        if cfg.reviewer_model:
+            fam = model_family(cfg.reviewer_model)
+            status = "ok" if cfg.reviewer_model.split(":")[0] in ids or any(i.endswith("/" + cfg.reviewer_model.split(":")[0]) for i in ids) else "degraded"
+            self.add("models", "models.reviewer", status,
+                     f"models.reviewer = {cfg.reviewer_model} ({fam or 'unknown family'})" + ("" if status == "ok" else ": not among the available models"),
+                     None if status == "ok" else "pick another with `omp models`", decision="reviewer")
+        elif len(fams) >= 2:
+            self.add("models", "models.reviewer", "ok",
+                     "unset: the reviewer-family extension picks a model of another family than the session's at spawn", decision="reviewer")
+        else:
+            self.add("models", "models.reviewer", "degraded",
+                     f"one family available ({', '.join(fams) or 'none'}): the reviewer shares the author's lineage; the PR's Testing section says so",
+                     "log in to a second provider family (omp /login)", decision="reviewer")
+        pair = cfg.behaviour_models or behaviour_pair(models)
+        self.facts["behaviour_pair"] = pair
+        if len(pair) == 2 and len({model_family(p) for p in pair}) == 2:
+            self.add("models", "models.behaviour", "ok", ("models.behaviour = " if cfg.behaviour_models else "derived pair: ") + " + ".join(pair),
+                     decision="behaviour-models")
+        else:
+            self.add("models", "models.behaviour", "degraded",
+                     "no pair of different families for behaviour runs of prompt changes: precheck's behaviour NOTE runs one model",
+                     "log in to a second provider family, or set models.behaviour", decision="behaviour-models")
+
+    def browser(self):
+        cfg = self.cfg
+        relay_on = None
+        url = "http://127.0.0.1:9224"
+        if shutil.which("omp"):
+            for key in ("browser.relay", "browser.relayUrl"):
+                code, out, _ = run("omp", "config", "get", key, "--json", timeout=5)
+                try:
+                    value = json.loads(out).get("value") if code == 0 else None
+                except json.JSONDecodeError:
+                    value = None
+                if key == "browser.relay":
+                    relay_on = value
+                elif value:
+                    url = value
+        status = None
+        try:
+            with urllib.request.urlopen(f"{url.rstrip('/')}/json/version", timeout=1) as r:
+                status = r.status
+        except urllib.error.HTTPError as e:
+            status = e.code
+        except (urllib.error.URLError, OSError, ValueError):
+            status = None
+        connected = status is not None and 200 <= status < 300
+        self.facts["relay"] = {"setting": relay_on, "url": url, "http": status, "connected": connected}
+        if connected and relay_on is False:
+            relay = ("degraded", f"a relay answers at {url}, but browser.relay is off, so omp's browser tool does not use it")
+        elif connected:
+            relay = ("ok", f"relay at {url}, Chrome extension connected")
+        elif status == 503:
+            relay = ("degraded", f"relay at {url} answers but no Chrome extension is connected")
+        elif relay_on:
+            relay = ("unknown", f"browser.relay is on; nothing answers at {url} now (it starts on first browser use)")
+        else:
+            relay = ("degraded", "browser.relay is off")
+        choice = self.choice("image-upload")
+        upload = cfg.image_upload
+        relay_fix = "omp browser-relay install, load it in Chrome, omp config set browser.relay true"
+        if upload == "relay":
+            self.add("browser", "browser.relay", relay[0], relay[1], None if relay[0] == "ok" else relay_fix, decision="image-upload")
+            self.add("browser", "browser.github-signin", "unknown",
+                     "whether that Chrome is signed in to github.com: open https://github.com in a relay tab once and look",
+                     decision="image-upload")
+        else:
+            reoffer = choice_reoffer(choice, "relay", connected)
+            detail = f"images.upload = {upload}" + (f" by choice: {choice.get('reason')}" if choice else " with no recorded choice")
+            row = self.add("browser", "browser.relay", "ok" if choice else "degraded",
+                           detail + "; fork-branch links: no theme/phone variants, break when the branch is deleted",
+                           "re-offer the relay (setup.md image-upload)" if reoffer or not choice else None, decision="image-upload")
+            if reoffer:
+                row["reoffer"] = True
+
+    def ssh_hosts(self):
+        """Concrete Host names in ~/.ssh/config and its Includes."""
+        seen, hosts = set(), []
+
+        def parse(path):
+            path = os.path.expanduser(path)
+            if path in seen or not os.path.isfile(path):
+                return
+            seen.add(path)
+            with open(path, errors="replace") as f:
+                for line in f:
+                    m = re.match(r"^\s*(Host|Include)\s+(.+?)\s*$", line, re.I)
+                    if not m:
+                        continue
+                    if m.group(1).lower() == "include":
+                        for pat in m.group(2).split():
+                            pat = pat if os.path.isabs(os.path.expanduser(pat)) else os.path.join("~/.ssh", pat)
+                            for p in sorted(glob.glob(os.path.expanduser(pat))):
+                                parse(p)
+                    else:
+                        hosts.extend(h for h in m.group(2).split() if not re.search(r"[*?!]", h))
+        parse("~/.ssh/config")
+        return list(dict.fromkeys(hosts))
+
+    def hosts(self):
+        names = self.ssh_hosts()
+        found = {h: None for h in names}
+        if self.probe_hosts and names:
+            def probe(h):
+                code, out, _ = run("ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=4", h, "uname -sm", timeout=8)
+                return uname_platform(out) if code == 0 else None
+            with concurrent.futures.ThreadPoolExecutor(min(16, len(names))) as pool:
+                found = dict(zip(names, pool.map(probe, names)))
+        self.facts["ssh"] = found
+        self.facts["ssh_probed"] = self.probe_hosts
+        if not names:
+            self.add("hosts", "hosts.ssh", "ok", "no ssh hosts configured: builds run here or on CI", decision="build-hosts")
+        elif self.probe_hosts:
+            self.add("hosts", "hosts.ssh", "ok", "; ".join(f"{h}: {p or 'unreachable'}" for h, p in found.items()), decision="build-hosts")
+        else:
+            self.add("hosts", "hosts.ssh", "ok", f"{len(names)} hosts in ~/.ssh/config (not contacted: --probe-hosts): {', '.join(names)}",
+                     decision="build-hosts")
+
+    def build(self):
+        rust = self.facts.get("rust") or {}
+        caps = {"here": self.here, "cargo": rust.get("cargo"), "xwin": rust.get("xwin"),
+                "win_target": WINDOWS_TARGET in rust.get("targets", []), "ssh": self.facts.get("ssh", {}),
+                "ssh_probed": self.facts.get("ssh_probed"), "fork": self.facts.get("fork")}
+        choice = self.choice("build-hosts")
+        for plat in PLATFORMS:
+            value = self.cfg.build[plat]
+            status, detail, fix = placement_status(plat, value, caps)
+            best = recommend_placement(plat, caps)
+            detail += f" [{self.cfg.source('build.' + plat)}]"
+            if status == "degraded" and choice and value == "none":
+                status = "ok"
+                detail += f"; by choice: {choice.get('reason', '')}"
+            row = self.add("build", f"build.{plat}", status, detail, fix, decision="build-hosts", recommended=best)
+            rank = lambda v: 0 if v == "local" else 1 if v.startswith("ssh:") else 2 if v == "ci" else 3
+            if rank(best) < rank(value) and (not choice or choice_reoffer(choice, best, True)):
+                row["reoffer"] = True
+
+    def upstream(self):
+        checkout = self.facts.get("repo", {}).get("checkout") or self.cfg.checkout
+        ref = "origin/main"
+        if run("git", "rev-parse", "-q", "--verify", ref, cwd=checkout)[0] != 0:
+            self.add("upstream", "upstream.drift", "unknown", f"no {ref} in {checkout}", "git fetch origin")
+            return
+        current = upstream_hashes(checkout, ref)
+        try:
+            with open(VALIDATED) as f:
+                validated = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            self.add("upstream", "upstream.drift", "unknown", f"no baseline at {VALIDATED}", "doctor --record-validated")
+            return
+        drift = compare_drift(validated, current)
+        when = run("git", "log", "-1", "--format=%cs", ref, cwd=checkout)[1]
+        base = f"validated at {validated.get('commit', '?')[:11]} ({validated.get('date', '?')}); {ref} is {when}"
+        moved = drift["changed"] + drift["added"] + drift["removed"]
+        if moved:
+            self.add("upstream", "upstream.drift", "degraded",
+                     f"upstream changed since the skill was checked ({base}): " + ", ".join(
+                         [f"changed {p}" for p in drift["changed"]] + [f"new {p}" for p in drift["added"]] + [f"gone {p}" for p in drift["removed"]]),
+                     f"git -C {checkout} diff {validated.get('commit', '')[:11]} {ref} -- <those paths>: read them; upstream wins where the skill disagrees",
+                     drift=drift)
+        else:
+            self.add("upstream", "upstream.drift", "ok", f"no change since the validated baseline ({base})")
+
+    def autonomy(self):
+        cfg = self.cfg
+        detail = (f"open_p2 = {cfg.open_p2} ({'P2-by-design changes wait for your go-ahead' if cfg.open_p2 == 'hold' else 'P2s open like fixes'}); "
+                  f"supervised opens left: {cfg.supervised_opens}")
+        self.add("autonomy", "autonomy", "ok", detail, decision="autonomy")
+
+    def watcher(self):
+        if not self.cfg.watch_enabled:
+            self.add("watcher", "watcher", "ok", "off: run `pr-queue watch` by hand, or enable the contrib/ timer", decision="watcher")
+            return
+        # Unit names from contrib/: launchd dev.omp-contrib.pr-queue-watch, systemd pr-queue-watch.timer.
+        if self.here == "macos":
+            installed = glob.glob(os.path.expanduser("~/Library/LaunchAgents/dev.omp-contrib.pr-queue-watch.plist"))
+        elif self.here == "linux":
+            installed = glob.glob(os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+                                               "systemd", "user", "pr-queue-watch.timer"))
+        else:
+            installed = []
+        if installed:
+            self.add("watcher", "watcher", "ok", f"enabled: {', '.join(installed)}", decision="watcher")
+        else:
+            self.add("watcher", "watcher", "missing", "watch.enabled = true but no launchd/systemd unit is installed",
+                     "install the contrib/ template (setup.md, watcher)", decision="watcher")
+
+    def sessions(self):
+        root = os.path.join(os.environ.get("PI_CODING_AGENT_DIR") or os.path.expanduser("~/.omp/agent"), "sessions")
+        cutoff = time.time() - 14 * 86400
+        recent = 0
+        if os.path.isdir(root):
+            for d in os.scandir(root):
+                if d.is_dir():
+                    for f in os.scandir(d.path):
+                        if f.name.endswith(".jsonl") and f.stat().st_mtime > cutoff:
+                            recent += 1
+        self.facts["sessions"] = {"root": root, "recent_14d": recent}
+        if recent:
+            self.add("sessions", "sessions", "ok", f"{recent} session transcripts in the last 14 days under {root}", decision="session-reader")
+        else:
+            self.add("sessions", "sessions", "degraded", f"no session transcripts from the last 14 days under {root}: a hunt has nothing to read",
+                     decision="session-reader")
+
+    def charts(self):
+        charts = os.path.join(SKILL, "charts")
+        if not os.path.isdir(os.path.join(charts, "node_modules", "puppeteer-core")):
+            self.add("tools", "tools.charts", "degraded", "charts/ dependencies not installed", f"cd {charts} && bun install",
+                     decision="chart-tools")
+            return
+        if run("bun", "--version", timeout=5)[0] != 0:
+            self.add("tools", "tools.charts", "degraded", "charts need bun (see tools.bun)", decision="chart-tools")
+            return
+        code, out, err = run("bun", "-e", "import { defaultChrome } from './lib/page.mjs'; console.log(defaultChrome())", cwd=charts, timeout=10)
+        if code == 0 and out:
+            self.add("tools", "tools.charts", "ok", f"Chrome for charts: {out.splitlines()[-1]}", decision="chart-tools")
+        else:
+            self.add("tools", "tools.charts", "degraded", (err.splitlines() or ["no Chrome found"])[-1][:300],
+                     "open any omp `browser` tab once (installs Chrome for Testing), or set CHROME_PATH", decision="chart-tools")
+
+    # -- driver --------------------------------------------------------------------------------------
+    def run(self, areas=None):
+        start = time.monotonic()
+        want = set(areas or [])
+        on = (lambda a: not want or a in want)
+        # Resolve the lazily derived values the probes share once, before the threads race to derive them.
+        _ = (self.cfg.fork_owner, self.cfg.fork_remote, self.cfg.checkout, self.cfg.build)
+        # Independent slow probes in parallel; the rest depend on their facts.
+        with concurrent.futures.ThreadPoolExecutor(8) as pool:
+            jobs = [pool.submit(f) for a, f in (("config", self.config), ("system", self.system), ("omp", self.omp),
+                                                 ("models", self.models), ("browser", self.browser), ("hosts", self.hosts),
+                                                 ("sessions", self.sessions), ("github", self.tier)) if on(a) or (a == "hosts" and on("build"))]
+            tools_job = pool.submit(self.tools) if on("tools") or on("build") else None
+            repo_job = pool.submit(self.repo) if on("repo") or on("build") or on("upstream") else None
+            charts_job = pool.submit(self.charts) if on("tools") else None
+            for j in jobs + [x for x in (tools_job, repo_job, charts_job) if x]:
+                j.result()
+        if on("build"):
+            self.build()
+        if on("upstream"):
+            self.upstream()
+        if on("autonomy"):
+            self.autonomy()
+        if on("watcher"):
+            self.watcher()
+        if want:
+            self.checks = [c for c in self.checks if c["area"] in want]
+        order = {a: i for i, a in enumerate(("config", "system", "tools", "repo", "github", "omp", "models", "browser", "hosts",
+                                             "build", "upstream", "autonomy", "watcher", "sessions"))}
+        self.checks.sort(key=lambda c: order.get(c["area"], 99))
+        summary = {s: sum(c["status"] == s for c in self.checks) for s in STATUSES}
+        return {
+            "doctor": 1,
+            # Set up = the wizard ran: a valid file holding at least one recorded choice. Records still
+            # missing show as config.choices and are walked on their own by /contribute setup.
+            "configured": is_configured(self.cfg),
+            "config_path": self.cfg.path,
+            "values": {k: {"value": self.cfg.get(k), "source": self.cfg.source(k)} for k in (
+                "github.fork_owner", "github.fork_remote", "github.branch_prefix", "github.queue_branch", "paths.checkout",
+                "paths.worktrees", "build.linux", "build.macos", "build.windows", "images.upload", "autonomy.open_p2",
+                "autonomy.supervised_opens", "watch.enabled")},
+            "choices": self.cfg.choices,
+            "facts": self.facts,
+            "checks": self.checks,
+            "summary": summary,
+            "reoffer": [c["id"] for c in self.checks if c.get("reoffer")],
+            "elapsed_s": round(time.monotonic() - start, 2),
+        }
+
+
+def upstream_hashes(repo, ref):
+    """{path or path#section: sha} of upstream's contribution documents at ref, read from git objects."""
+    out = {}
+
+    def show(path):
+        code, text, _ = run("git", "show", f"{ref}:{path}", cwd=repo)
+        return text if code == 0 else None
+
+    for path in UPSTREAM_FILES:
+        text = show(path)
+        if text is not None:
+            out[path] = sha(text)
+    for path, sections in UPSTREAM_SECTIONS.items():
+        text = show(path)
+        for heading in sections:
+            section = markdown_section(text or "", heading)
+            if section:
+                out[f"{path}#{heading}"] = sha(section)
+    for d in UPSTREAM_DIRS:
+        code, listing, _ = run("git", "ls-tree", "-r", "--name-only", ref, "--", d, cwd=repo)
+        for path in listing.splitlines() if code == 0 else []:
+            text = show(path)
+            if text is not None:
+                out[path] = sha(text)
+    return out
+
+
+# ---------------------------------------------------------------------------------------------------
+# repairs
+
+def step(desc, *cmd, dry, cwd=None):
+    print(f"-> {desc}" + (f": {' '.join(cmd)}" if cmd else ""))
+    if dry or not cmd:
+        return True
+    p = subprocess.run(cmd, cwd=cwd)
+    if p.returncode:
+        print(f"   failed ({p.returncode})", file=sys.stderr)
+    return p.returncode == 0
+
+
+def fix(area, dry):
+    cfg = omp_config.load()
+    checkout = cfg.checkout
+    if area == "hook":
+        return step("link the commit-msg hook into the checkout's hooks dir (an existing hook runs first, as commit-msg.chained)",
+                    sys.executable, os.path.join(HERE, "hooks", "install"), checkout, dry=dry)
+    if area == "fork":
+        owner = cfg.fork_owner
+        if not owner:
+            print("gh has no login: run `gh auth login` first", file=sys.stderr)
+            return False
+        name = cfg.get("github.fork_remote") if cfg.source("github.fork_remote") == "file" else "fork"
+        url = f"https://github.com/{owner}/{cfg.upstream_repo.split('/')[-1]}.git"
+        remotes = run("git", "remote", cwd=checkout)[1].split()
+        ok = step(f"create {owner}'s fork of {cfg.upstream_repo} on GitHub if it does not exist (no clone; existing fork is kept)",
+                  "gh", "repo", "fork", cfg.upstream_repo, "--clone=false", "--default-branch-only", dry=dry, cwd=checkout)
+        if name in remotes:
+            print(f"-> remote {name} exists already: left as is")
+            return ok
+        return ok and step(f"add remote {name!r} for the fork", "git", "-C", checkout, "remote", "add", name, url, dry=dry)
+    if area == "queue-branch":
+        print(f"-> create {cfg.fork_remote}/{cfg.queue_branch} with an empty queue manifest (pr-queue's store)")
+        if dry:
+            return True
+        import omp_queue
+        omp_queue.Store(checkout).update(lambda manifest, files: None, "pr-queue: create the queue")
+        return True
+    if area == "omp-settings":
+        d = Doctor()
+        d.omp()
+        ok = True
+        for c in d.checks:
+            if c["status"] == "degraded" and c.get("fix", "").startswith("omp config set"):
+                key, value = _split_set(c["fix"])
+                ok &= step(f"set {key} ({c['detail']})", "omp", "config", "set", key, value, dry=dry)
+        if ok and not any(c["status"] == "degraded" for c in d.checks):
+            print("-> nothing to change")
+        return ok
+    print(f"unknown --fix area {area!r} (hook, fork, queue-branch, omp-settings)", file=sys.stderr)
+    return False
+
+
+def _split_set(line):
+    """`omp config set KEY VALUE` (VALUE maybe single-quoted JSON) → [KEY, VALUE]."""
+    rest = line.removeprefix("omp config set ").strip()
+    key, value = rest.split(" ", 1)
+    return [key, value.strip().strip("'")]
+
+
+def record_validated(ref):
+    cfg = omp_config.load()
+    repo = cfg.checkout
+    commit = run("git", "rev-parse", ref, cwd=repo)[1]
+    if not commit:
+        sys.exit(f"{ref}: not found in {repo}")
+    data = {"note": "Hashes of upstream's contribution documents the skill was last checked against "
+                    "(doctor --record-validated). doctor flags any that changed at origin/main.",
+            "upstream": cfg.upstream_repo, "commit": commit,
+            "date": run("git", "log", "-1", "--format=%cs", commit, cwd=repo)[1],
+            "hashes": upstream_hashes(repo, commit)}
+    with open(VALIDATED, "w") as f:
+        json.dump(data, f, indent=1, sort_keys=True)
+        f.write("\n")
+    print(f"{VALIDATED}: {len(data['hashes'])} documents at {commit[:11]}")
+
+
+def render(report):
+    mark = {"ok": "ok  ", "missing": "MISS", "degraded": "warn", "unknown": "?   "}
+    lines = [f"config: {report['config_path']} ({'configured' if report['configured'] else 'NOT CONFIGURED: run /contribute setup'})"]
+    for c in report["checks"]:
+        lines.append(f"{mark[c['status']]} {c['id']:<36} {c['detail']}")
+        if c.get("fix") and c["status"] != "ok":
+            lines.append(f"     {'':<36} fix: {c['fix']}")
+        if c.get("reoffer"):
+            better = f"{c['recommended']} is possible now" if c.get("recommended") else "the ideal is available now"
+            lines.append(f"     {'':<36} re-offer: {better} (setup.md, {c.get('decision')})")
+    s = report["summary"]
+    lines.append(f"{s['ok']} ok, {s['missing']} missing, {s['degraded']} degraded, {s['unknown']} unknown ({report['elapsed_s']} s)")
+    return "\n".join(lines)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="doctor", description=__doc__.split("\n")[0])
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--probe-hosts", action="store_true")
+    ap.add_argument("--area", nargs="+")
+    ap.add_argument("--fix")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--record-validated", action="store_true")
+    ap.add_argument("--ref", default="origin/main")
+    args = ap.parse_args(argv)
+    if args.record_validated:
+        record_validated(args.ref)
+        return 0
+    if args.fix:
+        return 0 if fix(args.fix, args.dry_run) else 1
+    report = Doctor(probe_hosts=args.probe_hosts).run(args.area)
+    print(json.dumps(report, indent=1, default=str) if args.json else render(report))
+    return 1 if report["summary"]["missing"] else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

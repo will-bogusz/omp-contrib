@@ -1,0 +1,944 @@
+#!/usr/bin/env python3
+"""Check an oh-my-pi branch for what roboomp keeps ranking down, before the PR is marked ready.
+
+usage: precheck [N] [--ref REF] [--body FILE] [--number N] [--title T] [--no-siblings] [--base REF]
+  N              PR number on the upstream repo: checks <fork remote>/<its branch> plus its body and links
+                 (fetches that branch first). Without N: checks HEAD of the worktree you run it in,
+                 and skips the body checks.
+  --ref REF      check REF in the repo you run it in instead of HEAD (pr-queue: a queued branch)
+  --body FILE    run the body checks on FILE, for a PR not opened yet
+  --number N     the PR number the CHANGELOG entries must link, with --ref (no GitHub calls)
+  --no-siblings  skip the checks against our other open PRs (conflicts, carried commits)
+  --title T      the PR title the commits' scopes are checked against (pr-queue: the entry's
+                 title); with N it is the PR's, else the oldest commit's subject
+  --base REF     diff against REF instead of origin/main: a queued branch whose needs have not
+                 merged (its recorded base), or an old commit replayed against its original base
+
+FIX lines are what roboomp flags as should-fix or blocking; fix them before marking ready (or
+before the next push). NOTE lines need a decision, not necessarily a change. Exit status 1 when
+any FIX line printed. Checks:
+  - inline `import(...)` and `as never` / `as any` escapes in added TypeScript lines (FIX), and
+    other new `as` casts in non-test source (NOTE: keep one only where it narrows at an IO or
+    page-evaluation boundary; cleanup.md removes casts that paper over flow)
+  - `expect(...).rejects` in added test lines (NOTE: when the promise settles from I/O, use
+    `rejectionOf` from test/helpers/rejection.ts; `.rejects` hangs Bun on Windows, and CI runs no
+    Windows tests)
+  - wall-clock tests in added test lines (FIX): sleeps, clock reads, elapsed-time assertions and
+    timer races (`Bun.sleep`, `performance.now`, `setTimeout(…, ms)`, `AbortSignal.timeout`,
+    `thread::sleep`, `.elapsed()`) pass or fail by machine load and fail CI;
+    `Bun.sleep(0)` (one timer turn) and a Rust `Instant::now()` epoch the test offsets explicitly
+    are fine; fake timers in the file exempt timer and elapsed lines; a per-test time limit is a NOTE
+  - repo tooling on what the diff adds (FIX): oxlint findings on added TS lines (`bun check` passes
+    on warnings, so `unicorn/no-thenable` went unflagged on #15274 until a maintainer annotated it), files
+    oxfmt would reformat (#15125, committed after the last check), and `new Promise(` outside a
+    string (AGENTS.md wants `Promise.withResolvers()`; the maintainer rewrote it on #15118)
+  - every package whose source the diff touches has an added line under `## [Unreleased]` in its
+    CHANGELOG.md (crates/pi-natives counts as packages/natives); with N, each added entry links the
+    PR and credits @<you> (`github.fork_owner`). Skipped when every commit is `test:` (AGENTS.md: entries are
+    user-facing, and inline Rust test modules live under src/). Where the diff rewrites source lines
+    from commits no `v*` tag ships, the fix may be of a regression no user had: a missing entry is
+    a NOTE, and an added one a NOTE naming those commits (the maintainer dropped #15941's, `7c9d457d70`)
+  - the same entries after a simulated merge of origin/main (FIX): merge=union leaves an entry
+    under a release cut since the branch point, or repeats a `###` heading. The maintainer asks
+    for this on every PR; rebase onto origin/main and move the line
+  - test shapes maintainers rewrote (NOTE): full-string assertions, `test.each` rows (each must
+    fail with the fix reverted), casts in mocks, and new tests beside credential code that falls
+    back to env keys
+  - changed parameter lists on package source declarations (NOTE: Breaking Changes entry if
+    exported), and docs naming a changed function that the diff leaves untouched (NOTE)
+  - what the diff takes out or adds beside its one change (NOTE, code-style.md): each call
+    statement it removes from source and adds back nowhere (#15604 dropped
+    `enable_web_accessibility`), a commit whose conventional scope is outside the title's (#15414's
+    `test(coding-agent)` commit on a `fix(natives)` PR), a test asserting on script or source
+    text instead of running it (#15599's cmux test), and source files that name a third of a
+    type file's fields but not a field the diff adds to it (#15680's anonymizer)
+  - model or provider policy in TypeScript outside packages/catalog (NOTE): a new numeric constant
+    whose name, line or doc comment names a provider or model family, and string matching on a
+    model id (`id.includes(...)`). AGENTS.md puts that policy in the catalog's KDL rules; the maintainer moved
+    it there on #11613, #8577, #14286 and #14751
+  - a credential-shaped value (a name or expression with url, token, apiKey, auth, header, env, …)
+    passed unredacted to `prompt.render(...)`, or rendered by a prompt template the diff adds
+    (NOTE): the prompt goes to the model provider; #16390 rendered `browser.cdpUrl` and the maintainer
+    redacted it (914654c252)
+  - a change that can move agent behaviour (NOTE, advisory): prompt text, or tool, prelude or eval
+    code the model calls (`src/prompts/`, `src/tools/`, `src/eval/`), whose `## Testing` names no
+    sample-set run on two models of different families (`models.behaviour` in your config; unset,
+    any two families). They read the same line differently (#15402: a GPT model ignored a todo rule
+    Opus kept); #16231 rewrote the todo
+    rule every model reads and was checked only by tests that render the text. A change no model
+    sees (a parser fix, a cleanup) needs none: the NOTE is a prompt to decide
+  - Rust (FIX; NOTE when `build.<platform>` is "none" or its ssh host does not answer): a branch
+    changing Rust needs `rust-check` recorded (the queue manifest's
+    `rust_checks`, fetched) for its Rust diff on Linux, plus macOS or Windows when it touches code
+    under that OS's paths or `cfg`; CI compiles no Rust before the merge (#16202's Wayland E0618,
+    bf9fd4bd6a; #16140's macOS clippy, ef7c45bd4b)
+  - the independent review (workflow step 3, recorded with `review-stamp`): NOTE when none is
+    recorded, and when it asked for changes (each must-fix fixed or answered; no second round)
+  - commit messages naming a PR as `#N`, `owner/repo#N` or a PR URL (NOTE): each push of a new SHA
+    lands a reference on that PR's timeline; `quiet-refs` rewrites them after the next rebase the
+    PR needs anyway, never in a push of its own
+  - body (with N or --body): What/Why/Testing headings, a first-person own-words line opening
+    `## What`, under 3,000 characters outside tables, <details>, images and the checklist, no @-mention of
+    Codex, roboomp or a maintainer, and no merge-order line (`Builds on #N` for an open PR of ours,
+    `merge #N first`, `Merge after`, `Overlaps #N`; FIX: shaping.md, Open-PR rule)
+  - queue (with N, FIX): a closed PR whose change `pr-queue` holds queued reopens with the stored
+    body, so an edit to GitHub's is lost (queue.md); and a draft or unopened PR while the queue's
+    opening pause is set (`pr-queue pause`): it stays as it is until `pr-queue unpause`
+  - links (with N): open issues the body mentions that the PR does not close, so each is a
+    deliberate Fixes-or-Related call; and the issues it does close
+  - siblings (FIX, shaping.md Open-PR rule): commits of another open PR of ours on this branch
+    (by patch id, so older copies count), and a code conflict with an open ready PR of ours once
+    both land on origin/main. NOTE instead for a code conflict the rule accepts: a P0/P1 entry and
+    an open P2 open more than 3 days, or a pair `pr-queue open` opened that way (Open-PR rule 3);
+    NOTE for a conflict only in the generated catalog files, which the
+    maintainer regenerates at merge, and for each crate or package this branch changes that an open
+    ready PR of ours changes too (crates/<name>, packages/<name>): git merges the two cleanly, yet
+    the pair can fail to build (#15761 + #15762, E0507), so build and test the merged tree
+"""
+import argparse
+import os
+import re
+import subprocess
+import sys
+import tempfile
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import omp_config  # noqa: E402
+from omp_pr import CHECKOUT, CODE, MAINTAINERS, ME, REPO, TS, Diff, blamed_commits, changelog_drift, gh_json, last_review, run  # noqa: E402
+from omp_pr import is_test_path, package_of, rust_checks, rust_diff_id, rust_platforms  # noqa: E402
+from omp_queue import (STORE_REMOTE, GitError, GitHub, Queue, Store, merge_order_lines, opening_pause, pause_line,  # noqa: E402
+                       quiet_refs, stored_body_entry, stored_body_message)
+
+BODY_LIMIT = 3000
+MENTIONS = re.compile(r"@(" + "|".join(map(re.escape, ("codex", "chatgpt-codex-connector", "roboomp", *MAINTAINERS)))
+                      + r")\b", re.I)
+CAST = re.compile(r"""[\w)\]}>"'`]\s+as\s+(?!const\b)[\w{\[(<]""")
+ESCAPE_CAST = re.compile(r"\bas\s+(never|any)\b")
+INLINE_IMPORT = re.compile(r"\bimport\s*\(")
+REJECTS = re.compile(r"\)\s*\.rejects\b")
+STRING = re.compile(r"""("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`)""")
+LONG_STRING = re.compile(r"""^\s*["'`].{40,}""")
+PROMISE = re.compile(r"\bnew\s+Promise\s*[<(]")
+# The globs `check:tools` hands to oxfmt.
+FMT_SCOPE = re.compile(r"^(packages/[^/]+/src/.+\.tsx?|packages/[^/]+/(test|bench|examples|scripts)/.+\.ts|"
+                       r"packages/[^/]+/[^/]+\.ts|scripts/.+\.ts)$")
+OX_LINE = re.compile(r"^(.+?):(\d+):\d+: (.*)$")
+EXACT_ASSERT = re.compile(r"""\.(toBe|toEqual|toStrictEqual)\(\s*(["'`].{40,})?$""")
+MOCK_CAST = re.compile(r"\bas\s+typeof\s+\w+")
+# A test whose result depends on how fast the machine runs: a loaded CI box fails it and an idle one
+# passes, so it is flaky by construction. Fake timers or an injected clock make
+# time an input; awaiting the event itself replaces a sleep. `Bun.sleep(0)` crosses one timer turn
+# without waiting for time to pass, so it stays allowed.
+TS_CLOCK = re.compile(r"\bBun\.sleep(?:Sync)?\s*\((?!\s*0\s*\))|\bperformance\.now\s*\(|\bprocess\.hrtime\b"
+                      r"|\bBun\.nanoseconds\s*\(|\bAbortSignal\.timeout\s*\(|\bwithTimeout\s*\(")
+TS_TIMER = re.compile(r"\bsetTimeout\s*\(.*,\s*(?:[1-9][\d_]*|[A-Z][A-Z0-9_]{2,})\s*\)")
+TS_ELAPSED = re.compile(r"(?:(?i:elapsed|duration|took|latency|millis)|[a-z]Ms\b|_ms\b|\bms\b|Date\.now\s*\(\))"
+                        r".*\.toBe(?:Less|Greater)Than")
+TS_TEST_LIMIT = re.compile(r"^\s*\}\s*,\s*(?:\d[\d_]*|\{\s*timeout\s*:)")
+FAKE_CLOCK = re.compile(r"\b(?:useFakeTimers|setSystemTime|advanceTimersByTime|advanceTimersToNextTimer|runAllTimers"
+                        r"|runOnlyPendingTimers)\b")
+# `let t0 = Instant::now();` alone is an epoch: the test hands the code `t0 + ms(n)` and nothing reads
+# the clock again. Reading it to compare, subtract or measure is timing.
+RS_CLOCK = re.compile(r"\bthread::sleep\s*\(|\.elapsed\s*\(|\bInstant::now\s*\(\)\s*(?:[-<>]|\.duration_since)"
+                      r"|[-<>]=?\s*Instant::now\s*\(|\brecv_timeout\s*\(|\btime::(?:sleep|timeout)\s*\(")
+# Rust test code starts at a `#[cfg(test)]` module; the same attribute on one item (a test-only
+# constructor in production code, #16284's skylight.rs) does not make what follows a test.
+RS_TEST_MOD = re.compile(r"^\s*(?:pub(?:\([\w ]+\))?\s+)?mod\s")
+EACH = re.compile(r"\b(test|it|describe)\.each\b")
+# A declaration line: `export function f(a)`, `async f(a): T {`, `f(a) {`. Single-line params only.
+DECL = re.compile(r"^\s*(?:export\s+)?(?:(?:public|static|async|function)\s+)*([A-Za-z_$][\w$]*)\s*\(([^()]*)\)\s*[:{]")
+NOT_DECL = {"if", "for", "while", "switch", "catch", "return", "await", "function", "new", "typeof"}
+CREDENTIAL_SRC = re.compile(r"packages/ai/src/(auth|auth-broker|registry/oauth|providers|usage)/")
+DOC_GLOBS = ("docs/*.md", "docs/**/*.md", "packages/*/docs/*.md", "packages/*/docs/**/*.md")
+# Identifier-shaped names only (camelCase, PascalCase, snake_case): `inherit` matches half the docs.
+DOC_NAME = re.compile(r"[a-z0-9][A-Z]|_[a-z]")
+# The enclosing function git prints after a hunk's `@@` (`export function f(`, `  async m(`). Class
+# and interface names are left out: a change inside `AuthStorage` is not a change to every doc naming it.
+CONTEXT_NAME = re.compile(
+    r"\bfunction\s+([A-Za-z_$][\w$]*)|^\s*(?:(?:export|async|static|public)\s+)*([A-Za-z_$][\w$]*)\s*\(")
+NUM_CONST = re.compile(r"^\s*(?:export\s+)?const\s+[A-Z][A-Z0-9_]*\s*(?::\s*[\w.]+\s*)?=\s*-?\d[\d_.]*\s*;?\s*(//.*)?$")
+PROVIDER_WORD = re.compile(
+    r"(?i)(anthropic|claude|openai|gpt-?\d|gemini|vertex|bedrock|cursor|devin|kimi|moonshot|grok|xai\b|"
+    r"deepseek|mistral|copilot|codex|antigravity|minimax|glm|qwen|fireworks|openrouter|opus|sonnet|haiku)")
+ID_MATCH = re.compile(r"\bid\??\.(includes|startsWith|endsWith|match)\(")
+POLICY_LOOKBACK = 8
+# A provider's own transport, login and usage modules hold that provider's wire constants and id
+# formats; policy shared across models is what belongs in KDL.
+PROVIDER_MODULE = re.compile(r"^packages/ai/src/(providers|registry/oauth|usage)/")
+# A statement that is only a call, its result unused: `foo(a);`, `await x.y(b);`, `mod::f(&c);`, or
+# the first line of a call spanning several. Macros (`println!(`) are left out.
+CALL_STMT = re.compile(r"^\s*(?:await\s+|void\s+|let\s+_\s*=\s*)?(?:(?:[A-Za-z_$][\w$]*)\s*(?:\?\.|\.|::|->)\s*)*"
+                       r"([A-Za-z_$][\w$]*)\s*\(")
+NOT_CALL = {"if", "for", "while", "switch", "catch", "return", "await", "function", "new", "typeof", "elif",
+            "match", "with", "fn", "def", "assert", "pub", "impl", "struct", "enum", "trait", "type"}
+# Not a call: a method signature (`text(s: string): Promise<T>;`).
+NOT_CALL_SHAPE = re.compile(r"\)\s*:")
+# An inline Rust test module, by the hunk context git prints (`mod capture_tests {`).
+TEST_MODULE = re.compile(r"\bmod\s+\w*tests?\b")
+STMT_END = (";", "(", "{")
+# Any callee in a line: a removed call whose callee an added line still calls was moved or reworded.
+CALLEE = re.compile(r"([A-Za-z_$][\w$]*)\s*(?:::<[^>]*>\s*)?\(")
+# A test asserting on a script's or a source file's text rather than on what running it does.
+SCRIPT_ASSERT = re.compile(r"\bexpect\(\s*(?:[\w$]*[Ss]cript[\w$]*(?:\[[^\]]*\])?|(?:[\w$]+\.)*(?:src|source|sourceText|"
+                           r"sourceCode)|[\w$.]+\.toString\(\))\s*\)\s*\.(?:not\.)?(?:toContain|toMatch|toInclude|"
+                           r"toStartWith|toEndWith)\(")
+SOURCE_READ = re.compile(r"""(?:readFileSync|readFile|Bun\.file|include_str!)\s*\([^)]*?["'`][^"'`]*"""
+                         r"""\.(?:ts|tsx|js|mjs|rs|py)["'`]""")
+# A property in an interface or object type body; its hunk context names the type.
+FIELD_DECL = re.compile(r"^\s*(?:readonly\s+)?([A-Za-z_$][\w$]*)\??\s*:\s*[^=]+?[;,]?\s*$")
+FIELD_NAME = re.compile(r"^\s*(?:readonly\s+)?([A-Za-z_$][\w$]*)\??\s*:", re.M)
+TYPE_CTX = re.compile(r"\binterface\s+\w|\btype\s+\w+(?:<[^>]*>)?\s*=")
+# A type file whose fields a consumer can be judged against: fewer distinctive field names and a
+# third of them is too few to tell an allowlist from a passing mention.
+CONSUMER_MIN_FIELDS = 9
+def rust_where(platform, placement=None):
+    """(how to run rust-check for `platform`, or None when nothing checks it) from `build.<platform>`
+    (references/config.md): "local", "ssh:<host>", "ci" or "none"."""
+    placement = placement if placement is not None else omp_config.load().build[platform]
+    flag = " --windows" if platform == "windows" else ""
+    if placement == "local":
+        return f"scripts/rust-check{flag} in the PR's worktree here"
+    if placement.startswith("ssh:"):
+        host = placement[4:]
+        return f"scripts/rust-check{flag} in the PR's worktree on {host} (`ssh {host}`)"
+    if placement == "ci":
+        return f"scripts/rust-check --ci --platform {platform} (GitHub Actions on your fork)"
+    return None
+
+
+def host_reachable(host):
+    """Whether `ssh host` answers within a few seconds without a prompt."""
+    try:
+        return subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", host, "true"],
+                              capture_output=True, timeout=15).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+# Text a prompt template or `prompt.render` argument carries to the model provider. Words of a name
+# (camelCase or snake_case split) that say the value can hold a credential: a URL's userinfo and
+# query (#16390 rendered `browser.cdpUrl` verbatim; the maintainer wrapped it in redactUrlForLog, 914654c252).
+SECRET_WORDS = {"url", "urls", "uri", "endpoint", "token", "tokens", "secret", "secrets", "password", "passwd",
+                "apikey", "auth", "authorization", "cookie", "cookies", "credential", "credentials", "dsn",
+                "header", "headers", "env"}
+TEMPLATE_VAR = re.compile(r"\{\{\s*([A-Za-z_][\w.]*)\s*\}\}")
+RENDER_CALL = re.compile(r"\bprompt\.render\(")
+RENDER_ARG = re.compile(r"^\s*([A-Za-z_$][\w$]*)\s*:\s*(.+?),?\s*$")
+RENDER_LOOKBACK = 15
+
+findings = []
+
+
+def fix(kind, where, detail=""):
+    findings.append(1)
+    print(f"FIX   {kind:<10} {where}  {detail}".rstrip())
+
+
+def note(kind, where, detail=""):
+    print(f"NOTE  {kind:<10} {where}  {detail}".rstrip())
+
+
+def code_part(text):
+    """The line with string contents blanked and any // comment removed; '' for comment lines."""
+    stripped = text.strip()
+    if stripped.startswith(("//", "*", "/*")):
+        return ""
+    code = STRING.sub(lambda m: m.group(0)[0] * 2, text)
+    return code.split("//", 1)[0]
+
+
+def base_has_inline_import(path, base, cwd):
+    """True when `path` at `base` already loads modules with `import(` in code (a lazy-loader registry)."""
+    blob = subprocess.run(["git", "show", f"{base}:{path}"], capture_output=True, text=True, cwd=cwd)
+    return blob.returncode == 0 and any(INLINE_IMPORT.search(code_part(line)) for line in blob.stdout.splitlines())
+
+
+def check_code(added, base=None, cwd=None):
+    for path, lines in sorted(added.items()):
+        if not path.endswith(TS):
+            continue
+        is_test = is_test_path(path)
+        for i, (n, text) in enumerate(lines):
+            code = code_part(text)
+            if re.search(r"\b(import|export)\s+\*\s+as\b", code):
+                continue
+            if is_test and REJECTS.search(code):
+                note("rejects", f"{path}:{n}", "I/O-settled promise? use rejectionOf (test/helpers/rejection.ts)")
+            if ESCAPE_CAST.search(code):
+                fix("cast", f"{path}:{n}", text.strip()[:100])
+            elif is_test and MOCK_CAST.search(code):
+                note("mock-cast", f"{path}:{n}", "cast in a mock: mockResolvedValue / a typed fixture needs none")
+            elif CAST.search(code) and not is_test:
+                note("cast", f"{path}:{n}", text.strip()[:100])
+            if INLINE_IMPORT.search(code):
+                if base and base_has_inline_import(path, base, cwd):
+                    note("import()", f"{path}:{n}", "follows the file's existing import() loaders on main; say so in the body")
+                else:
+                    fix("import()", f"{path}:{n}", text.strip()[:100])
+            if is_test:
+                check_test_line(path, lines, i, n, text)
+
+
+def check_test_line(path, lines, i, n, text):
+    """Test shapes maintainers rewrote on our PRs (2026-10-08 round: #14763, #14765, #14753)."""
+    m = EXACT_ASSERT.search(text.rstrip())
+    following = lines[i + 1][1] if i + 1 < len(lines) and lines[i + 1][0] == n + 1 else ""
+    if m and (m.group(2) or LONG_STRING.match(following)):
+        note("exact-str", f"{path}:{n}", "full-string assertion: keep only if a consumer parses these bytes")
+    if EACH.search(code_part(text)):
+        note("each", f"{path}:{n}", "every row must fail with the fix reverted and cover a distinct case")
+
+
+def file_at(ref, path, cwd):
+    shown = run("git", "show", f"{ref}:{path}", cwd=cwd)
+    return shown.stdout if shown.returncode == 0 else ""
+
+
+def check_timing(added, ref, cwd):
+    """Added test lines whose pass or fail depends on wall-clock time (FIX): sleeps, clock reads,
+    elapsed-time assertions and timer races. A per-test time limit is a NOTE. Rust test code is a
+    file under a test path or anything below the file's `#[cfg(test)]`."""
+    for path, lines in sorted(added.items()):
+        if path.endswith(TS) and is_test_path(path):
+            fake = None
+            for n, text in lines:
+                code = code_part(text)
+                hit = TS_CLOCK.search(code)
+                if not hit and (TS_TIMER.search(code) or TS_ELAPSED.search(code)):
+                    if fake is None:
+                        fake = bool(FAKE_CLOCK.search(file_at(ref, path, cwd)))
+                    hit = not fake
+                if hit:
+                    fix("timing", f"{path}:{n}", "wall-clock test: use fake timers or an injected clock, "
+                        "and await the event instead of sleeping")
+                elif TS_TEST_LIMIT.match(code):
+                    note("timing", f"{path}:{n}", "per-test time limit: never lower the runner default; a test "
+                         "that needs a raised one is slow, not bounded")
+        elif path.endswith(".rs"):
+            start = 0 if is_test_path(path) else None
+            for n, text in lines:
+                code = code_part(text)
+                if not RS_CLOCK.search(code):
+                    continue
+                if start is None:
+                    head = file_at(ref, path, cwd).splitlines()
+                    start = next((i + 2 for i, line in enumerate(head[:-1]) if line.strip() == "#[cfg(test)]"
+                                  and RS_TEST_MOD.match(head[i + 1])), 0) or -1
+                if 0 <= start <= n:
+                    fix("timing", f"{path}:{n}", "wall-clock test: inject the clock or wait on the event, "
+                        "never sleep or time a call")
+
+
+def check_policy(added):
+    """Model or provider policy written in TS instead of the catalog's KDL rules (AGENTS.md, "Model/
+    Provider Policy Lives in KDL"). #14751 shipped `CACHE_LOOKBACK_POSITIONS = 20` under a comment
+    about Anthropic and applied it to every model; the maintainer replaced it with a `prompt-cache-lookback`
+    axis on the anthropic class (`1111b1fc03`)."""
+    for path, lines in sorted(added.items()):
+        if (not path.endswith(TS) or is_test_path(path) or path.startswith("packages/catalog/")
+                or PROVIDER_MODULE.match(path)):
+            continue
+        for i, (n, text) in enumerate(lines):
+            code = code_part(text)
+            if ID_MATCH.search(code):
+                note("kdl", f"{path}:{n}", "string match on a model id: policy belongs in the catalog KDL rules")
+                continue
+            if not NUM_CONST.match(text):
+                continue
+            # The constant's own line and the contiguous added lines just above it (its doc comment).
+            block = [text]
+            for prior_n, prior in reversed(lines[max(0, i - POLICY_LOOKBACK):i]):
+                if prior_n != n - len(block):
+                    break
+                block.append(prior)
+            word = next((m.group(1) for t in block if (m := PROVIDER_WORD.search(t))), None)
+            if word:
+                note("kdl", f"{path}:{n}", f"numeric constant tied to {word!r}: a catalog KDL axis, scoped "
+                                           f"to the class it is true for? ({text.strip()[:60]})")
+
+
+def check_review(branch, cwd):
+    """The one workflow step 3 review round (`review-stamp`). Fixes after it are not re-reviewed
+   : roboomp reviews the PR next."""
+    review = last_review(branch, cwd)
+    if not review:
+        note("review", branch, "no independent review recorded: run the one review round (workflow step 3), "
+                               "then scripts/review-stamp")
+        return
+    sha, verdict, at, by = review
+    if verdict == "needs-changes":
+        note("review", branch, f"the review at {sha[:10]} ({by or 'reviewer'}, {at}) asked for changes: each "
+                               "must-fix fixed (behaviour fixes with a test that fails on revert) or answered")
+
+
+def name_words(text):
+    """Lower-case words of the identifiers and strings in `text`, camelCase and snake_case split,
+    with `api` + `key` joined (`apiKey`, `API_KEY` -> apikey)."""
+    words = [w.lower() for w in re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|\d+", text)]
+    return set(words) | {"apikey" for a, b in zip(words, words[1:]) if (a, b) == ("api", "key")}
+
+
+def render_args(path, lines, ref, cwd):
+    """[(line, name, expression)] of the added lines in `path` that are arguments of a
+    `prompt.render(template, {...})` call: the nearest line above (within RENDER_LOOKBACK) indented
+    less than the argument opens the call."""
+    text = run("git", "show", f"{ref}:{path}", cwd=cwd).stdout.splitlines()
+    found = []
+    for n, line in lines:
+        m = RENDER_ARG.match(code_part(line))
+        if not m:
+            continue
+        indent = len(line) - len(line.lstrip())
+        for above in reversed(text[max(0, n - 1 - RENDER_LOOKBACK):n - 1]):
+            if above.strip() and len(above) - len(above.lstrip()) < indent:
+                if RENDER_CALL.search(above):
+                    found.append((n, m.group(1), (RENDER_ARG.match(line) or m).group(2)))
+                break
+    return found
+
+
+def check_prompt_values(added, ref, cwd):
+    """A settings or env value that can hold a credential (a URL with userinfo or a token query, a
+    key, a header) rendered into model-visible text without redaction: the system prompt goes to
+    the model provider. #16390 rendered `browser.cdpUrl` into the relay guidance block, and the maintainer
+    redacted it (914654c252, `redactUrlForLog`)."""
+    passed = []
+    for path, lines in sorted(added.items()):
+        if path.endswith(TS) and not is_test_path(path) and "/src/" in path:
+            passed += [(name, f"{path}:{n}", expr) for n, name, expr in render_args(path, lines, ref, cwd)]
+    # Each argument on its own: a redacted `url` at one call says nothing of another call's `url`.
+    for name, where, expr in passed:
+        if "redact" not in expr.lower() and (name_words(name) | name_words(expr)) & SECRET_WORDS:
+            note("secret", where, f"`{name}: {expr.strip()[:60]}` goes into a prompt the model provider reads: "
+                                  "can it carry a credential (URL userinfo or token query, key, header)? redact it "
+                                  "(redactUrlForLog) or render only the safe part")
+    # A placeholder whose value an added argument passes is judged at that argument, above.
+    passed = {name for name, _, _ in passed}
+    for path, lines in sorted(added.items()):
+        if "/src/" not in path or not path.endswith(".md") or is_test_path(path):
+            continue
+        for n, text in lines:
+            for name in TEMPLATE_VAR.findall(text):
+                if name in passed or not name_words(name) & SECRET_WORDS:
+                    continue
+                note("secret", f"{path}:{n}", f"renders {{{{{name}}}}} into model-visible text: check the value its "
+                                              "`prompt.render` caller passes can carry no credential, or redact it")
+
+
+AGENT_FACING = re.compile(r"/src/(prompts/.+\.md|tools/.+|eval/.+)$")
+# Model families a Testing section may name, for when `models.behaviour` is not configured.
+FAMILIES = {"Anthropic": re.compile(r"\b(haiku|sonnet|opus|claude)\b", re.I),
+            "OpenAI": re.compile(r"\b(gpt-\d[\w.-]*|codex|o\d(?:-mini)?)\b", re.I),
+            "Google": re.compile(r"\bgemini\b", re.I), "xAI": re.compile(r"\bgrok\b", re.I),
+            "open-weight": re.compile(r"\b(kimi|glm|deepseek|qwen|llama|mistral|minimax)\b", re.I)}
+
+
+def model_pattern(model):
+    """A model id (`anthropic/claude-haiku-4-5`, `gpt-5.1-codex`) as Testing would name it: its last
+    path segment, case-insensitive."""
+    return re.compile(r"(?<![\w.-])" + re.escape(model.rsplit("/", 1)[-1]) + r"(?![\w.-])", re.I)
+
+
+def check_behavior_eval(added, body):
+    """What agents do with a prompt or a tool is measured by running them, and two model families read
+    the same line differently. The two models are `models.behaviour` in your config; unset, any two
+    families named will do. Advisory: the path only hints the change can reach the model."""
+    paths = sorted(p for p in added if AGENT_FACING.search(p) and not is_test_path(p))
+    if not paths:
+        return
+    where = paths[0] + (f" (+{len(paths) - 1} more)" if len(paths) > 1 else "")
+    testing = ""
+    if body and "## Testing" in body:
+        testing = re.split(r"\n(?:## |---)", body.split("## Testing", 1)[1], maxsplit=1)[0]
+    models = omp_config.load().behaviour_models
+    if models:
+        missing = [m for m in models if not model_pattern(m).search(testing)]
+        runs = " and ".join(models)
+        unnamed = f"not named: {' or '.join(missing)}"
+    else:
+        named = [name for name, family in FAMILIES.items() if family.search(testing)]
+        missing = [] if len(named) >= 2 else ["two families"]
+        runs = "two models of different families (set models.behaviour in your config)"
+        unnamed = f"named: {', '.join(named) or 'none'}"
+    if missing:
+        note("behavior", where, f"can this change what an agent does? then run a sample set on main and this branch "
+                                f"with {runs}, scored from transcripts, and report it under ## Testing ({unnamed})")
+
+
+def queue_manifest(cwd):
+    """The queue manifest, fetched (rust-check records land from other hosts and CI); this host's copy when the
+    fetch fails."""
+    store = Store(cwd)
+    try:
+        return store.load()[0]
+    except GitError:
+        return store.load(fetch=False)[0]
+
+
+def check_rust(diff, base, ref, cwd, manifest):
+    """A Rust diff needs `rust-check` recorded on every platform it builds differently on: fork PRs
+    get no CI before the merge and CI runs no Rust on PRs, so the maintainer's build was the first to compile
+    #16202's Wayland change on Linux (E0618, bf9fd4bd6a) and to run clippy on #16140's macOS key
+    reroute (ef7c45bd4b). A record counts for the Rust diff it checked (its patch id): a rebase or a
+    CHANGELOG commit keeps it, a bot-round fix to a Rust line needs a new run."""
+    platforms = rust_platforms(diff, base, ref, cwd)
+    if not platforms:
+        return
+    diff_id = rust_diff_id(base, ref, cwd)
+    done = rust_checks(manifest, diff_id)
+    for platform in sorted(platforms):
+        if platform in done:
+            continue
+        placement = omp_config.load().build[platform]
+        how = rust_where(platform, placement)
+        if how is None:
+            note("rust", platform, f"unchecked: build.{platform} is \"{placement}\" in your config, so nothing "
+                                   f"compiles this Rust diff on {platform} before the merge; say so in the PR's "
+                                   "## Testing section")
+        elif placement.startswith("ssh:") and not host_reachable(placement[4:]):
+            note("rust", platform, f"unchecked: build.{platform} is \"{placement}\" but `ssh {placement[4:]}` does "
+                                   f"not answer; run {how} once it does, or say in ## Testing that {platform} is "
+                                   "unchecked")
+        else:
+            fix("rust", platform, f"no rust-check recorded for this Rust diff: run {how} "
+                                  f"(build.{platform} = \"{placement}\"; CI compiles no Rust before the merge)")
+
+
+def check_tests_env(added):
+    """Credential code falls back to provider env vars (`keys.get`), so a token in the shell masks
+    the stored row a new test sets up (#14753's CURSOR_ACCESS_TOKEN)."""
+    if any(CREDENTIAL_SRC.match(p) for p in added) and any(is_test_path(p) for p in added):
+        tests = sorted(p for p in added if is_test_path(p) and p.endswith(TS))
+        note("env", ", ".join(tests)[:120],
+             "credential lookups fall back to env keys: run these under `env -i HOME=$HOME PATH=$PATH bun test`")
+
+
+def ox_bin(name, cwd):
+    for root in (cwd, CHECKOUT):
+        path = os.path.join(root, "node_modules", ".bin", name)
+        if os.access(path, os.X_OK):
+            return path
+    return None
+
+
+def check_tooling(added, ref, cwd):
+    """oxlint and oxfmt over the files the diff adds TS lines to, read at `ref` so a PR branch
+    needs no checkout, plus `new Promise(` in added code."""
+    for path, lines in sorted(added.items()):
+        if path.endswith(TS):
+            for n, text in lines:
+                if PROMISE.search(code_part(text)):
+                    fix("promise", f"{path}:{n}", "use Promise.withResolvers() (AGENTS.md)")
+    files = sorted(p for p in added if p.endswith(TS) and not p.endswith(".d.ts"))
+    if not files:
+        return
+    lint, fmt = ox_bin("oxlint", cwd), ox_bin("oxfmt", cwd)
+    if not lint or not fmt:
+        note("tooling", cwd, "oxlint/oxfmt not installed: run `bun install` to enable the lint and format checks")
+        return
+    with tempfile.TemporaryDirectory(prefix="precheck-") as tmp:
+        for path in files + [".oxlintrc.json", ".oxfmtrc.json"]:
+            blob = subprocess.run(["git", "show", f"{ref}:{path}"], capture_output=True, cwd=cwd)
+            if blob.returncode == 0:
+                os.makedirs(os.path.dirname(os.path.join(tmp, path)), exist_ok=True)
+                with open(os.path.join(tmp, path), "wb") as f:
+                    f.write(blob.stdout)
+        present = [p for p in files if os.path.exists(os.path.join(tmp, p))]
+        added_at = {p: {n for n, _ in added[p]} for p in present}
+        out = run(lint, "-c", ".oxlintrc.json", "--format", "unix", *present, cwd=tmp).stdout
+        for line in out.splitlines():
+            m = OX_LINE.match(line)
+            if m and int(m.group(2)) in added_at.get(m.group(1), ()):
+                fix("lint", f"{m.group(1)}:{m.group(2)}", f"{m.group(3)[:110]}: fix it, or "
+                    "`// oxlint-disable-next-line <rule> -- <why>` when intended")
+        scoped = [p for p in present if FMT_SCOPE.match(p)]
+        if scoped:
+            out = run(fmt, "--check", *scoped, cwd=tmp)
+            for path in scoped:
+                if path in out.stdout + out.stderr:
+                    fix("fmt", path, f"not oxfmt-formatted: bunx oxfmt {path}")
+
+
+def declarations(lines):
+    found = {}
+    for text in lines:
+        m = DECL.match(text)
+        if m and m.group(1) not in NOT_DECL:
+            found[m.group(1)] = re.sub(r"\s+", " ", m.group(2).strip())
+    return found
+
+
+def check_api(added, removed):
+    """A changed parameter list on a package's source declaration (#14761 shipped one undeclared)."""
+    for path in sorted(removed):
+        if not (path.startswith("packages/") and "/src/" in path) or is_test_path(path):
+            continue
+        before = declarations(removed[path])
+        after = declarations(t for _, t in added.get(path, []))
+        for name, params in sorted(after.items()):
+            if name in before and before[name] != params:
+                note("signature", f"{path} {name}",
+                     f"({before[name][:50]}) -> ({params[:50]}): if exported, add a ### Breaking Changes entry")
+
+
+def check_removed_calls(diff):
+    """Each call statement the diff removes from source whose callee no added line calls, so each
+    drop is deliberate; a call kept with new arguments or moved is not listed. #15604's refactor
+    removed `enable_web_accessibility(pid, &app);` from `window_records` with no replacement;
+    the maintainer put it back (`e84a0a6f5c`)."""
+    called = {name for path, lines in diff.added.items() if not is_test_path(path)
+              for _, t in lines for name in CALLEE.findall(code_part(t))}
+    for path, lines in sorted(diff.removed_at.items()):
+        if not path.endswith(CODE) or is_test_path(path):
+            continue
+        rust = path.endswith(".rs")
+        ends = STMT_END + ((")",) if path.endswith(".py") else ())
+        for n, ctx, text in lines:
+            code = code_part(text).rstrip()
+            m = CALL_STMT.match(code)
+            if (not m or m.group(1) in NOT_CALL or m.group(1) in called or not code.endswith(ends)
+                    or NOT_CALL_SHAPE.search(code)
+                    # Rust: a match arm, a variant or tuple-struct value (`Ok(…)`), an inline test module.
+                    or (rust and ("=>" in code or m.group(1)[0].isupper() or TEST_MODULE.search(ctx)))):
+                continue
+            where = f" in {ctx[:50]}" if ctx else ""
+            note("removed", f"{path}:{n}{where}", f"{text.strip()[:80]}  (dropped on purpose?)")
+
+
+def check_scope(commits, title):
+    """Commits scoped outside the PR title: CONTRIBUTING.md wants one logical change per PR. the maintainer
+    removed #15414's `test(coding-agent)` screen-state notice test from a `fix(natives)` PR
+    (`3fe61bb3da`). `commits` is [(sha, subject, [paths])]; commits touching only CHANGELOGs (the
+    attribution commit) are left out."""
+    wanted = scopes(title)
+    if not wanted:
+        return
+    for sha, subject, paths in commits:
+        own = scopes(subject)
+        changed = [p for p in paths if not p.endswith("CHANGELOG.md")]
+        if not own or own <= wanted or not changed:
+            continue
+        kind = "test-only commit" if all(is_test_path(p) for p in changed) else "commit"
+        note("scope", f"{sha[:10]} {subject[:60]}",
+             f"{kind} scoped {','.join(sorted(own - wanted))}, outside the title's "
+             f"({','.join(sorted(wanted))}): part of this PR's one logical change?")
+
+
+def scopes(subject):
+    m = re.match(r"\w+\(([^)]*)\)!?:", subject or "")
+    return {s.strip() for s in m.group(1).split(",") if s.strip()} if m else set()
+
+
+def check_text_tests(added):
+    """Tests that assert on the text of a script or source file instead of running it. #15599's
+    cmux test checked that the page script contained `"body"`, so it passed without the script
+    ever running; the maintainer's Chromium-backed test found the empty-`innerText` bug (`132e741411`)."""
+    for path, lines in sorted(added.items()):
+        if not is_test_path(path):
+            continue
+        for n, text in lines:
+            if SCRIPT_ASSERT.search(text) or SOURCE_READ.search(text):
+                note("text-test", f"{path}:{n}", "asserts on script or source text: run it (a real browser, "
+                                                  "process or module) so the test fails when it misbehaves")
+
+
+def check_consumers(diff, ref, cwd):
+    """A field added to an interface or object type, against source files that name a third of
+    that file's fields but not the new one: field-by-field readers, copiers and allowlists. The
+    session anonymizer keeps only fields it has a rule for, so #15680's new `runtime` entry field
+    was dropped from anonymized exports until the maintainer added a rule (`71da31fb7d`)."""
+    new = {}
+    for path, lines in diff.added.items():
+        if not path.endswith(TS) or is_test_path(path) or "/src/" not in path:
+            continue
+        for n, text in lines:
+            m = FIELD_DECL.match(code_part(text))
+            if m and TYPE_CTX.search(diff.added_in.get((path, n), "")):
+                new.setdefault(path, set()).add(m.group(1))
+    for path, fields in sorted(new.items()):
+        names = set(FIELD_NAME.findall(run("git", "show", f"{ref}:{path}", cwd=cwd).stdout)) - fields
+        names = {n for n in names if len(n) >= 6 and DOC_NAME.search(n)}
+        if len(names) < CONSUMER_MIN_FIELDS:
+            continue
+        need = max(6, -(-len(names) // 3))
+        word = re.compile(r"\b(%s)\b" % "|".join(sorted(names)))
+        out = run("git", "grep", "-l", "-w", "-E", "|".join(sorted(names)), ref, "--",
+                  "packages/*/src/*.ts", "packages/*/src/**/*.ts", cwd=cwd).stdout
+        for hit in out.splitlines():
+            other = hit.split(":", 1)[-1]
+            if other == path:
+                continue
+            source = run("git", "show", f"{ref}:{other}", cwd=cwd).stdout
+            missing = sorted(f for f in fields if not re.search(rf"\b{re.escape(f)}\b", source))
+            if missing and len(set(word.findall(source))) >= need:
+                note("consumer", other, f"names {len(set(word.findall(source)))} fields of {path.rsplit('/', 1)[-1]} "
+                                        f"but not new {', '.join(missing)}: does it read, copy or allowlist them?")
+
+
+def check_docs(added, removed, contexts, ref, cwd):
+    """Docs naming a function the diff changes (#14751, #14659: docs kept the old contract)."""
+    names = set()
+    for path, ctx in contexts.items():
+        if path.endswith(TS) and not is_test_path(path) and "/src/" in path:
+            for c in ctx:
+                m = CONTEXT_NAME.search(c)
+                names |= {g for g in (m.groups() if m else ()) if g and g not in NOT_DECL}
+            names |= set(declarations(t for _, t in added.get(path, []))) | set(declarations(removed.get(path, [])))
+    names = {n for n in names if len(n) >= 6 and DOC_NAME.search(n)}
+    hits = {}
+    for name in sorted(names):
+        out = run("git", "grep", "-l", "-w", "-F", "-e", name, ref, "--", *DOC_GLOBS, cwd=cwd).stdout
+        for line in out.splitlines():
+            doc = line.split(":", 1)[-1]
+            if doc not in added and doc not in removed:
+                hits.setdefault(doc, []).append(name)
+    for doc, found in sorted(hits.items()):
+        note("docs", doc, f"mentions {', '.join(found[:4])}; update it if the contract it states changed")
+
+
+def unreleased_span(path, ref, cwd):
+    text = run("git", "show", f"{ref}:{path}", cwd=cwd).stdout.splitlines()
+    start = next((i + 1 for i, l in enumerate(text) if l.startswith("## [Unreleased]")), None)
+    if start is None:
+        return None
+    end = next((i + 1 for i, l in enumerate(text[start:], start) if l.startswith("## [")), len(text) + 1)
+    return start, end
+
+
+def unreleased_code(diff, base, ref, cwd):
+    """{package: ["<sha> <subject>", ...]}: the commits that wrote source lines the diff removes or
+    rewrites in that package and that no `v*` tag ships without `ref` (`git tag --contains C
+    --no-contains ref`, so a release that already holds this fix does not count). A bug that came
+    with such a commit is a regression no user saw. #15941 fixed a line #14591 wrote after v18.11.1,
+    and the maintainer dropped its CHANGELOG entry (`7c9d457d70`). Over our 109 merges 2026-10-05..16 this
+    names a commit on 9 PRs; on the other 8 the bug was older than the lines it rewrote."""
+    commits = blamed_commits(diff, base, cwd)
+    shipped, fresh = {}, {}
+    for pkg, shas in sorted(commits.items()):
+        for sha in sorted(shas):
+            if sha not in shipped:
+                shipped[sha] = bool(run("git", "tag", "--list", "v*", "--contains", sha, "--no-contains", ref,
+                                        cwd=cwd).stdout.split())
+            if not shipped[sha]:
+                subject = run("git", "log", "-1", "--format=%s", sha, cwd=cwd).stdout.strip()
+                fresh.setdefault(pkg, []).append(f"{sha[:10]} {subject[:60].rstrip()}")
+    return fresh
+
+
+def check_changelogs(added, ref, cwd, number, fresh=None):
+    """`fresh` is `unreleased_code`'s result. AGENTS.md wants user-facing entries, and a fix of a
+    regression no release shipped changes nothing a user saw: the maintainer dropped #15941's (`7c9d457d70`).
+    So where the diff rewrites unreleased code, a missing entry is a NOTE, not a FIX."""
+    fresh = fresh or {}
+    for pkg in sorted({p for p in map(package_of, added) if p}):
+        log = f"{pkg}/CHANGELOG.md"
+        entries = [(n, t) for n, t in added.get(log, []) if t.strip().startswith("- ")]
+        written = f"rewrites lines no release ships yet, from {'; '.join(fresh.get(pkg, [])[:3])}"
+        if not entries:
+            if pkg in fresh:
+                note("changelog", log, f"no entry; {written}: right if the bug came with that code; add one if "
+                                       "the last release shows it")
+            else:
+                fix("changelog", log, "no added entry for this touched package")
+            continue
+        if pkg in fresh:
+            note("changelog", log, f"{written}: if the bug came with that code, no user saw it, so drop the entry "
+                                   "(7c9d457d70); keep it if the last release shows the bug")
+        span = unreleased_span(log, ref, cwd)
+        for n, text in entries:
+            if not span or not span[0] < n < span[1]:
+                fix("changelog", f"{log}:{n}", "entry is outside ## [Unreleased]")
+            elif number and (f"/pull/{number}" not in text or f"@{ME}" not in text):
+                fix("changelog", f"{log}:{n}", f"entry lacks the #{number} link and @{ME} credit")
+
+
+def check_drift(ref, cwd):
+    """Placement after merging origin/main, which is where the maintainer reads it (every maintainer
+    review on 2026-10-08 opened with "the CHANGELOG entry has to go under ## [Unreleased]")."""
+    for path, entry, section in changelog_drift(ref, cwd=cwd):
+        fix("changelog", path, f"lands under {section} once origin/main merges in: rebase onto it and move "
+                               f"the entry under ## [Unreleased] ({entry[2:60]}…)")
+
+
+def prose_length(body):
+    """Characters a reader reads as prose: tables, <details>, images, videos and the checklist don't count.
+    An image stands in for a table, which is free too: its markup (URLs, alt) is not prose, and neither are
+    the blank lines that set it apart (runs of blank lines left where a block was count as one). A video is
+    a `user-attachments` URL on a line of its own, which GitHub renders as its player."""
+    prose = re.sub(r"<details>.*?</details>|<picture>.*?</picture>|<img\b[^>]*>|!\[[^\]]*\]\([^)]*\)", "",
+                   body, flags=re.S)
+    prose = "\n".join(l for l in prose.splitlines()
+                      if not l.lstrip().startswith(("|", "- [ ]", "- [x]", "- [X]"))
+                      and not re.fullmatch(r"\s*https://github\.com/user-attachments/assets/[0-9a-f-]{36}\s*", l))
+    return len(re.sub(r"\n\s*\n(\s*\n)+", "\n\n", prose))
+
+
+def check_body(body, ours=()):
+    """Body checks; `ours` is the numbers of our open PRs, for the "Builds on #N" merge-order check."""
+    for heading in ("## What", "## Why", "## Testing"):
+        if heading not in body:
+            fix("body", heading, "heading missing")
+    what = body.split("## What", 1)[-1].strip().split("\n\n", 1)[0] if "## What" in body else ""
+    if not re.search(r"\b(I|I'm|I've|I'd|[Mm]y|[Mm]e|[Ww]e|[Oo]ur)\b", what):
+        fix("body", "## What", "first paragraph has no first-person own-words sentence")
+    prose = prose_length(body)
+    if prose > BODY_LIMIT:
+        fix("body", "length", f"{prose} chars outside tables, <details> and checklist (limit {BODY_LIMIT})")
+    for m in sorted(set(MENTIONS.findall(body))):
+        fix("mention", f"@{m}", "no @-mentions of Codex, roboomp or maintainers")
+    for line in merge_order_lines(body, ours):
+        fix("order", line[:90], "merge-order text: a PR that needs another waits in the queue until it merges "
+                                "(shaping.md, Open-PR rule); a related PR goes under Why as `Related: #N`")
+
+
+def check_siblings(ref, number, cwd, branch=None):
+    """Another open PR's commits on this branch, and code conflicts with our open ready PRs once both
+    land on origin/main (shaping.md, Open-PR rule). The queue manifest supplies recorded needs and
+    bases, so a child stacked on this branch's older commits is not read as commits it carries."""
+    q = Queue(cwd, Store(cwd).load()[0], GitHub())
+    item = q.adhoc(ref, number, branch or None)
+    remedy = (f"pr-queue requeue {number} --needs {{}}" if number in q.by_number
+              else "pr-queue add <branch> --needs {}")
+    for other, count in sorted(((o, n) for o, n in q.carried(item).items() if o != "main"),
+                               key=lambda x: x[0].sort_id):
+        fix("carries", other.label, f"{count} of its commits are on this branch: it waits in the queue until "
+                                    f"{other.label} merges ({remedy.format(other.label)})")
+    if q.carried(item).get("main"):
+        note("carries", "main", f"{q.carried(item)['main']} commit(s) main already has under other SHAs: rebase "
+                                "drops them")
+    for label, code, generated, accepted in q.conflicts_with_ready(item):
+        if code and accepted:
+            # A P0/P1 opening over an old P2 (shaping.md, Open-PR rule 3).
+            note("sibling", label, f"code conflict in {', '.join(code)}: {accepted}")
+        elif code:
+            fix("sibling", label, f"code conflict in {', '.join(code)}: one of the two waits in the queue "
+                                  "(pr-queue plan says which)")
+        else:
+            note("sibling", label, f"only the generated {', '.join(generated)} conflict: regenerated at merge")
+    sharing = {}
+    for other, units in q.sharing(item, q.ready_items()):
+        for unit in units:
+            sharing.setdefault(unit, []).append(other.label)
+    for unit, labels in sorted(sharing.items()):
+        note("build", unit, f"also changed by open ready {', '.join(labels)}: build and test the merged tree with "
+                            f"{'it' if len(labels) == 1 else 'them'} (queue.md, Opening)")
+    return set(q.by_number)
+
+
+def check_links(pr):
+    body = pr["body"] or ""
+    closing = {c["number"] for c in pr["closingIssuesReferences"]}
+    mentioned = {int(number) for match in re.findall(
+        r"(?<![\w/#])#(?![0-9a-fA-F]{6}\b)([1-9]\d{2,})\b|/issues/([1-9]\d{2,})\b", body)
+        for number in match if number} - closing - {pr["number"]}
+    for n in sorted(mentioned):
+        item = gh_json("api", f"repos/{REPO}/issues/{n}")
+        if "pull_request" not in item and item["state"] == "open":
+            note("link", f"#{n}", f"open issue mentioned but not closed: Fixes or Related? ({item['title'][:70]})")
+    for n in sorted(closing):
+        note("closes", f"#{n}", "closes on merge; confirm nothing it asks for remains")
+
+
+def branch_commits(base, ref, cwd):
+    """[(sha, subject, [paths])] of the non-merge commits in base..ref, oldest first."""
+    out = run("git", "log", "--no-merges", "--reverse", "--format=%x00%H%x1f%s", "--name-only",
+              f"{base}..{ref}", cwd=cwd).stdout
+    commits = []
+    for chunk in out.split("\x00")[1:]:
+        head, _, files = chunk.partition("\n")
+        sha, _, subject = head.partition("\x1f")
+        commits.append((sha, subject, [f for f in files.splitlines() if f]))
+    return commits
+
+
+def check_refs(base, ref, cwd):
+    """Commit messages naming a PR as `#N` (or `owner/repo#N`, a PR URL): each push of such a commit's
+    SHA lands a "referenced this pull request" event on that PR. A reword is a push of its own, so
+    it waits for the next rebase the PR needs anyway, which rewrites them with `quiet-refs`."""
+    out = run("git", "log", "--no-merges", "--reverse", "--format=%x00%H%x1f%s%x1f%B", f"{base}..{ref}",
+              cwd=cwd).stdout
+    for chunk in out.split("\x00")[1:]:
+        sha, subject, message = chunk.split("\x1f", 2)
+        if quiet_refs(message) != message:
+            note("refs", sha[:10], f"{subject}: names a PR as #N; after the next rebase it needs anyway, "
+                                   "run scripts/quiet-refs before that push (never a push of its own)")
+
+
+def check_queued(pr):
+    """A closed PR whose change waits in the queue reopens with the stored body, not GitHub's; and while
+    the opening pause is set, a draft or unopened PR does not turn ready or open (queue.md)."""
+    manifest = Store(CHECKOUT).load()[0]
+    entry = stored_body_entry(manifest, pr["number"], pr["state"])
+    if entry:
+        fix("queue", stored_body_message(pr["number"], entry))
+    pause = opening_pause(manifest)
+    if pause and (pr["state"] == "CLOSED" or (pr["state"] == "OPEN" and pr["isDraft"])):
+        fix("queue", f"#{pr['number']} is {'a draft' if pr['state'] == 'OPEN' else 'closed'}: {pause_line(pause)}")
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(usage=__doc__.split("\n\n", 2)[1].removeprefix("usage: "))
+    parser.add_argument("number", nargs="?", type=int)
+    parser.add_argument("--ref")
+    parser.add_argument("--body")
+    parser.add_argument("--number", dest="link_number", type=int)
+    parser.add_argument("--no-siblings", action="store_true")
+    parser.add_argument("--base", default="origin/main")
+    parser.add_argument("--title")
+    args = parser.parse_args(argv)
+    pr = None
+    if args.number:
+        pr = gh_json("pr", "view", str(args.number), "-R", REPO, "--json",
+                     "number,state,isDraft,title,headRefName,body,closingIssuesReferences")
+        check_queued(pr)
+        cwd = CHECKOUT
+        run("git", "fetch", "-q", STORE_REMOTE, pr["headRefName"], cwd=cwd)
+        run("git", "fetch", "-q", "origin", "main", cwd=cwd)
+        ref = f"{STORE_REMOTE}/{pr['headRefName']}"
+    else:
+        cwd, ref = os.getcwd(), args.ref or "HEAD"
+        if run("git", "rev-parse", "--git-dir", cwd=cwd).returncode != 0:
+            sys.exit(__doc__)
+    number = pr["number"] if pr else args.link_number
+    base = run("git", "merge-base", args.base, ref, cwd=cwd).stdout.strip()
+    if not base:
+        sys.exit(f"no merge base between {args.base} and {ref}")
+    diff = Diff(base, ref, cwd)
+    added, removed, contexts = diff.added, diff.removed, diff.contexts
+    check_code(added, base, cwd)
+    check_timing(added, ref, cwd)
+    check_policy(added)
+    check_tests_env(added)
+    check_api(added, removed)
+    check_docs(added, removed, contexts, ref, cwd)
+    check_removed_calls(diff)
+    check_text_tests(added)
+    check_consumers(diff, ref, cwd)
+    check_prompt_values(added, ref, cwd)
+    check_rust(diff, base, ref, cwd, queue_manifest(cwd))
+    commits = branch_commits(base, ref, cwd)
+    check_scope(commits, pr["title"] if pr else args.title or (commits[0][1] if commits else ""))
+    check_refs(base, ref, cwd)
+    if not all(re.match(r"test(\([^)]*\))?!?:", subject) for _, subject, _ in commits):
+        check_changelogs(added, ref, cwd, number, unreleased_code(diff, base, ref, cwd))
+    check_tooling(added, ref, cwd)
+    check_drift(ref, cwd)
+    if pr:
+        branch = pr["headRefName"]
+    elif args.ref:
+        remote = re.escape(STORE_REMOTE)
+        branch = re.sub(rf"^(refs/remotes/{remote}/|refs/heads/|{remote}/)", "", args.ref)
+    else:
+        branch = run("git", "symbolic-ref", "--short", "-q", "HEAD", cwd=cwd).stdout.strip()
+    if branch:
+        check_review(branch, cwd)
+    ours = set() if args.no_siblings else check_siblings(ref, number, cwd, branch)
+    body = pr["body"] if pr else (open(args.body).read() if args.body else None)
+    if body is not None:
+        check_body(body or "", ours - {number})
+    check_behavior_eval(added, body)
+    if pr:
+        check_links(pr)
+    sys.exit(1 if findings else 0)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

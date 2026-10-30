@@ -1,0 +1,40 @@
+#!/usr/bin/env python3
+"""Install the commit-msg hook beside this script into an oh-my-pi clone (all its worktrees share it).
+
+usage: install [REPO]   (default: your checkout, `paths.checkout` in references/config.md)
+
+Links the hook (so updating the skill updates it) into the clone's hooks directory, honouring
+core.hooksPath. A commit-msg hook already there that is not ours moves to `commit-msg.chained`, which
+ours runs first. Rerunning changes nothing."""
+import os
+import subprocess
+import sys
+
+HOOK = os.path.join(os.path.dirname(os.path.realpath(__file__)), "commit-msg")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+import omp_config  # noqa: E402
+
+
+def main(argv):
+    repo = os.path.expanduser(argv[0]) if argv else omp_config.load().checkout
+    p = subprocess.run(["git", "rev-parse", "--path-format=absolute", "--git-path", "hooks"], cwd=repo,
+                       capture_output=True, text=True)
+    if p.returncode:
+        sys.exit(f"{repo}: not a git repository: {p.stderr.strip()}")
+    hooks = p.stdout.strip()
+    target, chained = os.path.join(hooks, "commit-msg"), os.path.join(hooks, "commit-msg.chained")
+    if os.path.realpath(target) == HOOK:
+        print(f"{target}: already installed")
+        return
+    os.makedirs(hooks, exist_ok=True)
+    if os.path.lexists(target):
+        if os.path.lexists(chained):
+            sys.exit(f"{target} and {chained} both exist: merge them by hand, then rerun")
+        os.rename(target, chained)
+        print(f"{target}: kept the existing hook as {chained}, which runs first")
+    os.symlink(HOOK, target)
+    print(f"{target} -> {HOOK}")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

@@ -1,0 +1,21 @@
+# Template for `pr-queue watch` as a systemd user service (Linux). `/contribute setup` fills the
+# {{…}} placeholders and installs it with pr-queue-watch.timer into ~/.config/systemd/user/, then
+# runs `systemctl --user enable --now pr-queue-watch.timer`. The watcher only reads GitHub and
+# writes the queue record on your fork's queue branch: it never opens, pushes a PR branch or comments.
+#   {{SKILL_DIR}}  the omp-contrib skill directory (holds scripts/pr-queue)
+#   {{CHECKOUT}}   your oh-my-pi clone (`paths.checkout`)
+#   {{PATH}}       a PATH that finds git, gh and python3 ≥ 3.11
+[Unit]
+Description=pr-queue watch: notice oh-my-pi queue changes (merges, entries turning openable, conflicts, releases)
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=HOME=%h
+Environment=PATH={{PATH}}
+# A host without a git credential helper pushes the queue record through gh's login.
+Environment=GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=credential.https://github.com.helper "GIT_CONFIG_VALUE_0=!gh auth git-credential"
+WorkingDirectory={{CHECKOUT}}
+ExecStart=/usr/bin/env python3 {{SKILL_DIR}}/scripts/pr-queue --repo {{CHECKOUT}} watch
+TimeoutStartSec=15min
+Nice=10

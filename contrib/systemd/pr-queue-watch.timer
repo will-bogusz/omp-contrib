@@ -1,0 +1,13 @@
+# Template: runs pr-queue-watch.service every {{INTERVAL}} (a systemd time span, e.g. 30min; the
+# watcher skips a run while an `open` holds the queue lock). `/contribute setup` fills it in.
+[Unit]
+Description=pr-queue watch every {{INTERVAL}}
+
+[Timer]
+OnBootSec=5min
+OnStartupSec=5min
+OnUnitActiveSec={{INTERVAL}}
+RandomizedDelaySec=60
+
+[Install]
+WantedBy=timers.target

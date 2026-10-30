@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+"""commit-msg hook for an oh-my-pi clone, installed by `install` beside it: on a branch under your branch prefix
+(`github.branch_prefix`, references/config.md) it
+writes the PR references in the new commit's message as `PR N` (omp_queue.quiet_refs), since a
+commit pushed to our fork that names `#N` lands on upstream PR N's timeline. Other branches and
+merge commits keep their message. The hook it replaced, if any, runs first as `commit-msg.chained`."""
+import os
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+import omp_config  # noqa: E402
+from omp_queue import quiet_refs  # noqa: E402
+
+
+def git(*args):
+    p = subprocess.run(["git", *args], capture_output=True, text=True)
+    return p.stdout.strip() if p.returncode == 0 else ""
+
+
+def branch():
+    name = git("symbolic-ref", "--short", "-q", "HEAD")
+    if name:
+        return name
+    # A reword during a rebase commits on a detached HEAD; the rebase records the branch it rewrites.
+    for state in ("rebase-merge", "rebase-apply"):
+        try:
+            with open(os.path.join(git("rev-parse", "--git-path", state), "head-name")) as f:
+                return f.read().strip().removeprefix("refs/heads/")
+        except OSError:
+            pass
+    return ""
+
+
+def main(path):
+    chained = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "commit-msg.chained")
+    if os.access(chained, os.X_OK):
+        code = subprocess.run([chained, path]).returncode
+        if code:
+            sys.exit(code)
+    prefix = omp_config.load().branch_prefix
+    if not prefix or not branch().startswith(prefix) or git("rev-parse", "-q", "--verify", "MERGE_HEAD"):
+        return
+    with open(path) as f:
+        message = f.read()
+    quiet = quiet_refs(message)
+    if quiet != message:
+        with open(path, "w") as f:
+            f.write(quiet)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1])

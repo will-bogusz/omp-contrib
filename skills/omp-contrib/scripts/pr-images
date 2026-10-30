@@ -1,0 +1,690 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["websockets>=13"]
+# ///
+"""Upload images for a PR body and print the Markdown to paste: as GitHub attachments through your
+Chrome, signed in to GitHub (relay), or as files committed to your fork (fork-links).
+
+usage: pr-images upload [--repo OWNER/NAME] [--mode relay|fork-links] [--folder NAME] [--themed | --loop | --still] [--scale N] [--alt TEXT ...] [--uploaded FILE=URL ...] FILE...
+  FILE      PNG, JPEG or GIF, at most 10 MB (GitHub's image limit), or an MP4, MOV or WebM video, at
+            most 10 MB (GitHub's video limit when the repository owner is on a free plan); a video
+            prints as its bare URL on its own line, which GitHub renders as its player (no theme or
+            phone variant, no width, no alt text), so --themed, --loop and --still refuse it
+  --repo    repository the assets belong to, default the config's github.upstream_repo; use the PR's
+            target repo
+  --mode    how files get a URL, default the config's images.upload (references/config.md):
+            relay       GitHub attachments, uploaded from a tab of --repo in your Chrome (below)
+            fork-links  committed to the branch omp-contrib-assets of your fork (github.fork_repo)
+                        under FOLDER/<hash>-<name> with `gh api`, printed as raw.githubusercontent.com
+                        URLs; a video's URL renders as a link there, not a player
+  --folder  fork-links only: the folder on the assets branch, e.g. the PR number or topic
+            (default: the first file's directory name)
+  --themed  pair NAME-dark.EXT with NAME-light.EXT into one <picture> that follows the viewer's
+            light/dark theme; every file needs its partner, and both must be the same size.
+            NAME-narrow-dark/-light, if given, is NAME's phone layout: the picture shows it below
+            a 1244 px wide window, up to 440 px wide, and the NAME pair from there up; its files
+            must be at least 880 px wide (a 320 px layout rendered at 3x) to stay sharp at 440
+  --loop    group a motion loop's four files, as ../charts/loop.py writes them, into one <picture>:
+            NAME.gif (wide), NAME-narrow.gif (the phone layout, at least 880 px wide, shown below a
+            1244 px window up to 440 px wide), NAME-still.png and NAME-narrow-still.png (each layout's
+            end frame, shown instead of the GIF to a viewer who asked for reduced motion: GitHub
+            doesn't pause a GIF inside <picture>); each still must be the size of its GIF
+  --still   group NAME-still.png and NAME-narrow-still.png (PNG or JPEG, as ../charts/loop.py --make
+            still writes them) into one <picture>: the wide frame from a 1244 px window up, the phone
+            layout below it, with no theme variant (footage has none), e.g. a whole task's end frame
+  --scale   pixel density of the files: 2 halves the width attribute of 2x renders
+  --alt     alt text, one per printed image in order (default: the file name, without the
+            -dark/-light suffix under --themed, or the -narrow/-still suffixes under --loop and --still)
+  --uploaded  FILE is already uploaded at URL: print URL for it instead of uploading it again
+            (FILE is still read, for its size); with every file given so, nothing opens
+
+The printed tags carry a width but never a height: GitHub's CSS caps an image at the column's
+width without `height: auto`, so a height attribute stretches it on a narrow screen.
+
+Relay (the ideal: real attachments, like dragging a file into a comment box, so they survive the
+fork's branches and a video plays inline): it makes the same three requests as that drag (upload
+policy, S3, finalize), from a tab of the repo it opens through the omp browser relay and closes
+again: through the relay, a fresh relay connection, or else, on macOS only, Chrome's AppleScript,
+touching only the tab marked #omp-pr-images-<hex>; if none can, it still prints the Markdown, exits
+1 and names that tab. The tab opens in the background only with the relay extension of omp 18.8.8
+or later; an older extension opens it in front (`omp browser-relay install`, then Reload in
+chrome://extensions). Nothing is typed into a composer and nothing is submitted. GitHub serves the
+asset only to signed-in viewers until a posted comment or body references it; from then on anyone
+can load it.
+
+Fork-links: one commit per run on the fork's asset branch through the GitHub API (no local
+checkout touched). A file's path carries its content hash, so a URL never changes what it shows;
+the images live as long as that branch does.
+
+Put the printed Markdown into the body (`gh pr edit N --body-file`).
+"""
+import argparse
+import base64
+import contextlib
+import hashlib
+import itertools
+import json
+import os
+import shutil
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import omp_config  # noqa: E402
+
+RELAY = "http://127.0.0.1:9224"
+ASSETS_BRANCH = "omp-contrib-assets"  # fork-links: the fork branch holding uploaded files
+MAX_BYTES = 10 * 1024 * 1024
+CHUNK = 4 * 1024 * 1024  # base64 characters per CDP message
+CREATE_GRACE = 15  # seconds cleanup watches for a tab whose creation was cut short
+TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
+         ".mp4": "video/mp4", ".mov": "video/quicktime", ".webm": "video/webm"}
+VIDEO = (".mp4", ".mov", ".webm")
+STILL = "still"  # NAME-still / NAME-narrow-still: a loop's reduced-motion frame
+THEMES = ("dark", "light")
+NARROW = "narrow"  # NAME-narrow-dark/-light: NAME's phone layout
+# Below this window width GitHub's PR column (window - 498 px from 1012 px up, 780 at most; far
+# narrower below 1012) shrinks a 780 px chart enough that its 11.5 px text falls under 11 px, so
+# the phone layout takes over. Measured on github.com, 2026-10-15.
+WIDE_MIN = 1244
+# The phone layout's widest on screen: below WIDE_MIN its source says width="440", so a half-width
+# desktop window (768-1243 px, a 350-745 px column) shows it up to 440 px instead of 320 beside empty
+# space, and a phone's column (324 px at 390) shrinks it. At 2 device pixels per CSS pixel that takes
+# NARROW_MIN_PX-wide files.
+NARROW_SHOWN = 440
+NARROW_MIN_PX = 2 * NARROW_SHOWN
+
+# Runs in the repo page: assemble the file from the chunks, then the policy -> S3 -> finalize
+# sequence of GitHub's file-attachment uploader. The fetch nonce authenticates the policy request,
+# as it does for the React composer; the finalize PUT carries the token the policy returned.
+# A navigation drops the chunks (the push of the next one fails) or shortens the file (the size
+# check fails), and the page must still be the requested repo, so nothing uploads half or astray.
+UPLOAD_JS = r"""async ({key, name, type, size, nwo}) => {
+  const b64 = globalThis.__prImages?.[key]?.join('') ?? ''; delete globalThis.__prImages?.[key];
+  const file = new File([Uint8Array.from(atob(b64), c => c.charCodeAt(0))], name, {type});
+  if (file.size !== size) return {error: `the page reloaded during the upload (${file.size} of ${size} bytes)`};
+  const meta = name => document.querySelector(`meta[name="${name}"]`)?.content;
+  const nonce = meta('fetch-nonce'), repo = meta('octolytics-dimension-repository_id');
+  if (!nonce || !repo) return {error: 'page has no fetch nonce or repository id'};
+  if (meta('octolytics-dimension-repository_nwo')?.toLowerCase() !== nwo.toLowerCase())
+    return {error: `the tab shows ${location.href}, not ${nwo}`};
+  const headers = {'Accept': 'application/json', 'X-Requested-With': 'XMLHttpRequest',
+                   'GitHub-Verified-Fetch': 'true', 'X-Fetch-Nonce': nonce};
+  const form = fields => { const fd = new FormData(); for (const [k, v] of fields) fd.append(k, v); return fd; };
+  let res = await fetch('/upload/policies/assets', {method: 'POST', headers, credentials: 'same-origin',
+    body: form([['name', name], ['size', String(file.size)], ['content_type', type], ['repository_id', repo]])});
+  if (!res.ok) return {error: `upload policy: HTTP ${res.status} ${(await res.text()).slice(0, 200)}`};
+  const policy = await res.json();
+  res = await fetch(policy.upload_url, {method: 'POST', headers: policy.header,
+    body: form([...Object.entries(policy.form), ['file', file]])});
+  if (!res.ok) return {error: `storage upload: HTTP ${res.status} ${(await res.text()).slice(0, 200)}`};
+  res = await fetch(policy.asset_upload_url, {method: 'PUT', headers, credentials: 'same-origin',
+    body: form([['authenticity_token', policy.asset_upload_authenticity_token]])});
+  if (!res.ok) return {error: `finalize: HTTP ${res.status} ${(await res.text()).slice(0, 200)}`};
+  const asset = await res.json();
+  // An image must decode. A <video> never loads in this background tab (Chrome defers media in hidden
+  // tabs) and the storage host it redirects to sends no CORS headers, so a video counts as there when its
+  // URL redirects to storage; a missing asset answers 404 (checked on github.com, 2026-10-15).
+  const loads = type.startsWith('video/')
+    ? (await fetch(asset.href, {method: 'HEAD', redirect: 'manual', credentials: 'same-origin'})).type === 'opaqueredirect'
+    : await new Promise(done => { const img = new Image();
+        img.onload = () => done(img.naturalWidth > 0); img.onerror = () => done(false); img.src = asset.href; });
+  if (!loads) return {error: `${asset.href} does not load after the upload`};
+  return {href: asset.href, repo};
+}"""
+
+READY_JS = """(() => document.readyState === 'complete' && location.host === 'github.com'
+  ? (document.querySelector('meta[name="user-login"]')?.content || '') : null)()"""
+
+
+def image_size(data):
+    """(width, height) of PNG, GIF or JPEG bytes, else None."""
+    if data[:8] == b"\x89PNG\r\n\x1a\n" and data[12:16] == b"IHDR":
+        return struct.unpack(">II", data[16:24])
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return struct.unpack("<HH", data[6:10])
+    if data[:2] == b"\xff\xd8":
+        i = 2
+        while i + 9 < len(data) and data[i] == 0xFF:
+            marker, length = data[i + 1], struct.unpack(">H", data[i + 2:i + 4])[0]
+            if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+                height, width = struct.unpack(">HH", data[i + 5:i + 9])
+                return width, height
+            i += 2 + length
+    return None
+
+
+def split_theme(path):
+    """(stem without the theme suffix, theme or None) for NAME-dark.png / NAME-light.png."""
+    stem = os.path.splitext(os.path.basename(path))[0]
+    for theme in THEMES:
+        if stem.endswith("-" + theme):
+            return stem[: -len(theme) - 1], theme
+    return stem, None
+
+
+def plan(paths, themed=False, loop=False, still=False):
+    """Group files into printed images, in argument order: [(alt, {key: path})], where key is "plain"; or
+    under themed "dark", "light", "narrow-dark", "narrow-light"; or under loop "loop", "narrow-loop",
+    "still", "narrow-still"; or under still "still", "narrow-still". Phone-layout keys start with "narrow"."""
+    if not (themed or loop or still):
+        return [(os.path.splitext(os.path.basename(p))[0], {"plain": p}) for p in paths]
+    groups = {}
+    for path in paths:
+        if path.lower().endswith(VIDEO):
+            raise ValueError(f"{path}: a video has no theme, phone or still variant on GitHub; upload it alone")
+        if themed:
+            stem, theme = split_theme(path)
+            if theme is None:
+                raise ValueError(f"{path}: --themed needs NAME-dark / NAME-light file names")
+            key = theme
+        else:
+            stem, key = os.path.splitext(os.path.basename(path))[0], "loop"
+            if stem.endswith("-" + STILL):
+                stem, key = stem[: -len(STILL) - 1], STILL
+            if still and (key != STILL or path.lower().endswith(".gif")):
+                raise ValueError(f"{path}: --still takes NAME-still and NAME-narrow-still, PNG or JPEG")
+            if (path.lower().endswith(".gif")) != (key == "loop"):
+                raise ValueError(f"{path}: --loop takes NAME.gif and NAME-narrow.gif, and PNG or JPEG for the -still files")
+        if stem.endswith("-" + NARROW):
+            stem, key = stem[: -len(NARROW) - 1], f"{NARROW}-{key}"
+        if key in groups.setdefault(stem, {}):
+            raise ValueError(f"{path}: two {key} files for {stem}")
+        groups[stem][key] = path
+    base = THEMES if themed else (STILL,) if still else ("loop", STILL)
+    for stem, files in groups.items():
+        want = base + tuple(f"{NARROW}-{k}" for k in base if loop or still or any(f.startswith(NARROW) for f in files))
+        missing = [k for k in want if k not in files]
+        if missing:
+            raise ValueError(f"{stem}: no {missing[0]} file to pair with {next(iter(files.values()))}")
+    return list(groups.items())
+
+
+def attrs(alt, size, scale):
+    """GitHub's own uploader's attributes, the width divided by the pixel density, without the height
+    (GitHub's CSS gives images `max-width: 100%` but no `height: auto`)."""
+    out = f'width="{size[0] // scale}" ' if size else ""
+    return out + f'alt="{escape(alt)}"'
+
+
+def escape(text):
+    return text.replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;")
+
+
+def markdown(alt, urls, size, scale):
+    """One printed image: GitHub's <img> for a plain file, a themed <picture> for a dark/light pair, a
+    motion <picture> for a loop.
+
+    With a phone layout (narrow-dark/-light urls), the wide pair comes first, from WIDE_MIN up, and the
+    narrow pair after it, NARROW_SHOWN wide at most. That order matters: for a viewer who set a fixed
+    theme, GitHub's <themed-picture> rewrites every source's media to match that theme at any width, and
+    the first source left matching is the wide one, so the desktop view never changes.
+
+    A loop's sources carry no colour-scheme term, so <themed-picture> leaves them alone: the stills come
+    first under (prefers-reduced-motion: reduce), each layout wide before narrow, then the GIFs. A still
+    alone has the same two layouts and no motion term."""
+    if "plain" in urls:
+        return f'<img {attrs(alt, size, scale)} src="{urls["plain"]}" />'
+    if STILL in urls and "loop" not in urls:
+        return "\n".join([
+            "<picture>",
+            f'  <source media="(min-width: {WIDE_MIN}px)" srcset="{urls[STILL]}">',
+            f'  <source width="{NARROW_SHOWN}" srcset="{urls[f"{NARROW}-{STILL}"]}">',
+            f'  <img {attrs(alt, size, scale)} src="{urls[STILL]}" />',
+            "</picture>"])
+    if "loop" in urls:
+        wide, phone = f'media="(min-width: {WIDE_MIN}px)"', f'width="{NARROW_SHOWN}"'
+        motion = "(prefers-reduced-motion: reduce)"
+        return "\n".join([
+            "<picture>",
+            f'  <source media="{motion} and (min-width: {WIDE_MIN}px)" srcset="{urls[STILL]}">',
+            f'  <source media="{motion}" {phone} srcset="{urls[f"{NARROW}-{STILL}"]}">',
+            f'  <source {wide} srcset="{urls["loop"]}">',
+            f'  <source {phone} srcset="{urls[f"{NARROW}-loop"]}">',
+            f'  <img {attrs(alt, size, scale)} src="{urls["loop"]}" />',
+            "</picture>"])
+    narrow = f"{NARROW}-dark" in urls
+    wide = f"(min-width: {WIDE_MIN}px) and " if narrow else ""
+    lines = ["<picture>"] + [f'  <source media="{wide}(prefers-color-scheme: {t})" srcset="{urls[t]}">' for t in THEMES]
+    if narrow:
+        lines += [f'  <source media="(prefers-color-scheme: {t})" width="{NARROW_SHOWN}" srcset="{urls[f"{NARROW}-{t}"]}">' for t in THEMES]
+    return "\n".join(lines + [f'  <img {attrs(alt, size, scale)} src="{urls["light"]}" />', "</picture>"])
+
+
+def chunks(data):
+    text = base64.b64encode(data).decode()
+    return [text[i:i + CHUNK] for i in range(0, len(text), CHUNK)] or [""]
+
+
+def load(path):
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in TYPES:
+        raise ValueError(f"{path}: GitHub uploads here take {', '.join(sorted(TYPES))}")
+    with open(path, "rb") as fh:
+        data = fh.read()
+    if len(data) > MAX_BYTES:
+        raise ValueError(f"{path}: {len(data)} bytes, GitHub caps images at 10 MB (videos too, for a free-plan owner)")
+    return data, TYPES[ext], image_size(data)
+
+
+class CdpError(RuntimeError):
+    """The relay answered a command with an error."""
+
+
+# The only relay errors that prove the outcome: a creation it refused before asking Chrome, and a
+# close of a tab it no longer has. Any other error (extension gone, RPC timeout) may follow a tab
+# Chrome did create or did not close, so cleanup goes on looking.
+NOT_CREATED = "relay extension is not connected"
+NO_SUCH_TAB = "No target with id"
+
+# Closes the tabs whose URL holds MARKER (unique to the run) and prints how many it matched and
+# how many are left; never starts Chrome.
+APPLE_CLOSE = """if application "Google Chrome" is not running then return "0 0"
+tell application "Google Chrome"
+  set matched to 0
+  set remaining to 0
+  repeat with w in windows
+    set matched to matched + (count (tabs of w whose URL contains "MARKER"))
+    close (tabs of w whose URL contains "MARKER")
+    set remaining to remaining + (count (tabs of w whose URL contains "MARKER"))
+  end repeat
+  return (matched as text) & " " & (remaining as text)
+end tell"""
+
+
+@contextlib.contextmanager
+def deferred_interrupt():
+    """Hold a Ctrl-C until the block ends (every step in it has a deadline); a second one stops it."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    caught = []
+
+    def hold(signum, frame):
+        if caught:
+            raise KeyboardInterrupt
+        caught.append(signum)
+        print("pr-images: closing its tab first (Ctrl-C again to stop now)", file=sys.stderr)
+
+    previous = signal.signal(signal.SIGINT, hold)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, previous if previous is not None else signal.default_int_handler)
+    if caught:
+        raise KeyboardInterrupt
+
+
+class Relay:
+    """A raw CDP client on the omp browser relay, driving one background tab it opens and closes.
+
+    The tab URL ends in a fragment unique to this run. Cleanup closes the tab by its id; when the
+    creation was cut short or failed ambiguously, or the connection broke, it finds the tab by that
+    fragment over a fresh connection, watching up to CREATE_GRACE seconds for a creation still in
+    flight, and touches no other tab. Every send and receive has a deadline (a relay that stops
+    reading is cut off), and a Ctrl-C during cleanup waits for it to finish."""
+
+    def __init__(self, repo):
+        self.url = f"https://github.com/{repo}#omp-pr-images-{os.urandom(6).hex()}"
+        self.marker = self.url.split("#", 1)[1]
+        self.ids = itertools.count(1)
+        self.ws = self.target = self.session = self.create_id = None
+        self.create_answered = False
+
+    def connect(self):
+        try:
+            with urllib.request.urlopen(f"{RELAY}/json/version", timeout=5) as res:
+                endpoint = json.load(res)["webSocketDebuggerUrl"]
+        except OSError:
+            raise RuntimeError(f"omp browser relay is not reachable at {RELAY}: any `browser.open` with "
+                               "`app: {relay: true}` starts it (or run `omp browser-relay`)") from None
+        from websockets.sync.client import connect
+        # Entered by hand: drop() closes it, on paths a with-block would not cover.
+        return connect(endpoint, max_size=None, open_timeout=10, close_timeout=2).__enter__()
+
+    def __enter__(self):
+        self.ws = self.connect()
+        try:
+            deadline = time.monotonic() + 30
+            self.create_id = next(self.ids)
+            self.send(self.ws, self.create_id, "Target.createTarget", deadline, url=self.url, background=True)
+            try:
+                self.target = self.reply(self.ws, self.create_id, "Target.createTarget", deadline)["targetId"]
+            except CdpError as err:
+                self.create_answered = True
+                if NOT_CREATED in str(err):
+                    self.create_id = None  # refused before Chrome was asked: there is no tab
+                raise
+            self.session = self.call("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
+        except BaseException:
+            self.cleanup()
+            raise
+        return self
+
+    def __exit__(self, *exc):
+        self.cleanup()
+
+    def cleanup(self):
+        """Close this run's tab: on this connection, else a fresh one, else through Chrome's
+        AppleScript (the relay or its extension is gone); raises if the tab may still be open."""
+        with deferred_interrupt():
+            try:
+                if self.create_id is None:
+                    return
+                try:
+                    return self.close_tab(self.ws)
+                except RuntimeError:
+                    self.drop(self.ws)
+                try:
+                    ws = self.connect()
+                    try:
+                        self.close_tab(ws)
+                    finally:
+                        self.drop(ws)
+                except RuntimeError:
+                    if not self.close_outside_relay():
+                        raise
+                    print("pr-images: the relay could not close its tab; Chrome's AppleScript did", file=sys.stderr)
+            finally:
+                self.drop(self.ws)
+
+    def close_outside_relay(self):
+        """Close this run's tab through Chrome's AppleScript (macOS). True once it is closed, or,
+        when its creation was never confirmed, once none has appeared for CREATE_GRACE seconds."""
+        deadline = time.monotonic() + CREATE_GRACE
+        while True:
+            counts = self.apple_close()
+            if counts is None or counts[1]:
+                return False
+            if counts[0] or self.target is not None or time.monotonic() >= deadline:
+                return True
+            time.sleep(0.5)  # the creation may still be on its way to Chrome
+
+    def apple_close(self):
+        """(matched, left) from APPLE_CLOSE, or None where it cannot run or fails."""
+        if sys.platform != "darwin" or not shutil.which("osascript"):
+            return None
+        try:
+            run = subprocess.run(["osascript", "-e", APPLE_CLOSE.replace("MARKER", self.marker)],
+                                 capture_output=True, text=True, timeout=15)
+            matched, left = map(int, run.stdout.split())
+        except (subprocess.TimeoutExpired, ValueError):
+            return None
+        return (matched, left) if run.returncode == 0 else None
+
+    def close_tab(self, ws):
+        deadline = time.monotonic() + CREATE_GRACE
+        if self.target is None and ws is self.ws and not self.create_answered:
+            try:  # the creation may still answer on this connection
+                self.target = self.reply(ws, self.create_id, "Target.createTarget", deadline)["targetId"]
+            except CdpError:
+                pass  # answered with an error: look for the tab by its marker below
+        while self.target is None:
+            infos = self.call("Target.getTargets", ws=ws, timeout=10)["targetInfos"]
+            self.target = next((i["targetId"] for i in infos if self.marker in i.get("url", "")), None)
+            if self.target is None:
+                if time.monotonic() >= deadline:
+                    return  # the creation never reached Chrome
+                time.sleep(0.5)
+        try:
+            self.call("Target.closeTarget", ws=ws, timeout=10, targetId=self.target)
+        except CdpError as err:
+            if NO_SUCH_TAB not in str(err):
+                raise
+
+    def call(self, method, session=None, timeout=60, ws=None, **params):
+        ws = ws or self.ws
+        msg_id, deadline = next(self.ids), time.monotonic() + timeout
+        self.send(ws, msg_id, method, deadline, session, **params)
+        return self.reply(ws, msg_id, method, deadline)
+
+    def send(self, ws, msg_id, method, deadline, session=None, **params):
+        """Send from a writer thread; past the deadline, shut the socket to cut the write off."""
+        msg = {"id": msg_id, "method": method, "params": params}
+        if session:
+            msg["sessionId"] = session
+        text, done, failure = json.dumps(msg), threading.Event(), []
+
+        def write():
+            try:
+                ws.send(text)
+            except Exception as err:  # noqa: BLE001 - reported to the caller below
+                failure.append(err)
+            finally:
+                done.set()
+
+        threading.Thread(target=write, daemon=True).start()
+        if not done.wait(max(0, deadline - time.monotonic())):
+            self.drop(ws)
+            raise RuntimeError(f"{method}: the relay stopped reading")
+        if failure:
+            raise RuntimeError(f"{method}: relay connection lost ({failure[0]})")
+
+    @staticmethod
+    def reply(ws, msg_id, method, deadline):
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise RuntimeError(f"{method}: no reply in time")
+            try:
+                reply = json.loads(ws.recv(timeout=left))
+            except TimeoutError:
+                continue
+            except Exception as err:  # noqa: BLE001 - the connection is gone
+                raise RuntimeError(f"{method}: relay connection lost ({err})") from None
+            if reply.get("id") == msg_id:
+                if "error" in reply:
+                    raise CdpError(f"{method}: {reply['error'].get('message')}")
+                return reply.get("result", {})
+
+    @staticmethod
+    def drop(ws):
+        if ws is None:
+            return
+        with contextlib.suppress(Exception):
+            ws.socket.shutdown(socket.SHUT_RDWR)
+        with contextlib.suppress(Exception):
+            ws.close()
+
+    def evaluate(self, expression, timeout=60):
+        result = self.call("Runtime.evaluate", self.session, timeout, expression=expression,
+                           awaitPromise=True, returnByValue=True)
+        if "exceptionDetails" in result:
+            raise RuntimeError(result["exceptionDetails"].get("exception", {}).get("description")
+                               or result["exceptionDetails"].get("text"))
+        return result["result"].get("value")
+
+    def wait_ready(self, timeout=30):
+        """The signed-in GitHub user once the page has loaded."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                login = self.evaluate(READY_JS, timeout=10)
+            except RuntimeError:
+                login = None  # the page is still navigating
+            if login is not None:
+                return login
+            time.sleep(0.5)
+        raise RuntimeError("the GitHub page did not finish loading in 30 s")
+
+
+def upload(relay, path, repo):
+    data, content_type, _ = load(path)
+    key = json.dumps(os.urandom(8).hex())
+    relay.evaluate(f"(globalThis.__prImages ??= {{}})[{key}] = []")
+    for part in chunks(data):
+        relay.evaluate(f"globalThis.__prImages[{key}].push({json.dumps(part)})")
+    args = {"key": json.loads(key), "name": os.path.basename(path), "type": content_type,
+            "size": len(data), "nwo": repo}
+    result = relay.evaluate(f"({UPLOAD_JS})({json.dumps(args)})", timeout=120)
+    if "error" in result:
+        raise RuntimeError(f"{path}: {result['error']}")
+    return result["href"]
+
+
+def gh_api(path, method="GET", body=None, missing_ok=False):
+    """`gh api` with a JSON body on stdin; the parsed reply, or None for a 404 when missing_ok."""
+    cmd = ["gh", "api", "-X", method, path] + (["--input", "-"] if body is not None else [])
+    run = subprocess.run(cmd, input=json.dumps(body) if body is not None else None,
+                         capture_output=True, text=True, timeout=180)
+    if run.returncode:
+        if missing_ok and "HTTP 404" in run.stderr:
+            return None
+        raise RuntimeError(f"gh api {method} {path}: {(run.stderr or run.stdout).strip()[:300]}")
+    return json.loads(run.stdout) if run.stdout.strip() else {}
+
+
+def asset_path(folder, path, data):
+    """FOLDER/<git blob hash, 10 hex>-<name>: a new version of a file gets a new path, so a URL already
+    in a posted body never changes what it shows."""
+    blob = hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()[:10]
+    return f"{folder.strip('/')}/{blob}-{os.path.basename(path)}"
+
+
+def raw_url(fork, path):
+    return f"https://raw.githubusercontent.com/{fork}/{ASSETS_BRANCH}/{urllib.parse.quote(path)}"
+
+
+def fork_links(fork, folder, paths):
+    """Commit `paths` to ASSETS_BRANCH on `fork` in one commit through the GitHub API (the branch is
+    created, without history, on first use) and return {path: raw URL}, each checked to load."""
+    ref = gh_api(f"repos/{fork}/git/ref/heads/{ASSETS_BRANCH}", missing_ok=True)
+    head = ref["object"]["sha"] if ref else None
+    base_tree = gh_api(f"repos/{fork}/git/commits/{head}")["tree"]["sha"] if head else None
+    entries, urls = [], {}
+    for path in paths:
+        data = load(path)[0]
+        blob = gh_api(f"repos/{fork}/git/blobs", "POST",
+                      {"content": base64.b64encode(data).decode(), "encoding": "base64"})["sha"]
+        target = asset_path(folder, path, data)
+        entries.append({"path": target, "mode": "100644", "type": "blob", "sha": blob})
+        urls[path] = raw_url(fork, target)
+    tree = gh_api(f"repos/{fork}/git/trees", "POST",
+                  {"tree": entries, **({"base_tree": base_tree} if base_tree else {})})["sha"]
+    if tree != base_tree:
+        commit = gh_api(f"repos/{fork}/git/commits", "POST", {
+            "message": f"assets: {folder} ({len(paths)} file(s))", "tree": tree, "parents": [head] if head else []})["sha"]
+        if head:
+            gh_api(f"repos/{fork}/git/refs/heads/{ASSETS_BRANCH}", "PATCH", {"sha": commit})
+        else:
+            gh_api(f"repos/{fork}/git/refs", "POST", {"ref": f"refs/heads/{ASSETS_BRANCH}", "sha": commit})
+    for path, url in urls.items():
+        wait_loads(url)
+    return urls
+
+
+def wait_loads(url, timeout=60):
+    """raw.githubusercontent.com serves a new commit after a few seconds; wait until `url` answers 200."""
+    deadline, last = time.monotonic() + timeout, None
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, method="HEAD"), timeout=15) as res:
+                if res.status == 200:
+                    return
+        except OSError as err:
+            last = err
+        time.sleep(2)
+    raise RuntimeError(f"{url} does not load after the push ({last})")
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(usage=__doc__.split("\n\n", 2)[1].removeprefix("usage: "))
+    parser.add_argument("command", choices=["upload"])
+    parser.add_argument("files", nargs="+")
+    parser.add_argument("--repo")
+    parser.add_argument("--mode", choices=["relay", "fork-links"])
+    parser.add_argument("--folder")
+    shape = parser.add_mutually_exclusive_group()
+    shape.add_argument("--themed", action="store_true")
+    shape.add_argument("--loop", action="store_true")
+    shape.add_argument("--still", action="store_true")
+    parser.add_argument("--scale", type=int, default=1)
+    parser.add_argument("--alt", action="append", default=[])
+    parser.add_argument("--uploaded", action="append", default=[], metavar="FILE=URL")
+    args = parser.parse_args(argv)
+    cfg = omp_config.load()
+    args.repo = args.repo or cfg.upstream_repo
+    args.mode = args.mode or cfg.image_upload or "relay"
+    if args.mode not in ("relay", "fork-links"):
+        parser.error(f"images.upload = {args.mode!r} in {cfg.path}: expected \"relay\" or \"fork-links\"")
+    if args.scale < 1:
+        parser.error("--scale must be 1 or more")
+    known = {}
+    for item in args.uploaded:
+        path, sep, url = item.partition("=")
+        if not sep or not url.startswith("https://"):
+            parser.error(f"--uploaded {item}: expected FILE=https://...")
+        known[os.path.realpath(path)] = url
+    try:
+        images = plan(args.files, args.themed, args.loop, args.still)
+        sizes = {path: load(path)[2] for _, paths in images for path in paths.values()}
+    except (OSError, ValueError) as err:
+        parser.error(str(err))
+    if args.alt and len(args.alt) != len(images):
+        parser.error(f"{len(args.alt)} --alt for {len(images)} images")
+    for alt, paths in images:
+        for layout in ("", f"{NARROW}-"):
+            group = [p for k, p in paths.items() if k.startswith(NARROW) == bool(layout)]
+            if len({sizes[p] for p in group}) > 1:
+                pair = ("loop", STILL) if args.loop else THEMES
+                parser.error(f"{alt}: the {layout}{pair[0]} and {layout}{pair[1]} files differ in size")
+            if layout and group and sizes[group[0]] and sizes[group[0]][0] < NARROW_MIN_PX:
+                parser.error(f"{alt}: the narrow files are {sizes[group[0]][0]} px wide; the phone layout is shown "
+                             f"up to {NARROW_SHOWN} px, so render it at least {NARROW_MIN_PX} px wide (320 px at 3x)")
+    unused = set(known) - {os.path.realpath(p) for p in sizes}
+    if unused:
+        parser.error(f"--uploaded {sorted(unused)[0]}: not among the files")
+
+    files = [path for _, paths in images for path in paths.values()]
+    urls = {p: known[os.path.realpath(p)] for p in files if os.path.realpath(p) in known}
+    todo = [p for p in files if p not in urls]
+    relay, leftover = None, None
+    if todo and args.mode == "fork-links":
+        fork = cfg.fork_repo
+        if not fork or fork.split("/")[0] == "":
+            sys.exit("pr-images: fork-links needs your fork (github.fork_owner / github.fork_remote, references/config.md)")
+        folder = args.folder or os.path.basename(os.path.dirname(os.path.abspath(todo[0]))) or "assets"
+        try:
+            urls.update(fork_links(fork, folder, todo))
+        except (RuntimeError, OSError, subprocess.TimeoutExpired) as err:
+            sys.exit(f"pr-images: {err}")
+        if any(p.lower().endswith(VIDEO) for p in todo):
+            print("pr-images: a video on fork-links renders as a link, not a player (relay uploads play inline)", file=sys.stderr)
+        print(f"committed {len(todo)} file(s) to {fork}@{ASSETS_BRANCH}:{folder}/", file=sys.stderr)
+    elif todo:
+        relay = Relay(args.repo)
+        try:
+            with relay:
+                login = relay.wait_ready()
+                if not login:
+                    sys.exit("Chrome is not signed in to GitHub")
+                for path in todo:
+                    urls[path] = upload(relay, path, args.repo)
+        except RuntimeError as err:
+            if len(urls) < len(files):
+                sys.exit(f"pr-images: {err}")
+            leftover = err  # every file is up; only closing the tab failed
+        print(f"uploaded {len(todo)} file(s) to {args.repo} as {login}", file=sys.stderr)
+    blocks = []
+    for i, (alt, paths) in enumerate(images):
+        if "plain" in paths and paths["plain"].lower().endswith(VIDEO):
+            blocks.append(urls[paths["plain"]])  # GitHub renders a bare attachment URL on its own line as its player
+            continue
+        size = sizes[paths.get("plain") or paths.get("light") or paths.get("loop") or paths[STILL]]
+        blocks.append(markdown(args.alt[i] if args.alt else alt, {k: urls[p] for k, p in paths.items()},
+                               size, args.scale))
+    print("\n\n".join(blocks))
+    if leftover:
+        sys.exit(f"pr-images: could not close its tab (#{relay.marker}): {leftover}")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

@@ -1,0 +1,1469 @@
+#!/usr/bin/env python3
+"""Trace your oh-my-pi PRs back to the local state needed to resume them.
+
+usage: pr-trace [N ...] [--open] [--fetch]
+       pr-trace --summary [N ...] [--open] [--fetch] [--since DAYS] [--json]
+       pr-trace --issues
+       pr-trace --wait-codex N [N ...] [--timeout MIN]
+       pr-trace --wait-change N [N ...] [--timeout MIN] [--state FILE]
+  N ...     PR numbers on the upstream repo
+  --open    every open PR authored by you (`github.fork_owner`)
+  --fetch   refresh origin/main and fork refs first, so the conflict checks are current (it only
+            updates remote-tracking refs, so it is fine in a look-only request)
+  --summary one line per PR, the ones that need us first, then our PRs merged in the last DAYS
+            (default 2) with the commits a maintainer added before merging and the first release
+            that ships each (earliest `v*` tag holding the merge commit, tags fetched; else
+            `unreleased`), and under each the bot findings posted after the merge: `post-merge: Codex P1 x2
+            open` when no later main commit names the PR or rewrites their lines (also listed in "Needs
+            us": fix them as a follow-up off main before the maintainer has to), else the main commit
+            that took them up. Start every "where do
+            things stand" scan with `--summary --open --fetch`: it selects by activity, not by when a
+            PR was opened (2026-10-08: two change requests on PRs opened days earlier sat 23 h).
+            --json prints the same as one object (open rows, merges, `pause`, `queue_watch`) for
+            scripts (a daily digest, a status bar). The summary starts with the
+            queue's opening pause when one is set (`pr-queue pause`), then the queue
+            watcher's record (`pr-queue watch`, fetched from the fork's queue branch
+            on every run, --fetch or not): what is ready to open and since when, open PRs that
+            started conflicting with main, post-merge bot findings still open on any merge (they
+            also join "Needs us" past the DAYS window), merges newly released, or that the watcher
+            went silent (or, when the fetch failed, that the record shown is this host's old copy).
+            A PR named after --summary that is not handed off also shows its `pre-hand-off` items,
+            to check it before it goes to the maintainer (workflow step 7, At hand-off); naming alone keeps
+            the budget and does not count as needing us
+  --issues  audit the open issues you filed instead: which a merged PR only referenced
+            without closing, which triage labelled duplicate, which have a fix PR pending
+  --wait-codex  after a push, block until Codex's pass on each named PR's head has ended (polled
+            every minute), printing one line per PR as it ends: `clean` (row Completed on the head
+            with no review, or 👍), `findings` (its review on the head, with the count), `failed`
+            (Failed, a row left Running with no 👀, or 👀 up past 45 min), `never` (no 👀 within
+            30 min of the push: the later of the head's commit time and when the wait first saw
+            it, so run it right after the push), `closed`. --timeout bounds the whole wait (default 60 min).
+            Exit 0: every pass ended, none with findings; 4: every pass ended, findings on at
+            least one head; 3: timeout, the PRs still pending listed; 2: usage error
+  --wait-change  block until any named PR changes, then print one `#N kind: text` line per change
+            and exit 0. Kinds: `state` (merged, closed, reopened), `ready`/`draft`, `head` (new SHA,
+            with the commit count; a `maintainer-commit` line per new commit someone else wrote),
+            `person` (a comment, review or review-thread comment by anyone but us and the bots),
+            `codex` (its pass on the head ended: clean, findings, failed or never, as --wait-codex),
+            and on ready PRs `mergeable` (GitHub's MERGEABLE/CONFLICTING; UNKNOWN keeps the last) and
+            `vs-main` (the merge-tree class: real conflict with its files, GitHub's CHANGELOG-only
+            conflict, or clean; recomputed when main or the head moves). Polls every 2 min. Both waits
+            share one poll per host (omp_poll): a gate of about a point per 20 PRs, full data only for
+            a PR that moved, every waiter's PRs in one query; under 500 points left they wait for the reset.
+            --timeout bounds the wait (default 55 min, one omp bash call); exit 3 on timeout.
+            --state FILE keeps the snapshots between waits: the next wait compares against it, so a
+            change that lands while we act on the last one still wakes the next wait
+
+For each PR: GitHub state and roboomp rank, maintainer change requests posted since our last
+thread comment (CHANGES), bot threads still waiting on our reply (Codex P2s listed apart as P2),
+whether Codex is still to review the head (reviewing while its 👀 is up, or due within 30 min of the push; a
+pass that ended without a result, or a 👀 up so long the pass is possibly stuck, are shown too), where
+Codex stands (clean, settled once every finding of its last pass is answered, findings to fix or
+decline, fixes pushed, round budget spent, or a maintainer pushing to the PR; workflow step 7) and
+files whose findings span three rounds (reconsider the approach), and on a handed-off PR (its
+queue note says it is with the maintainer, or a maintainer reviewed or commented) the hand-off items: the
+budget no longer applies, and each deferred Codex reply (`Not fixed yet`, `Left for review`) and
+each comment of ours with hand-off wording is listed to fix and edit,
+Codex threads we answered but have not resolved (resolve, with the thread id), roboomp review-body notes that no inline thread
+answers (maintainer questions, trade-offs, untested paths: settle each), the questions we asked
+a maintainer in the PR thread and whether one has replied since, whether the branch really
+conflicts with main (merge-tree; CHANGELOG-only or generated-catalog-only counts as clean, as in pr-queue),
+and when clean what GitHub shows (`GitHub: mergeable`, or `GitHub: conflicting (CHANGELOG only: …)`:
+GitHub's merge ignores merge=union; no push of its own, the next needed push rebases onto main),
+whether it breaks the open-PR
+rule (shaping.md: a merge-order line in the body, another open PR's commits, a code conflict with
+another open ready PR of ours, a draft older than the limit; "rule:" lines,
+from `pr-queue audit`), where our CHANGELOG lines land once main is merged in, a touched package
+with no CHANGELOG entry whose fix rewrites lines from a commit a release cut since the PR opened
+ships (precheck let the entry go while that commit was unreleased; the regression has since
+reached users, so the entry is due: changelog.md), the local worktree and scratch dir,
+the session that opened the PR (subagent included), the session where work on the branch first
+appears, the other sessions most involved with it, and a suggested next step. Session files are
+omp JSONL transcripts under ~/.omp/agent/sessions; pass a session id to `archive.session(id)` in
+Eval for its recaps and prompts. Drafts list the PRs their body says they wait on.
+"""
+import argparse
+import datetime
+import json
+import os
+import re
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from omp_pr import (  # noqa: E402
+    BODY_FINDING, CHECKOUT, CODEX, CONFIG, MAINTAINERS, ME, REPO, Diff, RateLimited, blamed_commits, bot, by_maintainer,
+    changelog_drift, first_release, gh_json, github_changelog_conflicts, has_ref, last_review, merge_conflicts,
+    merged_prs, open_prs, package_of, post_merge_counts, post_merge_review, run,
+)
+from omp_queue import STORE_REMOTE, GitError, GitHub, Queue, Store, opening_pause, pause_line  # noqa: E402
+import omp_poll  # noqa: E402
+import omp_watch  # noqa: E402
+
+SESSIONS = os.path.expanduser("~/.omp/agent/sessions")
+# Dirs holding the user's working notes per PR (`paths.scratch_roots`); none by default.
+SCRATCH_ROOTS = CONFIG.scratch_roots
+OTHER_SESSIONS_SHOWN = 4
+MIN_MENTIONS = 3
+MAINTAINER_TAG = re.compile(r"@(" + "|".join(MAINTAINERS) + r")\b", re.I)
+
+
+def mention_counts(text):
+    """{transcript path: number of JSONL entries mentioning text}."""
+    out = run("rg", "-c", "-F", text, SESSIONS, "-g", "*.jsonl")
+    counts = {}
+    for line in out.stdout.splitlines():
+        path, _, n = line.rpartition(":")
+        counts[path] = int(n)
+    return counts
+
+
+def first_mention(path, text):
+    """Timestamp of the first JSONL entry in `path` containing `text`."""
+    out = run("rg", "-m1", "-F", text, path)
+    try:
+        return json.loads(out.stdout.splitlines()[0]).get("timestamp") or ""
+    except (IndexError, json.JSONDecodeError):
+        return ""
+
+
+def session_of(path):
+    """(top-level session file, subagent name or None) for a transcript path."""
+    rel = os.path.relpath(path, SESSIONS).split(os.sep)
+    project, rest = rel[0], rel[1:]
+    top = os.path.join(SESSIONS, project, rest[0].removesuffix(".jsonl") + ".jsonl")
+    if len(rest) == 1:
+        return top, None
+    parts = []
+    for p in rest[1:]:
+        for name in p.removesuffix(".jsonl").split("."):
+            if not parts or parts[-1] != name:
+                parts.append(name)
+    return top, ".".join(parts)
+
+
+_headers = {}
+
+
+def header(top):
+    """(session id, title, cwd) from a top-level transcript's first lines."""
+    if top not in _headers:
+        sid, title, cwd = "", "", ""
+        try:
+            with open(top) as f:
+                for _ in range(4):
+                    entry = json.loads(f.readline() or "{}")
+                    if entry.get("type") == "title":
+                        title = entry.get("title", "")
+                    if entry.get("type") == "session":
+                        sid, cwd = entry.get("id", ""), entry.get("cwd", "")
+                        title = title or entry.get("title", "")
+        except (OSError, json.JSONDecodeError):
+            pass
+        _headers[top] = (sid, title, cwd)
+    return _headers[top]
+
+
+def describe(path, commits):
+    top, agent = session_of(path)
+    sid, title, cwd = header(top)
+    lines = [f"{sid[:13]} \"{title}\"" + (f" via subagent {agent}" if agent else ""), f"      file {top}"]
+    if agent:
+        lines.append(f"      sub  {path}")
+        report = path.removesuffix(".jsonl") + ".md"
+        if os.path.exists(report):
+            written = datetime.datetime.fromtimestamp(os.path.getmtime(report), datetime.timezone.utc)
+            later = [c for c in commits
+                     if datetime.datetime.fromisoformat(c["committedDate"].replace("Z", "+00:00")) > written]
+            note = f"; {len(later)} commit(s) landed after it" if later else ""
+            lines.append(f"      report {report}  (the subagent's final answer, read first{note})")
+    lines.append(f"      cwd  {cwd}")
+    return "\n".join(lines)
+
+
+def worktrees():
+    out = run("git", "worktree", "list", "--porcelain", cwd=CHECKOUT).stdout
+    found, path = {}, None
+    for line in out.splitlines():
+        if line.startswith("worktree "):
+            path = line[9:]
+        elif line.startswith("branch refs/heads/"):
+            found[line[18:]] = path
+    return found
+
+
+def scratch_dirs(branch, number):
+    """Scratch dirs named for the branch topic under any of `paths.scratch_roots`, or (under the first
+    root) holding a file that names the topic or PR. Later roots are matched by name only: a shared
+    notes dir lists many PRs."""
+    topic = branch.split("/", 1)[-1]
+    hits = set()
+    for root in SCRATCH_ROOTS:
+        if not os.path.isdir(root):
+            continue
+        for name in os.listdir(root):
+            if name == topic or name.endswith("-" + topic):
+                hits.add(os.path.join(root, name))
+    root = SCRATCH_ROOTS[0] if SCRATCH_ROOTS else None
+    if root and os.path.isdir(root):
+        out = run("rg", "-l", "--max-depth", "3", "-e", re.escape(topic), "-e", rf"#{number}\b", root)
+        for path in out.stdout.splitlines():
+            hits.add(os.path.join(root, os.path.relpath(path, root).split(os.sep)[0]))
+    return sorted(h for h in hits if os.path.isdir(h))
+
+
+def dependencies(pr):
+    """PRs a draft says it waits on: the #N in the sentence that mentions waiting, minus any
+    the sentence says it supersedes."""
+    body = pr.get("body", "")
+    match = re.search(r"\bwaits?\b[^.\n]*", body[:1500], re.I)
+    if not match:
+        return []
+    clause = re.sub(r"supersed\w*\s+#\d+(?:\s*(?:,|and|&)\s*#\d+)*", "", match.group(0), flags=re.I)
+    deps = []
+    for n in dict.fromkeys(int(n) for n in re.findall(r"#(\d{3,})", clause)):
+        if n == pr["number"]:
+            continue
+        d = gh_json("pr", "view", str(n), "-R", REPO, "--json", "state,labels")
+        rank = next((l["name"] for l in d["labels"] if l["name"].startswith("review:")), "no rank")
+        deps.append((n, d["state"].lower(), rank))
+    return deps
+
+
+# Before a PR goes to the maintainer we aim for a clean Codex pass on its
+# head: every cheap finding is fixed, P2s included, and only one needing a design change is declined
+# with a one-line reason; we stop pushing for Codex once its last pass on the head is clean or
+# answered in full, or after CODEX_ROUND_BUDGET rounds (workflow step 7). At
+# hand-off the budget ends and every valid finding is ours, the skipped ones included.
+CODEX_URGENT = re.compile(r"!\[P[01] Badge\]")
+# One comments connection per thread, split into opener/latest/all here: three per thread (first:1,
+# last:1, first:50) cost GitHub 300 requests for 100 threads, most of the query's points. A thread
+# past 50 comments (none of ours yet) would show its 50th as the latest.
+REVIEW_QUERY = """query($n:Int!){repository(owner:"%s",name:"%s"){pullRequest(number:$n){
+  reactions(first:50){nodes{content createdAt user{login}}}
+  reviews(first:100){nodes{id url submittedAt body author{login} commit{oid}}}
+  reviewThreads(first:100){nodes{id isResolved
+    comments(first:50){nodes{author{login} body url path line pullRequestReview{id}}}}}}}}""" % tuple(REPO.split("/"))
+
+
+def review_data(number):
+    """The PR's reviews, review threads (each with `opener`, `latest` and `all` comments) and
+    reactions (REVIEW_QUERY)."""
+    data = gh_json("api", "graphql", "-f", f"query={REVIEW_QUERY}", "-F", f"n={number}")
+    pull = data["data"]["repository"]["pullRequest"]
+    for t in pull["reviewThreads"]["nodes"]:
+        nodes = t.pop("comments")["nodes"]
+        t.update(opener={"nodes": nodes[:1]}, latest={"nodes": nodes[-1:]}, all={"nodes": nodes})
+    return pull
+
+
+def body_findings(review):
+    """[(severity, path, line)] of the findings in a Codex review's body (BODY_FINDING)."""
+    return [(m.group(5), m.group(2), int(m.group(3))) for m in BODY_FINDING.finditer(review.get("body") or "")]
+
+
+def review_threads(pull, pr=None):
+    """(waiting, p2, to_resolve) over the unresolved threads of `pull` (review_data). `waiting`:
+    threads whose last comment is not ours, Codex P2s left out, as "<login> on <path>: <url>". `p2`:
+    Codex threads without a P0/P1 badge whose last comment is not ours, same shape. `to_resolve`:
+    Codex threads we already answered, as (thread id, url); Codex threads are resolved after our
+    reply, roboomp's stay open for the maintainer. Given `pr`, Codex findings
+    written in a review body count too, until a later top-level comment of ours links the review
+    (no thread to reply in: answered like a review-body note, bots.md, Judging a finding 5)."""
+    waiting, p2, to_resolve = [], [], []
+    for t in pull["reviewThreads"]["nodes"]:
+        if t["isResolved"]:
+            continue
+        first = (t["opener"]["nodes"] or [{}])[0]
+        last = (t["latest"]["nodes"] or [{}])[-1]
+        opener, login = bot(first), bot(last)
+        if login != ME:
+            urgent = opener != CODEX or CODEX_URGENT.search(first.get("body") or "")
+            (waiting if urgent else p2).append(f"{login} on {last.get('path')}: {last.get('url')}")
+        elif opener == CODEX:
+            to_resolve.append((t["id"], last.get("url")))
+    ours = [c for c in (pr or {}).get("comments") or [] if (c.get("author") or {}).get("login") == ME]
+    for r in pull["reviews"]["nodes"] if pr else []:
+        if bot(r) != CODEX or any(c.get("createdAt", "") > (r.get("submittedAt") or "")
+                                  and r.get("url") and r["url"] in (c.get("body") or "") for c in ours):
+            continue
+        for severity, path, _ in body_findings(r):
+            (waiting if severity in ("P0", "P1") else p2).append(f"{CODEX} on {path}: {r.get('url')}")
+    return waiting, p2, to_resolve
+
+
+CODEX_SUMMARY = "<!-- codex-pull-request-review-summary -->"
+CODEX_SUMMARY_ROW = re.compile(r"^\|[^|]*Code Review[^|]*\|([^|]*)\|\s*`([0-9a-f]{7,40})`", re.M)
+CODEX_SUMMARY_AT = re.compile(r'datetime="([^"]+)"')
+# Codex's 👀 (EYES) on the PR body is its pass in progress: it lands when the pass starts, about 3 s
+# after the summary row turns `Running` (#15184, #15175: row 00:34:45, 👀 00:34:48-49, 2026-10-18),
+# and is removed when the pass ends, which leaves 👍 if clean, a review if it found something, and
+# nothing if it failed. A pass that dies leaves 👀 up (#15418: up since 2026-10-14 23:31, row
+# still `Running` on 10-18).
+CODEX_EYES_LAG = datetime.timedelta(minutes=2)
+# Once Codex has reviewed a PR, each push waits for its pass on the new head. Push
+# to pass start (row `Running` since) over 293 passes on our PRs 2026-09-20..10-18: p50 18 s, p90
+# 3.7 min, 97.6% within 30 min; force pushes (exact push time, 133): 97.7% within 30, max 41, the
+# late ones in backlog bursts (four PRs started together at 18:25 on 10-12). No 👀 this long after
+# the push: the pass never started (17% of 138 force pushes on PRs Codex had reviewed got none).
+CODEX_START_WINDOW = datetime.timedelta(minutes=30)
+# Pass start to end over 415 passes: p50 9 min, p90 13, p99 16, max 26. 👀 older than this, with no
+# newer `Running` row on the head, is a dead pass rather than a slow one.
+CODEX_STUCK = datetime.timedelta(minutes=45)
+# `pr-trace --wait-codex`: poll interval, and the default bound (a start at the window's edge plus
+# the longest pass, 30 + 26 min, fits).
+CODEX_POLL = 60
+CODEX_WAIT_DEFAULT = 60
+CODEX_FLAG = {"running": "Codex reviewing head", "due": "Codex due on head",
+              "ended": "Codex pass ended without a result",
+              "stuck": f"Codex pass possibly stuck (👀 up over {CODEX_STUCK.seconds // 60} min)"}
+# Rounds (Codex reviews with findings) before only P0/P1s get a push: 11 of the 12 material findings
+# on our PRs came in rounds 1-3 and none of the 104 from round 4 on (workflow step 7).
+CODEX_ROUND_BUDGET = 5
+# A file with findings in this many rounds, the latest included: reconsider the approach (step 7).
+CODEX_REPEAT_ROUNDS = 3
+CODEX_SETTLE = {
+    "clean": "clean: its last pass on the head found nothing; ready for the maintainer",
+    "settled": "settled: every finding of its last pass on the head is answered; no push for Codex",
+    "fix": "its last pass left findings on the head: fix every cheap one in one push, P2s included",
+    "pushed": "its last pass had findings; fixes pushed since, its next pass is pending",
+    "budget": (f"round budget spent ({CODEX_ROUND_BUDGET} rounds): only P0/P1s get a push, and once, a cheap "
+               "finding on lines our latest push wrote"),
+    "maintainer": "a maintainer has pushed to the PR: Codex findings on his head are his"}
+CODEX_SHORT = {"clean": "Codex clean", "settled": "Codex settled", "fix": "Codex findings",
+               "pushed": "Codex fixes pushed", "budget": "Codex budget spent", "maintainer": "maintainer pushed"}
+
+
+def codex_summary(pr):
+    """(status cell, short sha) of the Codex Review Summary comment Codex keeps updated with its
+    latest pass, or None when it has none."""
+    summary = next((c["body"] for c in pr["comments"] if CODEX_SUMMARY in (c.get("body") or "")), None)
+    row = CODEX_SUMMARY_ROW.search(summary or "")
+    return row.groups() if row else None
+
+
+def codex_eyes(pull):
+    """When Codex's 👀 went up on the PR body (review_data reactions), or None when it is not up."""
+    return max((stamp(x["createdAt"]) for x in pull["reactions"]["nodes"]
+                if bot(x) == CODEX and x.get("content") == "EYES"), default=None)
+
+
+def pushed_at(pr):
+    """The head's commit time, standing in for its push time (a rebase or amend renews it), or when a
+    wait first saw the head (`seenAt`) if later: a commit made before its tests ran is pushed minutes
+    after its commit time (#15563, 2026-10-18: committed 05:30Z, pushed ~05:37Z, read `never` early)."""
+    committed = stamp(pr["commits"][-1]["committedDate"])
+    return max(committed, stamp(pr["seenAt"])) if pr.get("seenAt") else committed
+
+
+def codex_head(pr, pull, now=None):
+    """Codex's state on the head, from its 👀 and the Codex Review Summary row: "running" while 👀
+    is up and under CODEX_STUCK old (counted from the head's `Running` row when that is newer), or
+    in the seconds between the row turning `Running` and 👀 landing; "ended" when the row on the
+    head says `Running` or `Failed` with no 👀 (the pass ended without a result); "due" when Codex
+    has a row on an older commit and the head was pushed under CODEX_START_WINDOW ago; "stuck" when
+    👀 is older than CODEX_STUCK and nothing above applies; else None (the head has a result, the
+    window passed, or Codex never engaged)."""
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    status, sha = codex_summary(pr) or ("", "")
+    eyes = codex_eyes(pull)
+    on_head = bool(sha) and pr["headRefOid"].startswith(sha)
+    at = CODEX_SUMMARY_AT.search(status) if on_head and "Running" in status else None
+    began = stamp(at.group(1)) if at else None
+    if eyes and now - max(eyes, began or eyes) < CODEX_STUCK:
+        return "running"
+    if on_head and ("Running" in status or "Failed" in status):
+        if began and not eyes and now - began < CODEX_EYES_LAG:
+            return "running"
+        return "stuck" if eyes else "ended"
+    if sha and not on_head and now - pushed_at(pr) < CODEX_START_WINDOW:
+        return "due"
+    return "stuck" if eyes else None
+
+
+def codex_outcome(pr, pull, now=None):
+    """How Codex's pass on the head ended, as (kind, text), or None while it runs or may still
+    start. Kinds: "findings" (a Codex review on the head; text counts its threads), "clean" (the row
+    on the head `Completed` with no review, or a 👍 since the push), "failed" (`Failed`, a row left
+    `Running` without 👀, or 👀 past CODEX_STUCK), "never" (no pass within CODEX_START_WINDOW of the
+    push)."""
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    state, head, pushed = codex_head(pr, pull, now), pr["headRefOid"], pushed_at(pr)
+    if state in ("running", "due"):
+        return None
+    on_head = [r for r in pull["reviews"]["nodes"]
+               if bot(r) == CODEX and r.get("submittedAt") and (r.get("commit") or {}).get("oid") == head]
+    if on_head:
+        review = max(on_head, key=lambda r: r["submittedAt"])
+        found = sum(1 for t in pull["reviewThreads"]["nodes"]
+                    if (((t["opener"]["nodes"] or [{}])[0].get("pullRequestReview") or {}).get("id") == review["id"]))
+        found += len(body_findings(review))
+        return "findings", f"{found} finding(s) on the head: {review.get('url')}"
+    status, sha = codex_summary(pr) or ("", "")
+    thumbs = [stamp(x["createdAt"]) for x in pull["reactions"]["nodes"]
+              if bot(x) == CODEX and x.get("content") == "THUMBS_UP"]
+    if (sha and head.startswith(sha) and "Completed" in status) or any(t >= pushed for t in thumbs):
+        return "clean", "clean pass on the head" + (" (👍)" if thumbs else "")
+    if state == "stuck":
+        eyes = codex_eyes(pull)
+        return "failed", f"no result: 👀 up since {eyes:%Y-%m-%d %H:%MZ}, past {CODEX_STUCK.seconds // 60} min (pass possibly stuck)"
+    if state == "ended":
+        return "failed", ("no result: Codex pass failed" if "Failed" in status
+                          else "no result: Codex pass ended without a result (row still `Running`, no 👀)")
+    if now - pushed < CODEX_START_WINDOW:
+        return None
+    return "never", (f"never started: no 👀 within {CODEX_START_WINDOW.seconds // 60} min of the push "
+                     f"({pushed:%Y-%m-%d %H:%MZ})")
+
+
+def wait_codex(numbers, minutes):
+    """Block until Codex's pass on each PR's head has ended, printing each outcome as it lands;
+    the exit status as documented in --help. Polls through the host's shared poll (poll_prs)."""
+    deadline = time.monotonic() + minutes * 60
+    pending, kinds, seen, first = list(dict.fromkeys(numbers)), set(), {}, {}
+    while True:
+        try:
+            _, nodes, rate = poll_prs(pending, CODEX_POLL - 5)
+        except (RuntimeError, OSError) as err:  # a gh blip should not end the wait
+            print(f"gh failed, retrying: {err}", file=sys.stderr)
+            nodes, rate = {}, spent_rate(err)
+        for number in list(pending):
+            node = nodes.get(number)
+            if not node:
+                continue
+            pr, pull = as_trace(node)
+            first.setdefault(pr["headRefOid"], omp_watch.fmt(datetime.datetime.now(datetime.timezone.utc)))
+            pr["seenAt"] = first[pr["headRefOid"]]
+            out = (codex_outcome(pr, pull) if node["state"] == "OPEN"
+                   else ("closed", f"{node['state'].lower()}: nothing to wait for"))
+            if out:
+                kinds.add(out[0])
+                print(f"#{number} {pr['headRefOid'][:10]} {out[0]}: {out[1]}", flush=True)
+                pending.remove(number)
+            else:
+                seen[number] = (pr["headRefOid"][:10], codex_head(pr, pull))
+        if not pending:
+            return 4 if "findings" in kinds else 0
+        if time.monotonic() >= deadline:
+            for number in pending:
+                head, state = seen.get(number, ("?", "gh"))
+                print(f"#{number} {head} timeout: " + {"running": "still reviewing (👀 up)",
+                                                       "gh": "gh never answered"}.get(state, "Codex not started yet"))
+            return 3
+        time.sleep(max(1, min(pause_for(rate, CODEX_POLL), deadline - time.monotonic())))
+
+
+# The waits (`--wait-change`, `--wait-codex`) poll through omp_poll: one cache per host, a gate,
+# full data only for a PR whose gate moved, and every PR a concurrent wait on the host watches
+# refreshed in the same query. Priced with `gh-cost` (rateLimit dryRun) on 2026-10-19: the gate is
+# 1 point for 1, 3 or 29 PRs, the full read 1, 4 and 37 points. Before, --wait-codex cost 4 points
+# per PR a minute (`gh pr view` 1 and the old REVIEW_QUERY 3) and --wait-change 1.25 per PR a
+# poll; now an idle poll is 1 point for every wait on the host together. Polling every 2 min
+# (wait-change) is enough: a Codex pass runs 9 min at the median, a maintainer round spans minutes.
+# Below CHANGE_RESERVE points left a wait sleeps to the limit's reset instead.
+CHANGE_POLL = 120
+CHANGE_RESERVE = 500
+# The default bound fits one omp `bash` call (its ceiling is 3600 s) with room for the first fetch;
+# `--state` carries the baseline across bounded waits, so a timeout loses nothing.
+CHANGE_WAIT_DEFAULT = 55
+CHANGE_FIELDS = """state isDraft mergeable headRefOid headRefName mergedAt mergedBy{login} url
+  commits(last:20){nodes{commit{oid messageHeadline committedDate authors(first:3){nodes{user{login} name}}}}}
+  comments(last:100){nodes{id url body createdAt author{__typename login}}}
+  reviews(last:100){nodes{id url body state submittedAt author{__typename login} commit{oid}}}
+  reviewThreads(last:100){nodes{id isResolved comments(first:50){nodes{id url body path createdAt
+    author{__typename login} pullRequestReview{id}}}}}
+  reactions(last:50){nodes{content createdAt user{login}}}"""
+
+
+def poll_prs(numbers, max_age):
+    """(main's tip, {number: CHANGE_FIELDS node or None}, rateLimit) through the host's shared poll."""
+    return omp_poll.Poll(REPO, CHANGE_FIELDS).poll(numbers, max_age)
+
+
+def pause_for(rate, pause):
+    """`pause`, or until the limit's reset when under CHANGE_RESERVE points are left."""
+    if rate and rate["remaining"] < CHANGE_RESERVE:
+        print(f"GraphQL points low ({rate['remaining']} left): next poll after the reset", file=sys.stderr)
+        return max(pause, (stamp(rate["resetAt"]) - datetime.datetime.now(datetime.timezone.utc)).total_seconds())
+    return pause
+
+
+def spent_rate(err):
+    """The rateLimit a failed poll implies: none left until the reset when GitHub refused it for a
+    spent budget (so pause_for sleeps to the reset instead of asking again each interval), else None."""
+    if isinstance(err, RateLimited) and err.reset:
+        return {"remaining": 0, "resetAt": omp_watch.fmt(err.reset)}
+    return None
+
+
+def as_trace(node):
+    """(pr, pull) in the shapes `gh pr view` and REVIEW_QUERY give, so codex_outcome reads them."""
+    commits = [{"oid": c["commit"]["oid"], "messageHeadline": c["commit"]["messageHeadline"],
+                "committedDate": c["commit"]["committedDate"],
+                "authors": [{"login": (a.get("user") or {}).get("login") or "", "name": a.get("name")}
+                            for a in c["commit"]["authors"]["nodes"]]}
+               for c in node["commits"]["nodes"]]
+    pr = {"state": node["state"], "isDraft": node["isDraft"], "headRefOid": node["headRefOid"],
+          "comments": node["comments"]["nodes"], "commits": commits}
+    threads = [{"id": t["id"], "isResolved": t["isResolved"], "opener": {"nodes": t["comments"]["nodes"][:1]},
+                "latest": {"nodes": t["comments"]["nodes"][-1:]}, "all": t["comments"]}
+               for t in node["reviewThreads"]["nodes"]]
+    pull = {"reviews": node["reviews"], "reviewThreads": {"nodes": threads}, "reactions": node["reactions"]}
+    return pr, pull
+
+
+def is_person(item):
+    """A comment or review someone other than us and the bots wrote. roboomp posts as a User."""
+    author = item.get("author") or {}
+    return author.get("__typename") != "Bot" and author.get("login") not in (None, "", ME, "roboomp")
+
+
+def people_items(node):
+    """{id: line} for each comment, review and review-thread comment a person (is_person) wrote. A
+    review whose body is empty carries only thread comments, listed on their own."""
+    items = {}
+    for kind, rows in (("comment", node["comments"]["nodes"]),
+                       ("review", [r for r in node["reviews"]["nodes"] if (r.get("body") or "").strip()]),
+                       ("thread", [c for t in node["reviewThreads"]["nodes"] for c in t["comments"]["nodes"]])):
+        for c in rows:
+            if is_person(c):
+                at = c.get("createdAt") or c.get("submittedAt") or ""
+                where = f" on {c['path']}" if c.get("path") else ""
+                state = f" {c['state'].lower()}" if c.get("state") else ""
+                items[c["id"]] = (f"{kind}{state} by {c['author']['login']} {at[5:16]}Z{where}: "
+                                  f"{gist(c.get('body') or '')[:120]} {c.get('url', '')}")
+    return items
+
+
+def conflict_class(branch):
+    """What `vs main` says, coarsely: the real conflict with its files, GitHub's CHANGELOG-only
+    conflict, or clean; None when the fork ref is missing."""
+    merge, _ = conflict(branch)
+    if merge.startswith("unknown"):
+        return None
+    if merge.startswith("REAL"):
+        return merge
+    return CHANGELOG_ONLY_CLASS if GITHUB_CHANGELOG_ONLY in merge else "clean"
+
+
+CHANGELOG_ONLY_CLASS = "clean; GitHub: CHANGELOG-only conflict"
+
+
+def change_snapshot(node, main, prev=None, now=None):
+    """The state --wait-change compares for one PR, JSON-shaped so --state can keep it. `prev` (the
+    last snapshot) carries GitHub's last known mergeability over an UNKNOWN (GitHub recomputing) and
+    the conflict class while neither main nor the head moved. Drafts get neither, nor a Codex outcome:
+    queued work is rebased onto main when it opens (pr-queue advance), and Codex skips drafts.
+    `head_seen` is when the head first showed up here (its commit time on a first sight), the push
+    time `pushed_at` uses: a head pushed with an old commit time is `never` only CODEX_START_WINDOW
+    after it appeared."""
+    prev = prev or {}
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    pr, pull = as_trace(node)
+    ready = node["state"] == "OPEN" and not node["isDraft"]
+    head = node["headRefOid"]
+    if prev and prev.get("head") != head:
+        seen = omp_watch.fmt(now)
+    else:
+        seen = prev.get("head_seen") or omp_watch.fmt(pushed_at(pr))
+    pr["seenAt"] = seen
+    outcome = codex_outcome(pr, pull, now) if ready else None
+    snap = {"state": node["state"], "draft": node["isDraft"], "head": head, "head_seen": seen,
+            "branch": node["headRefName"], "commits": [c["oid"] for c in pr["commits"]],
+            "people": sorted(people_items(node)), "codex": [head, *outcome] if outcome else None,
+            "mergeable": None, "conflict": None, "conflict_at": None}
+    if ready:
+        known = node["mergeable"] if node["mergeable"] != "UNKNOWN" else None
+        snap["mergeable"] = known or prev.get("mergeable")
+        at = [main, node["headRefOid"]]
+        if prev.get("conflict_at") == at and prev.get("conflict"):
+            snap["conflict"], snap["conflict_at"] = prev["conflict"], at
+        else:
+            run("git", "fetch", "-q", STORE_REMOTE, node["headRefName"], cwd=CHECKOUT)
+            snap["conflict"] = conflict_class(node["headRefName"])
+            snap["conflict_at"] = at if snap["conflict"] else None
+    return snap
+
+
+def changes(prev, cur, node):
+    """[(kind, text)] of what differs between two snapshots of one PR (change_snapshot), `node` the
+    current GraphQL data for the details."""
+    found = []
+    if prev["state"] != cur["state"]:
+        by = (node.get("mergedBy") or {}).get("login")
+        found.append(("state", f"{prev['state'].lower()} -> {cur['state'].lower()}"
+                               + (f" by {by} at {node['mergedAt']}" if cur["state"] == "MERGED" else "")))
+    if prev["draft"] != cur["draft"]:
+        found.append(("ready" if not cur["draft"] else "draft", "draft -> ready" if not cur["draft"] else "ready -> draft"))
+    if prev["head"] != cur["head"]:
+        pr, _ = as_trace(node)
+        new = [c for c in pr["commits"] if c["oid"] not in set(prev["commits"])]
+        theirs = [c for c in new if by_maintainer(c)]
+        how = "" if prev["head"] in cur["commits"] else ", force-pushed"
+        found.append(("head", f"{prev['head'][:10]} -> {cur['head'][:10]} ({len(new)} new commit(s){how})"))
+        found += [("maintainer-commit", f"{c['oid'][:10]} {c['messageHeadline'][:70]} by "
+                   + ", ".join(a["login"] or a["name"] or "?" for a in c["authors"])) for c in theirs]
+    people = people_items(node)
+    found += [("person", people[i]) for i in cur["people"] if i not in set(prev["people"]) and i in people]
+    if cur["codex"] and cur["codex"] != prev["codex"]:
+        found.append(("codex", f"{cur['codex'][1]} on {cur['codex'][0][:10]}: {cur['codex'][2]}"))
+    # GitHub recomputes mergeability a poll or two after main moves, so a flip to CONFLICTING that
+    # the merge-tree class already calls CHANGELOG-only is the same event again (2026-10-18: eleven
+    # series PRs woke the wait twice for one main commit).
+    explained = cur["mergeable"] == "CONFLICTING" and cur["conflict"] == CHANGELOG_ONLY_CLASS
+    if cur["mergeable"] and prev["mergeable"] and cur["mergeable"] != prev["mergeable"] and not explained:
+        found.append(("mergeable", f"GitHub {prev['mergeable'].lower()} -> {cur['mergeable'].lower()}"))
+    if cur["conflict"] and prev["conflict"] and cur["conflict"] != prev["conflict"]:
+        found.append(("vs-main", f"{prev['conflict']} -> {cur['conflict']}"))
+    return found
+
+
+def wait_change(numbers, minutes, state_path=None):
+    """Block until any named PR changes (`changes`), print each change as `#N kind: text`, and save
+    the snapshots to `state_path` when given (the next wait's baseline, so nothing that lands between
+    two waits is lost). Exit 0 on a change, 3 on timeout (the snapshots saved), 2 on usage."""
+    deadline = time.monotonic() + minutes * 60
+    numbers = list(dict.fromkeys(numbers))
+    base = {}
+    if state_path and os.path.exists(state_path):
+        with open(state_path) as f:
+            base = {int(k): v for k, v in json.load(f).items()}
+    run("git", "fetch", "-q", "origin", "main", cwd=CHECKOUT)
+    main_seen = None
+    while True:
+        try:
+            main, nodes, rate = poll_prs(numbers, CHANGE_POLL - 10)
+        except (RuntimeError, OSError) as err:  # a gh blip should not end the wait
+            print(f"gh failed, retrying: {err}", file=sys.stderr)
+            main, nodes, rate = None, {}, spent_rate(err)
+        found = []
+        if main:
+            if main != main_seen:
+                run("git", "fetch", "-q", "origin", "main", cwd=CHECKOUT)
+                main_seen = main
+            for n in numbers:
+                node = nodes.get(n)
+                if not node:
+                    continue
+                cur = change_snapshot(node, main, base.get(n))
+                if n in base:
+                    found += [(n, kind, text) for kind, text in changes(base[n], cur, node)]
+                base[n] = cur
+            if state_path:
+                with open(state_path, "w") as f:
+                    json.dump(base, f)
+        for n, kind, text in found:
+            print(f"#{n} {kind}: {text}", flush=True)
+        if found:
+            return 0
+        left = deadline - time.monotonic()
+        if left <= 0:
+            print(f"timeout: no change on {', '.join(f'#{n}' for n in numbers)} in {minutes:g} min")
+            return 3
+        time.sleep(max(1, min(pause_for(rate, CHANGE_POLL), left)))
+
+
+def stamp(at):
+    return datetime.datetime.fromisoformat(at.replace("Z", "+00:00"))
+
+
+def codex_settle(pr, pull, handed=False):
+    """Where Codex's review of the PR stands (workflow step 7), from its
+    latest completed pass on any head. None when Codex has completed no pass; else "maintainer"
+    when a maintainer wrote the head commit (he is working the PR); "clean" when that pass found
+    nothing; when it had findings: "pushed" if we have pushed since (its next pass is pending),
+    "budget" once the PR has had CODEX_ROUND_BUDGET rounds and is not `handed` off (at hand-off
+    every valid finding is ours), "fix" while a Codex thread waits on our
+    reply, else "settled" (every finding answered: fixed, or declined as design-level). A pass is a
+    Codex review (a round: Codex reviews only to post findings), a 👍 reaction (Codex re-adds it on
+    each clean pass, so its time is the latest clean pass), or a `Completed` summary row on a commit
+    no Codex review covers (a clean pass)."""
+    reviews = [r for r in pull["reviews"]["nodes"] if bot(r) == CODEX and r.get("submittedAt")]
+    passes = [(stamp(r["submittedAt"]), (r.get("commit") or {}).get("oid") or "", True) for r in reviews]
+    passes += [(stamp(x["createdAt"]), "", False) for x in pull["reactions"]["nodes"]
+               if bot(x) == CODEX and x.get("content") == "THUMBS_UP"]
+    status, short = codex_summary(pr) or ("", "")
+    at = CODEX_SUMMARY_AT.search(status) if "Completed" in status else None
+    if at and not any(sha.startswith(short) for _, sha, _ in passes):
+        passes.append((stamp(at.group(1)), short, False))
+    # A head the maintainer pushed is his whatever Codex did, before any pass too: no push of ours
+    # (a drift fix included) goes onto it.
+    if pr.get("commits") and by_maintainer(pr["commits"][-1]):
+        return "maintainer"
+    if not passes:
+        return None
+    _, sha, findings = max(passes, key=lambda p: p[0])
+    if not findings:
+        return "clean"
+    if not (sha and pr["headRefOid"].startswith(sha)):
+        return "pushed"
+    if len(reviews) >= CODEX_ROUND_BUDGET and not handed:
+        return "budget"
+    waiting, p2, _ = review_threads(pull, pr)
+    return "fix" if p2 or any(w.startswith(CODEX + " ") for w in waiting) else "settled"
+
+
+def codex_repeats(pull):
+    """[(path, rounds)] for files whose Codex findings span CODEX_REPEAT_ROUNDS or more rounds, the
+    latest round among them: the cue to ask whether a platform, browser or OS API already answers
+    what the code models by hand (workflow step 7; #15496's CSS visibility model)."""
+    order = {r["id"]: i for i, r in enumerate(sorted(
+        (r for r in pull["reviews"]["nodes"] if bot(r) == CODEX and r.get("submittedAt")),
+        key=lambda r: r["submittedAt"]), 1)}
+    rounds = {}
+    for t in pull["reviewThreads"]["nodes"]:
+        first = (t["opener"]["nodes"] or [{}])[0]
+        path = ((t["latest"]["nodes"] or [{}])[-1]).get("path")
+        n = order.get((first.get("pullRequestReview") or {}).get("id"))
+        if bot(first) == CODEX and path and n:
+            rounds.setdefault(path, set()).add(n)
+    last = max(order.values(), default=0)
+    return sorted((p, len(r)) for p, r in rounds.items() if len(r) >= CODEX_REPEAT_ROUNDS and last in r)
+
+
+def codex_own_regressions(pr, pull, cwd=CHECKOUT):
+    """URLs of the open Codex P2 threads, past the round budget, that sit on head lines our latest
+    push wrote: `git blame` dates the line's commit after Codex's previous review (author dates
+    survive a rebase). Those still get one fix push if cheap, once: only while the PR has exactly
+    CODEX_ROUND_BUDGET rounds, so the pass after that push ends it (workflow step 7; #15418's
+    always-sent close, 2026-10-14)."""
+    reviews = sorted((r for r in pull["reviews"]["nodes"] if bot(r) == CODEX and r.get("submittedAt")),
+                     key=lambda r: r["submittedAt"])
+    if len(reviews) != CODEX_ROUND_BUDGET:
+        return []
+    since = stamp(reviews[-2]["submittedAt"])
+    found = []
+    for t in pull["reviewThreads"]["nodes"]:
+        first = (t["opener"]["nodes"] or [{}])[0]
+        last = (t["latest"]["nodes"] or [{}])[-1]
+        if (t["isResolved"] or bot(first) != CODEX or bot(last) == ME or CODEX_URGENT.search(first.get("body") or "")
+                or not last.get("path") or not last.get("line")):
+            continue
+        blame = run("git", "blame", "--porcelain", "-L", f"{last['line']},{last['line']}", pr["headRefOid"],
+                    "--", last["path"], cwd=cwd)
+        written = re.search(r"^author-time (\d+)", blame.stdout, re.M) if blame.returncode == 0 else None
+        if written and datetime.datetime.fromtimestamp(int(written.group(1)), datetime.timezone.utc) > since:
+            found.append(last.get("url"))
+    return found
+
+
+# A PR handed to the maintainer carries no deferred finding and no comment of ours
+# that leaves work to him (workflow step 7, At hand-off; #15105, #15574, #15762 among seven).
+HANDOFF_WORDING = re.compile(r"\bleft for (?:review|you)\b|\bfor the maintainers?\b", re.I)
+DEFERRED_REPLY = re.compile(r"^\s*(?:Left for review|Not fixed yet)\b", re.I)
+_WHO = "|".join(["the maintainers?", "maintainers?", *map(re.escape, MAINTAINERS)])
+WITH_MAINTAINER = re.compile(rf"\b(?:sent|handed|given) to (?:{_WHO})\b|\b(?:with|waiting on) (?:{_WHO})\b"
+                             rf"|\b(?:{_WHO}) review", re.I)
+
+
+def handoff_reason(pr, note=""):
+    """Why the PR counts as handed to the maintainer, or "": its queue note says it is with the maintainer,
+    or a maintainer reviewed or commented on it. Naming a PR on the command line is not one."""
+    if WITH_MAINTAINER.search(note or ""):
+        return "queue note: " + gist(note)[:80]
+    if any((c.get("author") or {}).get("login") in MAINTAINERS for c in pr["comments"] + pr.get("reviews", [])):
+        return "a maintainer has reviewed or commented"
+    return ""
+
+
+def handoff_items(pr, pull):
+    """[(kind, url)] of our comments to change before or while the maintainer has the PR: "deferred"
+    for a thread reply that put a finding off (`Not fixed yet`, the old `Left for review`): fix it,
+    or decline or disprove it, and edit the reply; "wording" for a thread reply or top-level comment
+    that leaves work to him: edit those sentences."""
+    found = []
+    for t in pull["reviewThreads"]["nodes"]:
+        for c in (t.get("all") or {}).get("nodes") or []:
+            body = c.get("body") or ""
+            if bot(c) != ME:
+                continue
+            if DEFERRED_REPLY.search(body):
+                found.append(("deferred", c.get("url")))
+            elif HANDOFF_WORDING.search(body):
+                found.append(("wording", c.get("url")))
+    found += [("wording", c.get("url")) for c in pr["comments"]
+              if (c.get("author") or {}).get("login") == ME and HANDOFF_WORDING.search(c.get("body") or "")]
+    return found
+
+
+HANDOFF_SHOWN = {"deferred": "deferred Codex finding: fix it with a test (or decline or disprove it), then edit the reply",
+                 "wording": "our comment leaves work to the maintainer: edit those sentences"}
+
+
+def maintainer_asks(pr):
+    """[(asked at, url, reply)] for our PR-thread comments that tag a maintainer; reply is
+    "<login> <time>" for the first maintainer comment or review after the ask, else None."""
+    replies = [((c.get("author") or {}).get("login", ""), c.get("createdAt") or c.get("submittedAt") or "")
+               for c in pr["comments"] + pr["reviews"]]
+    asks = []
+    for c in pr["comments"]:
+        if (c.get("author") or {}).get("login") != ME or not MAINTAINER_TAG.search(c["body"]):
+            continue
+        reply = min(((t, who) for who, t in replies if who in MAINTAINERS and t > c["createdAt"]), default=None)
+        asks.append((c["createdAt"], c["url"], f"{reply[1]} {reply[0]}" if reply else None))
+    return asks
+
+
+APPROVAL = re.compile(r"\b(lgtm|looks good|approved?|merging|merged|ship it)\b", re.I)
+ASKS_FOR_WORK = re.compile(r"\b(please|fix|regression|should|needs?|nit|instead|conflict)\b", re.I)
+# Our reply shapes, any case: "Fixed in <sha>", "- Nit: fixed in <sha>", "Not restoring the gate ...".
+ANSWER = re.compile(r"\b(fixed|done|addressed) in [0-9a-f]{7,}|^Not \w+ing\b", re.M | re.I)
+
+
+def maintainer_requests(pr):
+    """[(at, login, url, gist)] for maintainer comments and review bodies that ask for work and
+    that no later comment of ours answers. An answer is our reply shape (`Fixed in <sha>`,
+    `Not <doing> X ...`) or any later comment of ours linking the request. Approvals and plain
+    activity are left out. the maintainer writes change requests since 2026-10-08 (seven in one round);
+    before that maintainers only pushed fixups."""
+    ours = [((c.get("createdAt") or ""), c.get("body") or "") for c in pr["comments"]
+            if (c.get("author") or {}).get("login") == ME]
+    found = []
+    for c in pr["comments"] + pr["reviews"]:
+        login = (c.get("author") or {}).get("login", "")
+        at = c.get("createdAt") or c.get("submittedAt") or ""
+        body = (c.get("body") or "").strip()
+        if login not in MAINTAINERS or not body:
+            continue
+        if APPROVAL.search(body) and not ASKS_FOR_WORK.search(body):
+            continue
+        url = c.get("url", "")
+        if any(t > at and (ANSWER.search(b) or (url and url in b)) for t, b in ours):
+            continue
+        found.append((at, login, url, gist(body)))
+    return sorted(found)
+
+
+def gist(body):
+    """First paragraph that is not the boilerplate rebase note, flattened."""
+    paragraphs = [p.strip() for p in body.replace("\r\n", "\n").split("\n\n") if p.strip()]
+    rest = [p for p in paragraphs if not p.startswith("**Rebase note")] or paragraphs
+    return re.sub(r"\s+", " ", rest[0])[:160]
+
+
+ROBOOMP_NOTE = re.compile(r"[^.\n]*\b(maintainer|trade-?off|behavio(u)?r note|rests on|not a blocker|"
+                          r"live check|didn't run|did not run)\b[^.\n]*[.\n]?", re.I)
+# A body sentence that sends the reader to an inline thread ("One blocking issue, inline: …", "(open
+# question inline)", "see inline finding"): the thread reply answers it (workflow step 7).
+POINTS_INLINE = re.compile(r"\(inline\b|\binline\s*[:)]|\binline\s+(?:nit|issue|finding|comment|repro|question|thread)"
+                           r"|\b(?:nit|issue|finding|comment|question)s?\s+inline\b", re.I)
+# roboomp's verdict line ("lgtm — P0: …; ready for maintainer merge", #16231) names the maintainer
+# without asking anything: no note, unless it also asks, conditions the merge or names a check.
+VERDICT = re.compile(r"\bready for (?:a |the )?maintainers?(?:'s?)? (?:merge|review)\b", re.I)
+ASKS = re.compile(r"\b(?:decision|decide|call|question|after|once|until|unless|if|but)\b|\?", re.I)
+
+
+def verdict_only(text):
+    """Whether a note sentence is roboomp's bare verdict: it names the maintainer merge and nothing
+    else a note is made of (a question, a condition, a trade-off, an untested path)."""
+    rest = VERDICT.sub("", text).replace("maintainer", "")
+    return bool(VERDICT.search(text)) and not ASKS.search(text) and not ROBOOMP_NOTE.search(rest)
+
+
+def roboomp_reviews(pr):
+    return [r for r in pr["reviews"] if (r.get("author") or {}).get("login", "").removesuffix("[bot]") == "roboomp"]
+
+
+# A body sentence citing `file.ts:123` restates the inline thread roboomp opened there (#15508:
+# "`tab-worker.ts:1567` changes ... maintainer decision" was also thread r4251156636, answered in it).
+CITES_LINE = re.compile(r"\b([\w.-]+\.[A-Za-z]\w*):(\d+)\b")
+
+
+def roboomp_inline_spots(number):
+    """(file basename, line) of each roboomp inline comment; line None when GitHub kept none."""
+    out = run("gh", "api", "--paginate", f"repos/{REPO}/pulls/{number}/comments", "--jq",
+              '.[] | select(.user.login | startswith("roboomp")) | [.path, (.line // .original_line)] | @json')
+    spots = set()
+    for line in out.stdout.splitlines():
+        path, at = json.loads(line)
+        spots.add((os.path.basename(path or ""), at))
+    return spots
+
+
+def note_sentences(body, number=None):
+    """Sentences of one roboomp review body that no inline thread answers."""
+    body = body or ""
+    notes = []
+    spots = None
+    for m in ROBOOMP_NOTE.finditer(body):
+        text = re.sub(r"\s+", " ", m.group(0)).strip()
+        if (POINTS_INLINE.search(text) or "generated" in text or "checkout" in text or "green light" in text.lower()
+                or verdict_only(text)):
+            continue
+        # The sentence pattern stops at the dot in `tab-worker.ts`, so look on the note's whole line.
+        end = body.find("\n", m.end() - 1)
+        cites = CITES_LINE.findall(body[body.rfind("\n", 0, m.start()) + 1:end if end >= 0 else len(body)])
+        if cites and number is not None:
+            spots = roboomp_inline_spots(number) if spots is None else spots
+            if any((name, int(at)) in spots or (name, None) in spots for name, at in cites):
+                continue
+        notes.append(text[:180])
+    return notes
+
+
+def roboomp_notes(pr):
+    """Sentences in roboomp's review body that are not inline threads: its maintainer questions,
+    trade-offs and untested paths. the maintainer's fixups landed on exactly these on 2026-10-08 (#14753's
+    untested renewal, #14758's unreachable-broker stack dump, #14762's proxy default)."""
+    return [n for r in roboomp_reviews(pr) for n in note_sentences(r.get("body"), pr.get("number"))]
+
+
+def roboomp_notes_unanswered(pr):
+    """Whether a roboomp review body with notes has no top-level PR comment of ours after it. Notes
+    get one top-level comment, maintainer questions answered with our recommendation; the rest of a body is answered in the threads, so a body without notes needs no
+    top-level comment (workflow step 7)."""
+    bodies = [r.get("submittedAt") or "" for r in roboomp_reviews(pr) if note_sentences(r.get("body"), pr.get("number"))]
+    if not bodies:
+        return False
+    ours = [c.get("createdAt") or "" for c in pr["comments"] if (c.get("author") or {}).get("login") == ME]
+    return not any(at > max(bodies) for at in ours)
+
+
+def conflict(branch):
+    """(vs-main line, CHANGELOG drift). Conflicts count as pr-queue counts them (omp_pr.classify):
+    CHANGELOGs never, the generated catalog files only as a note, since the maintainer regenerates them.
+    A clean line also says what GitHub shows: its merge ignores `merge=union`, so a CHANGELOG both
+    sides added lines to at one spot reads CONFLICTING there (`github_changelog_conflicts`). That is
+    no conflict of ours and no push of its own; the next push we need anyway rebases onto main."""
+    ref = f"{STORE_REMOTE}/{branch}"
+    if not has_ref(ref):
+        return f"unknown (no local {STORE_REMOTE}/ ref; rerun with --fetch)", []
+    code, generated = merge_conflicts("origin/main", ref) or ([], [])
+    drift = [f"{path}: entry lands under {section}" for path, _, section in changelog_drift(ref)]
+    if code:
+        return "REAL: " + ", ".join(code), drift
+    logs = github_changelog_conflicts("origin/main", ref)
+    github = (f"; {GITHUB_CHANGELOG_ONLY}: {', '.join(logs)}), so the next needed push rebases onto main"
+              if logs else "; GitHub: mergeable" if not generated else "")
+    if generated:
+        return f"clean (generated {', '.join(generated)} conflict too; the maintainer regenerates them){github}", drift
+    return "clean" + github, drift
+
+
+# The vs-main state of a branch that merges cleanly with union but not on GitHub (`conflict`).
+GITHUB_CHANGELOG_ONLY = "GitHub: conflicting (CHANGELOG only"
+
+
+def shipped_regressions(pr, cwd=CHECKOUT):
+    """[(package, tag, "<sha> <subject>")]: each package the branch touches with no added CHANGELOG
+    line, where the diff rewrites lines of a commit whose first `v*` release (one without this fix)
+    was cut after the PR opened. At opening that commit was unreleased, so precheck let the entry go
+    (a regression no release shipped gets none); the release reached users before the fix merged,
+    so the entry is due again. #16038 fixed 8fbaf75aa2, which v18.11.3 shipped while it was open,
+    and the maintainer added the entry before merging (e2b974e459)."""
+    ref = f"{STORE_REMOTE}/{pr['headRefName']}"
+    subjects = [c.get("messageHeadline", "") for c in pr.get("commits", [])]
+    if not has_ref(ref, cwd=cwd) or (subjects and all(re.match(r"test(\([^)]*\))?!?:", s) for s in subjects)):
+        return []
+    base = run("git", "merge-base", "origin/main", ref, cwd=cwd).stdout.strip()
+    if not base:
+        return []
+    diff = Diff(base, ref, cwd)
+    missing = [pkg for pkg in sorted({p for p in map(package_of, diff.added) if p})
+               if not any(t.strip().startswith("- ") for _, t in diff.added.get(f"{pkg}/CHANGELOG.md", []))]
+    if not missing:
+        return []
+    opened = datetime.datetime.fromisoformat(pr["createdAt"].replace("Z", "+00:00"))
+    blamed, found = blamed_commits(diff, base, cwd), []
+    for pkg in missing:
+        hits = []
+        for sha in blamed.get(pkg, ()):
+            tags = run("git", "tag", "--list", "v*", "--contains", sha, "--no-contains", ref, "--sort=v:refname",
+                       "--format=%(refname:short) %(creatordate:iso-strict)", cwd=cwd).stdout.split("\n")
+            tag, _, at = tags[0].partition(" ")
+            if tag and datetime.datetime.fromisoformat(at) > opened:
+                hits.append((tags[0], sha))
+        if hits:
+            first, sha = min(hits)
+            subject = run("git", "log", "-1", "--format=%s", sha, cwd=cwd).stdout.strip()
+            found.append((pkg, first.split()[0], f"{sha[:10]} {subject[:60].rstrip()}"))
+    return found
+
+
+def review_state(branch):
+    """(verdict, line) of the one stamped pre-open review (`review-stamp`), or ("none", ...)."""
+    review = last_review(branch)
+    if not review:
+        return "none", "none recorded (workflow step 3)"
+    sha, verdict, at, by = review
+    return verdict, f"{verdict} at {sha[:10]}{' by ' + by if by else ''} ({at})"
+
+
+RESOLVE_THREAD = "gh api graphql -f query='mutation{resolveReviewThread(input:{threadId:\"<id>\"}){thread{isResolved}}}'"
+
+
+def next_step(pr, rank, waiting, merge, deps, asks, requests, drift, notes, review="none", to_resolve=(),
+              notes_unanswered=False, rule=(), codex=None, settle=None, p2=(), repeats=(), regressions=(),
+              handoff=(), shipped=(), pair_gone=()):
+    if pr["isDraft"]:
+        pending = [f"#{n}" for n, state, _ in deps if state != "merged"]
+        if pending:
+            return (f"draft waiting on {', '.join(pending)}: work that needs another PR waits in the queue, "
+                    f"not open (shaping.md, Open-PR rule): `pr-queue requeue {pr['number']}`")
+        if any(f.startswith("draft ") for f in rule):
+            return (f"draft past the limit: settle its shape with the user, or `pr-queue requeue {pr['number']}` "
+                    "(shaping.md, Open-PR rule)")
+        if deps:
+            return ("draft whose dependencies merged: rebase onto origin/main, then mark it ready within the "
+                    "hourly budget once the user has settled its shape (workflow step 6)")
+        return "draft: read its body for the shape the user is deciding; mark ready only once they settle it (step 6)"
+    if requests:
+        return ("read the maintainer comment above: a change request goes through workflow.md, "
+                "Maintainer change request; an answer to our question goes to the user")
+    if codex in ("running", "due"):
+        return (f"wait for Codex's pass on the head: `pr-trace --wait-codex {pr['number']}`; then handle its "
+                "outcome with any threads above in one push (Workflow step 7)")
+    urgent = [w for w in waiting if w.startswith(CODEX + " ")]
+    if settle == "budget" and (urgent or p2):
+        fix = "fix the P0/P1 findings above in one push; " if urgent else ""
+        if regressions:
+            fix += (f"{len(regressions)} P2(s) sit on lines our latest push wrote ({', '.join(regressions)}): fix "
+                    "each cheap one in one push, the only push past the budget; ")
+            return (f"Codex round budget spent: {fix}reply to each other P2 `Not fixed yet: <the fix in one "
+                    f"line>; Codex round budget spent.` and resolve it (Workflow step 7): {RESOLVE_THREAD}")
+        return (f"Codex round budget spent: {fix}reply to each P2 `Not fixed yet: <the fix in one line>; Codex "
+                f"round budget spent.` and resolve it, no push for it (Workflow step 7): {RESOLVE_THREAD}")
+    if settle != "maintainer" and (urgent or p2):
+        rethink = ""
+        if repeats:
+            where = ", ".join(f"{path} ({n} rounds)" for path, n in repeats)
+            rethink = (f"Codex keeps finding problems in {where}: first ask whether a platform, browser or OS "
+                       "API already answers what that code models by hand, and replace the model if so; then ")
+        deferred = " and the deferred ones under hand-off" if any(k == "deferred" for k, _ in handoff) else ""
+        return (f"{rethink}fix every cheap Codex finding above{deferred} in one push, P2s included; decline only one "
+                "whose fix needs a design change, in one line naming that change, and resolve it (Workflow step 7)")
+    if handoff:
+        return ("handed off, so every Codex finding is ours: fix each deferred one above with a test that fails "
+                "without it (or decline or disprove it in our words) in one push, then edit its reply to `Fixed in "
+                "<sha>: <what changed>. Test: <name>.`; edit each comment above that leaves work to the maintainer "
+                "(Workflow step 7, At hand-off)")
+    if [w for w in waiting if not w.startswith(CODEX + " ")]:
+        return "answer the bot threads above (Workflow step 7)"
+    if notes_unanswered:
+        return ("answer the roboomp notes above in one top-level PR comment: our recommendation on its "
+                "maintainer question, one line per body-only finding; nothing the threads already answer "
+                "(Workflow step 7)")
+    if to_resolve:
+        return f"resolve the Codex threads above that we answered (Workflow step 7): {RESOLVE_THREAD}"
+    if merge.startswith("REAL") and pair_gone:
+        # One of a pair opened over a P2 merged (shaping.md, Open-PR rule 3): the survivor's conflict
+        # is the one the queue accepted, and it is ours to clear before the next merge wave.
+        gone = ", ".join(f"#{n} ({state})" for n, state in pair_gone)
+        return (f"rebase onto main now: its queue pair {gone} is no longer open, so the conflict the queue accepted "
+                f"is now this PR's with main; `pr-queue advance '#{pr['number']}'`, resolve toward main "
+                "(shaping.md, Open-PR rule 3)")
+    if merge.startswith("REAL"):
+        return "rebase onto origin/main, resolve, and move our CHANGELOG lines under [Unreleased] (Cadence)"
+    if shipped:
+        logs = ", ".join(f"{pkg}/CHANGELOG.md" for pkg, _, _ in shipped)
+        return (f"add the CHANGELOG entry (the regression shipped in {shipped[0][1]}): {logs} under [Unreleased], "
+                "with the PR link and credit, in one push (changelog.md)")
+    if rule:
+        return (f"breaks the open-PR rule ({'; '.join(rule)}): `pr-queue plan` says keep, rebase (in place: "
+                f"`pr-queue advance '#{pr['number']}'`) or requeue (`pr-queue requeue {pr['number']}`) "
+                "(shaping.md, Open-PR rule)")
+    if not rank:
+        return "no roboomp rank: if >30 min since ready, the event was dropped; undo/redo ready after the hour"
+    if drift and settle != "maintainer":
+        # Bot rounds settled (roboomp ranked it; no Codex pass due or finding open, checked above) and
+        # a release cut since our entry was written: one CHANGELOG-only push per release (the
+        # maintainer made 27 CHANGELOG commits on 20 of our 78 merges 10-18..20).
+        return (f"push the CHANGELOG fix now: `pr-queue advance '#{pr['number']}'` rebases onto origin/main and "
+                "moves our entries under ## [Unreleased]; one such push per release (Cadence)")
+    if any(reply is None for _, _, reply in asks):
+        return "waiting on a maintainer's answer to our question above; don't ask again"
+    if rank in ("review:p2", "review:p3"):
+        return "needs a maintainer decision; our answer is posted, so waiting for a maintainer round"
+    if settle == "maintainer":
+        return "waiting on the maintainer, who has pushed to this PR: Codex findings on his head are his"
+    if notes:
+        return ("nothing pending on GitHub; confirm each roboomp note above was settled by a fix, test or "
+                "live run and answered (bots.md, Judging a finding 5), then wait for a maintainer merge round")
+    if GITHUB_CHANGELOG_ONLY in merge:
+        return ("GitHub's CHANGELOG-only conflict rides with the next push, which rebases onto origin/main "
+                "(Cadence); waiting for a maintainer merge round")
+    return "nothing to do; waiting for a maintainer merge round"
+
+
+def rule_flags(prs, numbers, manifest):
+    """{number: [short flag]} from the queue audit (shaping.md, Open-PR rule), main conflicts left to
+    the `vs main` check. Areas come from the fork's queue manifest when fetched."""
+    short = {"merge-order": lambda d: "merge-order line",
+             "carries": lambda d: "carries " + ",".join(label for label, _ in d),
+             "carries-main": lambda d: "carries main's commits",
+             "conflicts-pr": lambda d: "conflicts " + ",".join(label for label, _ in d),
+             "stale-draft": lambda d: f"draft {d}d",
+             "base": lambda d: f"targets {d}"}
+    rows = Queue(CHECKOUT, manifest, GitHub(), prs).audit(set(numbers), github=False)
+    return {r["number"]: [short[k](d) for k, d in r["flags"] if k in short] for r in rows}
+
+
+def queue_notes(manifest):
+    """{PR number: its queue entry's note}, where a hand-off to the maintainer is recorded."""
+    return {e["pr"]: e.get("note") or "" for e in manifest.get("entries", []) if e.get("pr")}
+
+
+def queue_pairs(manifest):
+    """{PR number: [(other number, role, other's manifest state)]} for each pair `pr-queue open` opened
+    over a P2 (shaping.md, Open-PR rule 3): the P2's entry lists the opener in `rebases_after`. Role
+    "after" on the P2 (it rebases once the opener merges), "over" on the opener."""
+    states = {e["pr"]: e["state"] for e in manifest.get("entries", []) if e.get("pr")}
+    pairs = {}
+    for e in manifest.get("entries", []):
+        for n in (e.get("rebases_after") or []) if e.get("pr") else []:
+            pairs.setdefault(e["pr"], []).append((n, "after", states.get(n, "unknown")))
+            pairs.setdefault(n, []).append((e["pr"], "over", e["state"]))
+    return pairs
+
+
+def trace(number, trees, prs, rules, note=""):
+    pr = gh_json("pr", "view", str(number), "-R", REPO, "--json",
+                 "number,title,state,isDraft,labels,createdAt,url,headRefName,headRefOid,body,commits,"
+                 "comments,reviews")
+    branch, url = pr["headRefName"], pr["url"]
+    rank = next((l["name"] for l in pr["labels"] if l["name"].startswith("review:")), "")
+    print(f"\n## #{number} {pr['title']}")
+    print(f"  {pr['state'].lower()}{' draft' if pr['isDraft'] else ''} {rank or 'no rank'}  "
+          f"opened {pr['createdAt']}  {url}")
+    print(f"  branch   {branch} @ {pr['headRefOid'][:10]}  ({STORE_REMOTE}/{branch})")
+    print(f"  worktree {trees.get(branch, '-')}")
+    print(f"  scratch  {', '.join(scratch_dirs(branch, number)) or '-'}")
+    deps = dependencies(pr) if pr["isDraft"] else []
+    for n, state, dep_rank in deps:
+        print(f"  waits on #{n} ({state}, {dep_rank})")
+
+    waiting, merge, drift, asks, requests, notes = [], "n/a", [], maintainer_asks(pr), [], []
+    notes_unanswered, p2, codex, settle, repeats, regressions = False, [], None, None, [], []
+    review, to_resolve, rule, handoff, shipped = ("n/a", ""), [], rules.get(number, []), [], []
+    for at, ask_url, reply in asks:
+        print(f"  asked    {at} {ask_url}: {'answered by ' + reply if reply else 'no maintainer reply yet'}")
+    if pr["state"] == "OPEN":
+        pull = review_data(number)
+        handed = handoff_reason(pr, note=note)
+        (waiting, p2, to_resolve), settle = review_threads(pull, pr), codex_settle(pr, pull, bool(handed))
+        codex, repeats = codex_head(pr, pull), codex_repeats(pull)
+        handoff = handoff_items(pr, pull) if handed else []
+        if handed:
+            print(f"  handed   to the maintainer ({handed}): every Codex finding is ours (Workflow step 7)")
+        for kind, item_url in handoff:
+            print(f"  hand-off {HANDOFF_SHOWN[kind]}: {item_url}")
+        if codex:
+            print(f"  codex    {CODEX_FLAG[codex]}")
+        if settle:
+            print(f"  codex    {CODEX_SETTLE[settle]}")
+        for path, n in repeats:
+            print(f"  codex    findings in {path} over {n} rounds: reconsider the approach (Workflow step 7)")
+        regressions = codex_own_regressions(pr, pull) if settle == "budget" else []
+        for thread_url in regressions:
+            print(f"  codex    past the budget, on a line our latest push wrote: fix it if cheap, one push: {thread_url}")
+        requests = maintainer_requests(pr)
+        notes = roboomp_notes(pr)
+        notes_unanswered = roboomp_notes_unanswered(pr)
+        if notes_unanswered:
+            print("  roboomp  review-body notes below have no top-level reply of ours yet")
+        merge, drift = conflict(branch)
+        print(f"  vs main  {merge}")
+        review = review_state(branch)
+        print(f"  review   {review[1]}")
+        for d in drift:
+            print(f"  changelog {d} after merging main (Cadence: once bot rounds settle, one push fixes it)")
+        shipped = shipped_regressions(pr)
+        for pkg, tag, commit in shipped:
+            print(f"  changelog {pkg}: no entry, and {tag} shipped the regression ({commit}) since the PR opened")
+        for flag in rule:
+            print(f"  rule     {flag}")
+        for at, login, req_url, text in requests:
+            print(f"  CHANGES  {login} {at} {req_url}\n           {text}")
+        for w in waiting:
+            print(f"  waiting  {w}")
+        for w in p2:
+            print(f"  P2       {w}")
+        for thread_id, url in to_resolve:
+            print(f"  resolve  Codex thread {thread_id} (answered): {url}")
+        for n in notes:
+            print(f"  roboomp  note: {n}")
+
+    url_counts, branch_counts = mention_counts(url), mention_counts(branch)
+    # The URL cannot appear before the PR exists, so its earliest mention is the session that opened it.
+    opened = min(((first_mention(f, url), f) for f in url_counts), default=None)
+    started = min(((first_mention(f, branch), f) for f in branch_counts), default=None)
+    opened = opened if opened and opened[0] else None
+    started = started if started and started[0] else None
+    shown = set()
+    if opened:
+        print(f"  opened in   {opened[0]}  {describe(opened[1], pr['commits'])}")
+        shown.add(session_of(opened[1])[0])
+    else:
+        print("  opened in   no local transcript has the PR URL (opened elsewhere?)")
+    if started and session_of(started[1])[0] not in shown:
+        print(f"  work began  {started[0]}  {describe(started[1], pr['commits'])}")
+        shown.add(session_of(started[1])[0])
+
+    # Other sessions, most involved first; one-off mentions (a PR listing) rank last.
+    involvement = {}
+    for counts in (url_counts, branch_counts):
+        for f, n in counts.items():
+            top = session_of(f)[0]
+            if top not in shown:
+                involvement[top] = involvement.get(top, 0) + n
+    ranked = sorted(((t, n) for t, n in involvement.items() if n >= MIN_MENTIONS), key=lambda kv: -kv[1])
+    for top, n in ranked[:OTHER_SESSIONS_SHOWN]:
+        sid, title, _ = header(top)
+        print(f"  also in     {n:>4} mentions  {sid[:13]} \"{title}\"  {top}")
+    rest = len(involvement) - min(len(ranked), OTHER_SESSIONS_SHOWN)
+    if rest:
+        print(f"  also in     {rest} more sessions with fewer mentions (PR lists, passing references)")
+    if pr["state"] == "OPEN":
+        print(f"  next     {next_step(pr, rank, waiting, merge, deps, asks, requests, drift, notes, review[0], to_resolve, notes_unanswered, rule, codex, settle, p2, repeats, regressions, handoff, shipped)}")
+
+
+# Next steps that wait on someone else; GitHub's CHANGELOG-only conflict rides with our next needed
+# push (Cadence).
+PASSIVE_STEPS = ("nothing", "waiting", "needs a maintainer decision", "draft: read",
+                 "GitHub's CHANGELOG-only conflict rides")
+
+
+def summary_row(number, prs, rules, note="", named=False, pairs=()):
+    """One open PR as data: rank, age, flags, whether it needs us, and the next step. `named`: given
+    after --summary; a named PR not yet handed off lists its `pre-hand-off` items without lifting
+    the budget or needing us (workflow step 7, At hand-off). `pairs`: its `queue_pairs` entries."""
+    pr = gh_json("pr", "view", str(number), "-R", REPO, "--json",
+                 "number,title,state,isDraft,labels,createdAt,headRefName,headRefOid,body,commits,comments,"
+                 "reviews,url")
+    row = {"number": number, "title": pr["title"], "url": pr["url"], "state": pr["state"].lower()}
+    if pr["state"] != "OPEN":
+        return {**row, "needs_us": False}
+    rank = next((l["name"] for l in pr["labels"] if l["name"].startswith("review:")), "")
+    branch = pr["headRefName"]
+    deps = dependencies(pr) if pr["isDraft"] else []
+    pull, requests, notes = review_data(number), maintainer_requests(pr), roboomp_notes(pr)
+    handed = handoff_reason(pr, note)
+    (waiting, p2, to_resolve), settle = review_threads(pull, pr), codex_settle(pr, pull, bool(handed))
+    items = handoff_items(pr, pull) if handed or named else []
+    handoff = items if handed else []
+    repeats = codex_repeats(pull)
+    codex = codex_head(pr, pull)
+    merge, drift = conflict(branch)
+    rule = rules.get(number, [])
+    review = review_state(branch)
+    notes_unanswered = roboomp_notes_unanswered(pr)
+    regressions = codex_own_regressions(pr, pull) if settle == "budget" else []
+    shipped = shipped_regressions(pr)
+    pair_gone = [(n, "merged" if state == "merged" else "closed" if state == "closed" else "not open")
+                 for n, _, state in pairs if n not in prs]
+    step = next_step(pr, rank, waiting, merge, deps, maintainer_asks(pr), requests, drift, notes, review[0],
+                     to_resolve, notes_unanswered, rule, codex, settle, p2, repeats, regressions, handoff, shipped,
+                     pair_gone)
+    others = [w for w in waiting if not w.startswith(CODEX + " ")]
+    codex_open = [] if settle == "maintainer" else [w for w in waiting if w.startswith(CODEX + " ")] + list(p2)
+    flags = [f"CHANGES x{len(requests)}"] if requests else []
+    flags += [f"bot threads x{len(others)}"] if others else []
+    flags += [f"Codex open x{len(codex_open)}"] if codex_open else []
+    flags += [CODEX_FLAG[codex]] if codex else []
+    flags += [CODEX_SHORT[settle]] if settle else []
+    flags += [f"Codex rethink {path.rsplit('/', 1)[-1]} ({n} rounds)" for path, n in repeats] if codex_open else []
+    flags += [f"Codex own regression x{len(regressions)}"] if regressions else []
+    flags += [f"hand-off x{len(handoff)}"] if handoff else [f"pre-hand-off x{len(items)}"] if items else []
+    flags += [f"rebases after #{n} merges" if role == "after" else f"opened over P2 #{n}"
+              for n, role, _ in pairs if n in prs]
+    flags += [f"resolve Codex x{len(to_resolve)}"] if to_resolve else []
+    flags += ["roboomp notes unanswered"] if notes_unanswered else []
+    flags += ["conflict"] if merge.startswith("REAL") else ["no fork ref"] if merge.startswith("unknown") else []
+    flags += [f"rule: {f}" for f in rule]
+    flags += ["changelog drift"] if drift else []
+    flags += ["GitHub: CHANGELOG-only conflict (next push rebases)"] if GITHUB_CHANGELOG_ONLY in merge else []
+    flags += [f"changelog: regression shipped in {shipped[0][1]}"] if shipped else []
+    created = datetime.datetime.fromisoformat(pr["createdAt"].replace("Z", "+00:00"))
+    return {**row, "draft": pr["isDraft"], "rank": rank.removeprefix("review:"),
+            "created": pr["createdAt"], "age_days": (datetime.datetime.now(datetime.timezone.utc) - created).days,
+            "codex": settle, "handed": handed, "handoff": [{"kind": k, "url": u} for k, u in items],
+            "flags": flags, "next": re.split(r"[:;]", step, maxsplit=1)[0], "next_full": step,
+            "needs_us": bool(requests or others or codex_open or to_resolve or handoff)
+            or not step.startswith(PASSIVE_STEPS)}
+
+
+def summary_line(row):
+    if row["state"] != "open":
+        return f"#{row['number']:<6} {row['state']:<8} {row['title'][:70]}"
+    label = "draft" if row["draft"] else (row["rank"] or "no rank")
+    flags = f"[{', '.join(row['flags'])}] " if row["flags"] else ""
+    tag = "hand-off" if row["handed"] else "pre-hand-off"
+    items = "".join(f"\n         {tag} {HANDOFF_SHOWN[i['kind']]}: {i['url']}" for i in row["handoff"])
+    return (f"#{row['number']:<6} {label:<7} {row['age_days']:>3}d  {row['title'][:64]:<64}  {flags}-> {row['next']}"
+            + items)
+
+
+POST_MERGE_STEP = "fix as a follow-up off main before the maintainer has to"
+
+
+def recent_merges(days):
+    """Our PRs merged in the last `days`, with the non-merge commits someone else added first, the
+    first release that ships each (the user updates to it to get the fix) and the bot findings posted
+    after the merge."""
+    since = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)).date()
+    out = merged_prs(since)
+    if out:
+        run("git", "fetch", "-q", "--tags", "origin", "main", cwd=CHECKOUT)
+    for m in out:
+        m["release"] = first_release(m["merge_commit"]) or "unknown"
+    post_merge_review(out)
+    return out, since
+
+
+def merge_line(m):
+    added = m["maintainer_commits"]
+    extra = f"{len(added)} maintainer commit(s): {'; '.join(added)[:110]}" if added else "merged as sent"
+    release = m["release"] if m["release"] in ("unreleased", "unknown") else f"in {m['release']}"
+    line = (f"#{m['number']:<6} merged {m['merged_at'][5:16]} by {m['merged_by']:<8} {release:<12} "
+            f"{m['title'][:56]:<56}  {extra}")
+    found = m.get("post_merge") or []
+    still = [f for f in found if not f["taken_up"] and not f.get("addressed_by")]
+    done = [f for f in found if f["taken_up"]]
+    if still:
+        line += f"\n         post-merge: {post_merge_counts(still)} open"
+        line += "".join(f"\n           {f['path']}:{f['end']} {f['url']}" for f in still)
+    for pr in dict.fromkeys(f["addressed_by"] for f in found if f.get("addressed_by")):
+        fixed = [f for f in found if f.get("addressed_by") == pr]
+        line += f"\n         post-merge: {post_merge_counts(fixed)} addressed by #{pr}"
+    if done:
+        shas = ", ".join(dict.fromkeys(f["taken_up"] for f in done))
+        line += f"\n         post-merge: {post_merge_counts(done)} taken up on main in {shas}"
+    return line
+
+
+def post_merge_row(m):
+    """The "Needs us" line for a merge with post-merge findings no main commit touched and no open or
+    merged follow-up PR of ours addresses (omp_pr.addressed_by), else None."""
+    still = [f for f in m.get("post_merge") or [] if not f["taken_up"] and not f.get("addressed_by")]
+    if not still:
+        return None
+    return (f"#{m['number']:<6} merged  {m['title'][:64]:<64}  [post-merge: {post_merge_counts(still)} open] "
+            f"-> {POST_MERGE_STEP}")
+
+
+def summarize(numbers, days, prs, rules, manifest, named=(), as_json=False, fetch_error=None):
+    notes, pairs = queue_notes(manifest), queue_pairs(manifest)
+    rows = [summary_row(n, prs, rules, notes.get(n, ""), n in named, pairs.get(n, ())) for n in numbers]
+    merges, since = recent_merges(days)
+    # The queue watcher's record (`pr-queue watch`), fetched from the fork for this run.
+    record = manifest.get("watch")
+    watch = omp_watch.summary(record, datetime.datetime.now(datetime.timezone.utc), days, fetch_error)
+    pause = opening_pause(manifest)
+    if as_json:
+        print(json.dumps({"repo": REPO, "pause": pause, "open": rows, "merged": merges,
+                          "merged_since": since.isoformat(), "queue_watch": watch}))
+        return
+    if pause:
+        print(pause_line(pause))
+    print("\n".join(watch["lines"]))
+    print()
+    # Post-merge findings the watcher still holds open on merges older than the window above.
+    recent = {m["number"] for m in merges}
+    older = [{"number": int(n), "title": m["title"], "post_merge": [{**f, "taken_up": None} for f in m["findings"]]}
+             for n, m in sorted((record or {}).get("post_merge", {}).items()) if int(n) not in recent]
+    followups = [line for line in map(post_merge_row, merges + older) if line]
+    for heading, wanted in (("Needs us", True), ("Waiting on others", False)):
+        chosen = [summary_line(r) for r in rows if r["needs_us"] == wanted] + (followups if wanted else [])
+        print(f"{heading} ({len(chosen)})")
+        print("\n".join(chosen) if chosen else "  none")
+        print()
+    print(f"Merged in the last {days} day(s)  (first release with it; learn from each merge: read every "
+          "maintainer commit)")
+    for m in merges:
+        print(merge_line(m))
+    if not merges:
+        print(f"none since {since}")
+
+
+ISSUE_QUERY = """query($n:Int!){repository(owner:"%s",name:"%s"){issue(number:$n){
+  timelineItems(first:100,itemTypes:[CROSS_REFERENCED_EVENT]){nodes{... on CrossReferencedEvent{
+    source{... on PullRequest{number state author{login} labels(first:20){nodes{name}}
+      closingIssuesReferences(first:20){nodes{number}}}}}}}}}}""" % tuple(REPO.split("/"))
+
+
+def audit_issues():
+    """Our open issues whose state no longer matches the work around them."""
+    issues = gh_json("issue", "list", "-R", REPO, "--author", ME, "--state", "open", "--limit", "200",
+                     "--json", "number,title,labels")
+    for issue in sorted(issues, key=lambda i: i["number"]):
+        n, labels = issue["number"], {l["name"] for l in issue["labels"]}
+        data = gh_json("api", "graphql", "-f", f"query={ISSUE_QUERY}", "-F", f"n={n}")
+        prs = {}
+        for node in data["data"]["repository"]["issue"]["timelineItems"]["nodes"]:
+            src = node.get("source") or {}
+            if "number" in src:
+                prs[src["number"]] = src
+        notes = []
+        if "duplicate" in labels:
+            notes.append("triage labelled it duplicate: close it")
+        for pr in sorted(prs.values(), key=lambda p: p["number"]):
+            closes = n in {c["number"] for c in pr["closingIssuesReferences"]["nodes"]}
+            who = pr["author"]["login"]
+            rank = next((l["name"] for l in pr["labels"]["nodes"] if l["name"].startswith("review:")), "no rank")
+            if pr["state"] == "MERGED" and not closes:
+                notes.append(f"#{pr['number']} by {who} merged referencing it without closing: "
+                             "check what remains, then close it or say what is left")
+            elif pr["state"] == "OPEN" and closes:
+                notes.append(f"fix pending in #{pr['number']} by {who} ({rank})")
+        print(f"#{n} {issue['title'][:90]}")
+        for note in notes or ["no linked work"]:
+            print(f"  {note}")
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(usage=__doc__.split("\n\n", 2)[1].removeprefix("usage: "))
+    parser.add_argument("numbers", nargs="*", type=int)
+    parser.add_argument("--open", action="store_true")
+    parser.add_argument("--fetch", action="store_true")
+    parser.add_argument("--issues", action="store_true")
+    parser.add_argument("--summary", action="store_true")
+    parser.add_argument("--since", type=int, default=2, metavar="DAYS")
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--wait-codex", action="store_true")
+    parser.add_argument("--wait-change", action="store_true")
+    parser.add_argument("--timeout", type=float, metavar="MIN")
+    parser.add_argument("--state", metavar="FILE")
+    args = parser.parse_args(argv)
+    if args.since < 0:
+        parser.error("--since takes a number of days, 0 or more")
+    for flag, wait, default in (("--wait-codex", args.wait_codex, CODEX_WAIT_DEFAULT),
+                                ("--wait-change", args.wait_change, CHANGE_WAIT_DEFAULT)):
+        if wait:
+            args.timeout = default if args.timeout is None else args.timeout
+            if not args.numbers or args.timeout <= 0 or (args.wait_codex and args.wait_change):
+                parser.error(f"{flag} takes PR numbers and a --timeout above 0 minutes, alone")
+    if args.state and not args.wait_change:
+        parser.error("--state goes with --wait-change")
+    if args.wait_codex:
+        sys.exit(wait_codex(args.numbers, args.timeout))
+    if args.wait_change:
+        sys.exit(wait_change(args.numbers, args.timeout, args.state))
+    if args.fetch:
+        run("git", "fetch", "-q", "--tags", "origin", "main", cwd=CHECKOUT)
+        run("git", "fetch", "-q", STORE_REMOTE, cwd=CHECKOUT)
+    if args.issues:
+        audit_issues()
+        return
+    prs = open_prs()
+    numbers = set(args.numbers) | (set(prs) if args.open else set())
+    if not numbers and not args.summary:
+        sys.exit(__doc__)
+    # The queue record is read fresh every run (one ref): a copy left from the last --fetch made the
+    # watcher look silent for 16 h while its timer ran every 30 min.
+    store, fetch_error = Store(CHECKOUT), None
+    try:
+        manifest, _ = store.load()
+    except GitError as e:
+        fetch_error = str(e)
+        manifest, _ = store.load(fetch=False)
+    rules = rule_flags(prs, numbers & set(prs), manifest)
+    if args.summary:
+        summarize(sorted(numbers), args.since, prs, rules, manifest, set(args.numbers), args.json, fetch_error)
+        return
+    trees, notes = worktrees(), queue_notes(manifest)
+    for n in sorted(numbers):
+        trace(n, trees, prs, rules, notes.get(n, ""))
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

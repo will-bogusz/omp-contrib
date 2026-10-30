@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""Set PR N's body from FILE over REST, then read it back (references/framing.md, charts.md).
+
+usage: pr-body [--repo OWNER/NAME] [--dry-run] N FILE
+  --repo defaults to the upstream repo (`github.upstream_repo`). For that repo, the guard refuses when `pr-queue body-home N` names a
+  queued entry: `pr-queue open` posts that entry's stored body, so an edit to GitHub's body is lost
+  (references/queue.md). The queue owns no other repo, so no guard runs for one.
+  Then PATCHes repos/OWNER/NAME/pulls/N with `-F body=@FILE`, which sends FILE's bytes unchanged, and reads
+  the body back. Trailing newlines do not count in the comparison; a real difference prints a unified diff
+  and exits 1. A body already equal to FILE is not sent again.
+  --dry-run runs the same guard and reads the live body, prints the diff the PATCH would make, sends nothing.
+Exit: 0 body set and read back, or dry run done; 1 refused, failed, or GitHub kept a different body; 2 bad arguments.
+"""
+import argparse
+import difflib
+import json
+import os
+import subprocess
+import sys
+
+SCRIPTS = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, SCRIPTS)
+import omp_config  # noqa: E402
+
+DEFAULT_REPO = omp_config.load().upstream_repo  # omp_pr.REPO; omp_config alone, which asks gh nothing
+QUEUED_REPO = DEFAULT_REPO  # the repo pr-queue owns
+
+
+class Refused(Exception):
+    pass
+
+
+def norm(text):
+    """A body as GitHub keeps it: trailing newlines do not count."""
+    return text.rstrip("\n")
+
+
+def diff(live, want, number, path):
+    return "".join(difflib.unified_diff((live + "\n").splitlines(True), (want + "\n").splitlines(True),
+                                        f"PR #{number} live body", path))
+
+
+def read_body(path):
+    try:
+        with open(path, "rb") as f:
+            text = norm(f.read().decode("utf-8"))
+    except (OSError, UnicodeDecodeError) as e:
+        raise Refused(f"cannot read {path} as UTF-8 text: {e}")
+    if not text.strip():
+        raise Refused(f"{path} is empty: refusing to blank the body")
+    return text
+
+
+def guard(repo, number):
+    """For the queued repo: refuse when PR N's body is a queued entry's stored body; fail closed when the check fails."""
+    if repo.casefold() != QUEUED_REPO.casefold():
+        return
+    p = subprocess.run([os.path.join(SCRIPTS, "pr-queue"), "body-home", str(number)], capture_output=True, text=True)
+    if p.returncode:
+        raise Refused(f"pr-queue body-home {number} failed (exit {p.returncode}), so PR #{number} was not touched: "
+                      f"{p.stderr.strip()}")
+    home = json.loads(p.stdout)
+    if home.get("entry"):
+        raise Refused(f"{home.get('message')}; refused: `pr-queue set {home['entry']} --body FILE` instead")
+
+
+def gh(*args):
+    p = subprocess.run(["gh", *args], capture_output=True)
+    if p.returncode:
+        raise Refused(f"gh {' '.join(args[:3])} failed (exit {p.returncode}): {p.stderr.decode().strip()}")
+    return p.stdout.decode()
+
+
+def live_body(repo, number):
+    return norm(gh("api", f"repos/{repo}/pulls/{number}", "--jq", '.body // ""'))
+
+
+def set_body(repo, number, path, dry_run):
+    want = read_body(path)
+    guard(repo, number)
+    live = live_body(repo, number)
+    if live == want:
+        print(f"{repo} PR #{number}'s body already matches {path}; nothing sent")
+        return
+    if dry_run:
+        print(f"dry run: would PATCH {repo} PR #{number}'s body from {path} ({len(want)} chars over {len(live)}); "
+              "nothing sent")
+        print(diff(live, want, number, path), end="")
+        return
+    gh("api", "-X", "PATCH", f"repos/{repo}/pulls/{number}", "-F", f"body=@{os.path.abspath(path)}", "--silent")
+    after = live_body(repo, number)
+    if after != want:
+        print(diff(after, want, number, path), end="")
+        raise Refused(f"{repo} PR #{number} read back a body that differs from {path} (diff above)")
+    print(f"{repo} PR #{number}'s body set from {path} and read back: matches ({len(want)} chars)")
+
+
+def pr_number(text):
+    digits = text.lstrip("#")
+    if not digits.isdigit():
+        raise argparse.ArgumentTypeError(f"not a PR number: {text}")
+    return int(digits)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("number", type=pr_number, metavar="N", help="PR number (#N accepted)")
+    parser.add_argument("file", metavar="FILE", help="the body, sent byte for byte")
+    parser.add_argument("--repo", default=DEFAULT_REPO, metavar="OWNER/NAME", help=f"default {DEFAULT_REPO}")
+    parser.add_argument("--dry-run", action="store_true", help="show the diff a PATCH would make; send nothing")
+    args = parser.parse_args(argv)
+    try:
+        set_body(args.repo, args.number, args.file, args.dry_run)
+    except Refused as e:
+        print(f"pr-body: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

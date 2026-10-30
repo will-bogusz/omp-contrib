@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""Rebuild this branch's CHANGELOGs as origin/main's file plus our own entries under [Unreleased].
+
+usage: changelog-to-unreleased [--base REF] [--tip OLD_TIP --old-base OLD_BASE]...
+  Run in the PR's worktree right after `git rebase origin/main` (or a merge of it). For every CHANGELOG.md the branch
+  changes, the file becomes REF's version (default origin/main) with each entry line that only
+  this branch wrote (a `- ` line one of our own non-merge commits added, absent from REF's file and
+  from the main the branch last sat on) inserted under `## [Unreleased]`, in the `###` section it
+  sat under on the branch before (created at the end of Unreleased if missing). Lines REF already
+  has never move, so earlier union-merge leftovers (a main entry duplicated, shifted or kept after
+  main deleted it) disappear too, and old-main lines a release reworded since are dropped. After a
+merge the old tip and base are read from HEAD^1 and HEAD^2; after a rebase pass them as --tip (the
+branch before the rebase) and --old-base (the commit it sat on), or a replay that left our line
+under a released `###` keeps that heading, an old-main line a release reworded counts as ours, and
+the replayed commits (not the originals) decide which lines we wrote. Both repeat: a branch rebased
+by hand onto a newer main before (`advance --no-push`) names that head and its main as well as the
+fork's tip and its main, so the commits of either decide what we wrote and the text of either main
+is not ours (2026-10-29). Prints what it placed; commit the result yourself.
+
+Why: `.gitattributes` sets merge=union for CHANGELOGs, so after a release cut our line stays
+under the released heading, and the maintainer asks for it under [Unreleased] (2026-10-08).
+`precheck` reports the same drift as a FIX without changing anything.
+"""
+import argparse
+import os
+import re
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from omp_pr import run  # noqa: E402
+
+PR_LINK = re.compile(r"\[#\d+\]\([^)]*\)")
+
+
+def unlinked(line):
+    """`line` with its `[#N](…)` links blanked: the same entry under another PR number compares equal."""
+    return PR_LINK.sub("[#]", line)
+
+
+def our_entries(lines, base_lines, headings_from, inherited, written, fresh=frozenset()):
+    """[(subsection heading, line)] for entry lines the branch has and REF does not. The heading
+    comes from `headings_from` (the branch tip before the merge or rebase) when the line is there: a
+    union merge can leave our line under a different `###` of the released section. When that tip is
+    known, a line it lacks is a union leftover, not ours: replaying a commit that edited our entry
+    (the PR link) keeps both wordings. `inherited` is the file at the previous merge base: its lines
+    came from main, not from us, even when a release reworded them since. `written` is every line our
+    own non-merge commits added: a line only main wrote is not ours even when a union merge kept it on
+    the branch after main deleted it (#14759, 2026-10-15). A line REF or `inherited` holds with other
+    PR links is theirs too: a need reopened under a new number lands its entry relinked, and a copy
+    of the old link our own commit carried is not ours (browser-worker-exit, #15493 -> #15920,
+    2026-10-16). `fresh` is what the replayed commits added that the commits before the rebase never
+    wrote: a conflict resolution that reworded our entry, ours although the old tip lacks it
+    (inflight-epoch, 2026-10-16)."""
+    known, before = set(base_lines) | set(inherited), heading_map(headings_from)
+    relinked = {unlinked(line) for line in known if line.startswith("- ")}
+    return [(before.get(line) or heading or "### Fixed", line)
+            for line, heading in heading_map(lines).items()
+            if line not in known and unlinked(line) not in relinked
+            and (line in fresh or ((not before or line in before) and line in written))]
+
+
+def written_lines(rev, exclude, path):
+    """Entry lines the non-merge commits reachable from `rev` and from none of `exclude` added to
+    `path`. Merges are skipped: what a merge of main brings in, or keeps by union, main wrote."""
+    out = run("git", "log", "--no-merges", "--no-ext-diff", "--format=", "-p", "--unified=0",
+              rev, "--not", *exclude, "--", path).stdout
+    return {line[1:] for line in out.split("\n") if line.startswith("+- ")}
+
+
+def heading_map(lines):
+    """{entry line: the `###` heading above it}, first occurrence wins."""
+    heading, out = None, {}
+    for line in lines:
+        if line.startswith("## "):
+            heading = None
+        elif line.startswith("### "):
+            heading = line.strip()
+        elif line.startswith("- "):
+            out.setdefault(line, heading)
+    return out
+
+
+# Subsection order under `## [Unreleased]`, from AGENTS.md § Changelog.
+SECTION_ORDER = ["### Breaking Changes", "### Added", "### Changed", "### Fixed", "### Removed"]
+
+
+def section_rank(heading):
+    return SECTION_ORDER.index(heading) if heading in SECTION_ORDER else len(SECTION_ORDER)
+
+
+def insert_unreleased(base_lines, entries):
+    lines = list(base_lines)
+    start = next((i for i, l in enumerate(lines) if l.startswith("## [Unreleased]")), None)
+    if start is None:
+        sys.exit("no ## [Unreleased] heading in the base file")
+    for heading, entry in entries:
+        end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("## ")), len(lines))
+        at = next((i for i in range(start + 1, end) if lines[i].strip() == heading), None)
+        if at is None:
+            # New subsection ahead of the first one that sorts after it, else at the end of Unreleased.
+            later = next(
+                (
+                    i
+                    for i in range(start + 1, end)
+                    if lines[i].startswith("### ") and section_rank(lines[i].strip()) > section_rank(heading)
+                ),
+                None,
+            )
+            if later is not None:
+                lines[later:later] = [heading, "", entry, ""]
+                continue
+            tail = end
+            while tail > start + 1 and not lines[tail - 1].strip():
+                tail -= 1
+            lines[tail:tail] = ["", heading, "", entry]
+            continue
+        last = at
+        for i in range(at + 1, end):
+            if lines[i].startswith("### "):
+                break
+            if lines[i].strip():
+                last = i
+        lines.insert(last + 1 if last > at else at + 2, entry)
+    return lines
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(usage=__doc__.split("\n\n", 2)[1].removeprefix("usage: "))
+    parser.add_argument("--base", default="origin/main")
+    parser.add_argument("--tip", action="append", default=[], help="the branch tip before a rebase")
+    parser.add_argument("--old-base", action="append", default=[],
+                        help="the commit the branch sat on before a rebase")
+    args = parser.parse_args(argv)
+    paths = run("git", "diff", "--name-only", f"{args.base}...HEAD", "--", "*CHANGELOG.md").stdout.split()
+    # Right after `git merge origin/main`, HEAD^1 is our tip before the merge and its merge base
+    # with HEAD^2 is the main it last held.
+    is_merge = run("git", "rev-parse", "-q", "--verify", "HEAD^2").returncode == 0
+    old_bases = [run("git", "merge-base", "HEAD^1", "HEAD^2").stdout.strip()] if is_merge else args.old_base
+    old_tips = ["HEAD^1"] if is_merge else args.tip
+    report = []
+    for path in paths:
+        base = run("git", "show", f"{args.base}:{path}").stdout.split("\n")
+        # The last tip named is the newest: it goes first, and heading_map keeps a line's first heading.
+        tip = [line for t in reversed(old_tips) for line in run("git", "show", f"{t}:{path}").stdout.split("\n")]
+        inherited = [line for b in old_bases for line in run("git", "show", f"{b}:{path}").stdout.split("\n")]
+        written = set().union(*(written_lines(t, [args.base] + old_bases, path) for t in old_tips or ["HEAD"]))
+        # After a rebase HEAD's own commits are the replayed ones; a merge replays nothing. A line the
+        # old tip already held came by a merge of main and union-replays as ours (#14759): not fresh.
+        fresh = set()
+        if args.tip and not is_merge:
+            fresh = written_lines("HEAD", [args.base], path) - written - set(tip)
+        with open(path) as f:
+            mine = f.read().split("\n")
+        entries = our_entries(mine, base, tip, inherited, written, fresh)
+        rebuilt = insert_unreleased(base, entries)
+        if rebuilt != mine:
+            with open(path, "w") as f:
+                f.write("\n".join(rebuilt))
+        report += [f"{path}: [Unreleased] {h}: {e[2:70]}…" for h, e in entries]
+    print("\n".join(report) or "nothing to place")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

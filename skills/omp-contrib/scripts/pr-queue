@@ -1,0 +1,1597 @@
+#!/usr/bin/env python3
+"""Queue our oh-my-pi changes so a PR is open only while it merges alone (shaping.md, Open-PR rule).
+
+usage: pr-queue [--repo DIR] [--manifest FILE] COMMAND ...
+  sync      fetch; import open PRs the manifest lacks; mark entries merged when their PR merged or
+            their own commits are on origin/main by patch id (a maintainer's rebase changes SHAs);
+            mark closed PRs closed; warns on a queued entry whose branch merged main or a need since
+            its base (see add)
+  add BRANCH --title T [--area A] [--priority P0-P3] [--needs X ...] [--body FILE] [--base SHA]
+            [--p2-decision TEXT]
+            record a final branch as queued and push it to your fork (the remote `github.fork_remote`).
+            X is an entry id or #N. --base is
+            the commit its own commits sit on (default: inferred from the commits other entries own).
+            Warns when merge commits sit between base and tip: plan and advance then take only its
+            non-merge commits past base and origin/main (add and set --base alike). --p2-decision
+            marks a change that is P2 by design (shaping.md: it changes a default, adds a setting or
+            reverses a deliberate contract) with the one decision it asks the maintainer for; while
+            `autonomy.open_p2` is "hold" it is held `user decision pending: TEXT` until `approve`
+  set KEY [--title|--area|--priority|--needs ...|--body FILE|--base SHA|--state S|--note TEXT|--branch B [--keep-old]
+           |--hold "WHO, DATE: REASON"|--unhold|--p2-decision TEXT|--no-p2-decision]
+            --hold keeps a queued entry from opening: plan shows it `held` with the reason, never
+            `open` or `next-hour`, and open refuses it; advance still rebases it. --unhold lifts it.
+            --p2-decision sets or replaces the entry's P2 decision (a new one needs a new approve),
+            --no-p2-decision drops it.
+            --branch renames a queued entry: pushes its tip as B, renames the worktree's branch,
+            makes topic(B) its id (stored body and other entries' needs follow), deletes the old
+            fork branch. When <fork remote>/B exists already (a restack pushed it), B is recorded as it is,
+            with the worktree that has B checked out; pass --base for its new base. --keep-old
+            leaves the old fork branch in place
+  approve KEY
+            the user's go-ahead for the entry's P2 decision (`p2_approved` in the entry): lifts the
+            `user decision pending` hold. Run it only on the user's explicit word
+  show [KEY] [--json]
+            KEY is an entry id, a branch, or #N
+  body-home N
+            JSON {number, entry, message}: entry and message are set when PR N is closed and an entry
+            queues its change, so `open` posts the stored body and an edit to GitHub's is lost
+            (charts/run.mjs refuses on it; precheck N prints it as FIX)
+  advance [KEY ...] [--no-push]
+            for each queued entry whose needs have all merged: rebase only its own commits onto
+            origin/main (`git rebase --onto origin/main <base>` in its worktree; with merges since
+            base, `git rebase origin/main` or a todo of its own commits alone), rebuild its
+            CHANGELOGs with changelog-to-unreleased, fold that into the owning commit, write the PR
+            references in the replayed messages as `PR N` (they are new SHAs anyway), push to the fork.
+            A conflicting rebase stops in the worktree and is reported for an agent to resolve.
+            An open PR is advanced only when named (plan's `rebase`: it stays open). A named entry
+            is also rebased when GitHub alone reads it as conflicting in a CHANGELOG (below)
+  plan [--json]
+            which open ready PRs stay open (keep, or rebase in place when main alone conflicts),
+            which are requeued, which queued entries open now, which wait and why. A queued P0/P1
+            whose only blockers are code conflicts with open P2s of ours open over 3 days opens over
+            them: `open (over P2 #N)` (shaping.md, Open-PR rule 3). Under a kept or
+            opening row, `GitHub:` lines say which CHANGELOGs GitHub reads as conflicting, with main
+            or with another row once one merges: its merge ignores merge=union. Information only:
+            no rule counts it and it is no push of its own; the next needed push rebases onto main
+            (`advance KEY --no-push` with it; a queued entry: `advance KEY` before `open`). Caches its
+            result in the manifest for QUEUE.md when it changed or is an hour old. Its head says how
+            many supervised opens remain (`Supervised start: the next N open(s) need your explicit OK`)
+            and lists entries held only by a P2 decision under `Awaiting your decision`
+  audit [--json]
+            open PRs that break the rule: merge-order lines in the body, another open PR's commits,
+            a code conflict with main or with another open ready PR (not one an opening over a P2
+            accepted), old drafts; and, as in plan, the `GitHub:` lines of any open PR, which break nothing
+  open KEY  open a queued entry: refuses unless plan would open it now, its stored body passes
+            precheck, and the merged tree with each open ready PR in one of its crates or packages
+            is recorded as built (see built); then pushes, opens a draft, links the CHANGELOG
+            entries to the number, reruns precheck, and marks it ready. An entry opening over P2s
+            marks each P2's entry `rebases_after: [N]`: it rebases onto main once N merges, and their
+            conflict counts for neither again. Refused outright, before the lock, while the opening
+            pause is set (pause).
+            Supervised start: while `autonomy.supervised_opens` in your config is above 0, open refuses
+            without --user-approved, passed only after the user saw the body, the diff summary and
+            their own-words sentence and said yes; each open then counts it down in the config file.
+            An entry held by its P2 decision is refused until `approve`
+  pause "WHO, DATE: REASON"
+            stop all opening across the queue: open refuses, plan prints the pause first and shows
+            `paused` where it would show `open` or `next-hour`, `pr-trace --summary` and `precheck N`
+            on a draft name it. Open PRs carry on: bot fixes, rebases and drift pushes continue.
+            Stored as the manifest's config `pause`; replaces one already set
+  unpause   lift the opening pause
+  built KEY WITH [WITH ...]
+            record that the merged tree of KEY with each WITH (entry id or #N) was built and tested.
+            A merge git calls clean can still fail to compile (#15761 + #15762, E0507), so plan
+            lists `build and test the merged tree with X` for each open ready PR or same-plan
+            opening that shares a crates/<name> or packages/<name> with an opening. The record
+            holds both sides' code (patch id outside CHANGELOGs): a rebase keeps it, a code change
+            voids it. Records every WITH it can and prints `not recorded: KEY with WITH: <why>` for
+            the rest (merged, closed, unknown); exits 1 only when none was recorded
+  tree [SHA] [--record [--rust]]
+            one merged tree for the round: each unbuilt pair under plan's `open` and `next-hour` rows,
+            by tip SHA in plan order. Prints the `git merge` of every tip onto origin/main, or with SHA
+            (a tree already built) the tips it lacks, to extend it. --record writes `built` for every
+            listed pair, refusing while SHA lacks one's current tip; a pair sharing a crate only with
+            --rust (cargo build and test passed there, not bun alone). Branches that conflict in code
+            (an opening over a P2) never share a tree: it prints one tree per side, and SHA picks the
+            tree it holds most of
+  requeue N [--needs X ...] [--base SHA]
+            close open PR N (no comment) and queue its branch, its body stored for the reopen
+  watch     sync, then record what changed since the last watch in the manifest's `watch` record
+            (written only on a change or hourly): our merges (with maintainer commits), queued
+            entries plan turns openable or no longer, open ready PRs newly conflicting with main,
+            merges a `v*` tag now ships, and bot findings posted after a merge that no later main
+            commit took up (kept until one does or its thread is resolved, so a session days later
+            still sees them). Notice only: never opens, advances, pushes or comments;
+            skips a run while an `open` holds the lock. A timer can run it every 30 min (contrib/ has
+            launchd and systemd templates); `pr-trace --summary` prints the record first. When a PR of
+            ours merged, closed, opened, turned ready or shipped in a release, it runs post-status
+            for each discussion in `series-posts` beside your config file (template: scripts/series-posts;
+            its one GitHub write; not with --manifest)
+
+The manifest is `queue.json` on the fork's queue branch (`github.queue_branch`; bodies under `bodies/`), read and
+written by every host with the fork remote; --manifest FILE keeps it in a local file instead (dry
+runs). Every write renders QUEUE.md beside it in the same commit, its groups from the last cached
+plan. Reference: references/queue.md.
+"""
+import argparse
+import datetime
+import json
+import os
+import re
+import shlex
+import socket
+import subprocess
+import sys
+import tempfile
+import uuid
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from omp_pr import CHECKOUT, ME, REPO, changelog_drift, first_release, review_log  # noqa: E402
+import omp_config  # noqa: E402
+from omp_queue import (  # noqa: E402
+    MAIN, PUSH, RANKS, STATES, STORE_BRANCH, STORE_REMOTE, WORKTREES, GitError, GitHub, Queue, Store, awaiting_user,
+    entry_hold, find_entry, git, git_out, is_ancestor, merge_order_lines, new_entry, now, opening_pause, pause_line,
+    quiet_replayed, rev, rev_list, stamp, stored_body_entry, stored_body_message, topic,
+)
+import omp_queue_view  # noqa: E402
+import omp_watch  # noqa: E402
+from omp_queue_view import action_label  # noqa: E402
+
+SCRIPTS = os.path.dirname(os.path.realpath(__file__))
+# Discussions `watch` refreshes with post-status: your list, beside the config file (scripts/series-posts
+# is the template).
+SERIES_POSTS = os.path.join(os.path.dirname(omp_config.config_path()), "series-posts")
+FLAG_NAMES = {
+    "merge-order": "merge-order line", "carries": "carries", "carries-main": "carries main's commits",
+    "conflicts-main": "conflicts with main", "conflicts-pr": "conflicts with",
+    "stale-draft": "stale draft", "base": "targets a base other than main",
+}
+
+
+class Refused(Exception):
+    pass
+
+
+def fetch(repo):
+    """origin/main and every fork branch; tags stay out (read commands write only remote-tracking refs)."""
+    for spec in (("origin", "main"), (STORE_REMOTE,)):
+        p = git(repo, "fetch", "-q", "--no-tags", *spec)
+        if p.returncode:
+            raise GitError(f"git fetch {' '.join(spec)}: {p.stderr.strip()} (rerun, or pass --no-fetch to use "
+                           "the refs as they are)")
+
+
+def worktrees(repo):
+    found, path = {}, None
+    for line in git_out(repo, "worktree", "list", "--porcelain").splitlines():
+        if line.startswith("worktree "):
+            path = line[9:]
+        elif line.startswith("branch refs/heads/"):
+            found[line[18:]] = path
+    return found
+
+
+def ensure_worktree(repo, branch):
+    """The worktree with `branch` checked out, adding one under WORKTREES (from <fork remote>/<branch> when
+    there is no local branch) if none has it."""
+    path = worktrees(repo).get(branch)
+    if path:
+        return path
+    path = os.path.join(WORKTREES, topic(branch))
+    if os.path.exists(path):
+        raise Refused(f"{path} exists but does not have {branch} checked out")
+    if rev(repo, f"refs/heads/{branch}"):
+        git_out(repo, "worktree", "add", "-q", path, branch)
+    else:
+        git_out(repo, "worktree", "add", "-q", "-b", branch, path, f"{STORE_REMOTE}/{branch}")
+    return path
+
+
+def in_rebase(wt):
+    return any(os.path.exists(git_out(wt, "rev-parse", "--path-format=absolute", "--git-path", d))
+               for d in ("rebase-merge", "rebase-apply"))
+
+
+def sync_worktree(wt, branch, keep_ahead=False):
+    """Bring the worktree's branch to <fork remote>/<branch>: fast-forward when behind; refuse when it has
+    local edits, or commits the fork lacks unless `keep_ahead` (advance --no-push: an agent's fix
+    commits ride the rebase and go out in its one push)."""
+    if git_out(wt, "status", "--porcelain", "--untracked-files=no"):
+        raise Refused(f"{wt} has uncommitted changes")
+    head, fork = rev(wt, "HEAD"), rev(wt, f"refs/remotes/{STORE_REMOTE}/{branch}")
+    if fork and head != fork:
+        if is_ancestor(wt, head, fork):
+            git_out(wt, "merge", "-q", "--ff-only", fork)
+        elif not (keep_ahead and is_ancestor(wt, fork, head)):
+            raise Refused(f"{branch} in {wt} has commits {STORE_REMOTE}/{branch} lacks: push or drop them first"
+                          + ("" if keep_ahead else ", or advance with --no-push and push once yourself"))
+
+
+def push(repo, branch, old):
+    lease = f"--force-with-lease={branch}:{old or ''}"
+    git_out(repo, *PUSH, "-q", lease, STORE_REMOTE, f"{branch}:{branch}")
+    git(repo, "fetch", "-q", STORE_REMOTE, branch)
+
+
+def script(name, *args, cwd):
+    return subprocess.run([sys.executable, os.path.join(SCRIPTS, name), *args], cwd=cwd, capture_output=True,
+                          text=True)
+
+
+def unique_id(manifest, branch):
+    base, n = topic(branch), 2
+    ident = base
+    while any(e["id"] == ident for e in manifest["entries"]):
+        ident, n = f"{base}-{n}", n + 1
+    return ident
+
+
+def check_needs(manifest, needs):
+    for need in needs:
+        if not re.fullmatch(r"#\d+", need) and not find_entry(manifest, need):
+            raise Refused(f"need {need!r} is neither #N nor an entry id")
+
+
+def merge_note(repo, ident, base, tip):
+    """A warning when merge commits sit between `base` and `tip` (the branch merged main or a need
+    after it was branched), else "". `plan` and `advance` then take its own commits alone."""
+    if not base or not tip:
+        return ""
+    merges = git_out(repo, "rev-list", "--merges", tip, f"^{base}").split()
+    if not merges:
+        return ""
+    own = rev_list(repo, tip, f"^{base}", f"^{MAIN}")
+    return (f"warning: {ident}: {len(merges)} merge commit(s) between its base {base[:10]} and tip {tip[:10]}; "
+            f"plan and advance take only its {len(own)} non-merge commit(s) past base and {MAIN}: check "
+            f"`git log --no-merges {tip[:10]} ^{base[:10]} ^{MAIN}` lists only its own work")
+
+
+# --- sync -------------------------------------------------------------------------------------------
+
+def cmd_sync(args, repo, store, gh):
+    if not args.no_fetch:
+        fetch(repo)
+    manifest, _ = store.load()
+    q = Queue(repo, manifest, gh)
+    report, changes, requeued, notes = [], {}, set(), []
+    stale = [e for e in q.stale if e.get("pr")]
+    states = gh.states([e["pr"] for e in stale]) if stale else {}
+    for entry in stale:
+        state = {"MERGED": "merged", "CLOSED": "closed"}.get(states.get(entry["pr"]), "open")
+        merged_by = "pr" if state == "merged" else None
+        if state == "closed" and q.closed_landed(entry["pr"], entry["branch"]):
+            state, merged_by = "merged", "content"
+        if state == "closed" and entry.get("requeue") == entry["pr"]:
+            requeued.add(entry["id"])  # `requeue` closed it, then failed to record that
+            report.append(f"#{entry['pr']} {entry['id']}: closed by requeue, now queued")
+        elif state != "open":
+            changes[entry["id"]] = {"state": state, "merged_by": merged_by}
+            report.append(f"#{entry['pr']} {entry['id']}: {state}" + (" (closed, content on main)"
+                                                                       if merged_by == "content" else ""))
+    for item in q.items:
+        if item.state == "queued":
+            note = merge_note(repo, item.entry["id"], q.base(item), q.tip(item))
+            if note:
+                notes.append(note)
+            tip, own = q.tip(item), q.own(item)
+            pids = q.patch_ids(own)
+            if tip and is_ancestor(repo, tip, q.main):
+                changes[item.entry["id"]] = {"state": "merged", "merged_by": "ancestor"}
+                report.append(f"{item.entry['id']}: merged (its branch is part of {MAIN})")
+            elif own and len(pids) == len(own) and set(pids.values()) <= q.main_pids(item):
+                changes[item.entry["id"]] = {"state": "merged", "merged_by": "patch-id"}
+                report.append(f"{item.entry['id']}: merged (its {len(own)} own commit(s) are on {MAIN})")
+        elif item.number and item.entry["id"] in {e["id"] for e in manifest["entries"]}:
+            fields = {"priority": item.pr.get("rank") or item.entry.get("priority"), "title": item.title}
+            if any(item.entry.get(k) != v for k, v in fields.items()):
+                changes[item.entry["id"]] = fields
+    known = {e["id"] for e in manifest["entries"]}
+    trees = worktrees(repo)
+    imports = []
+    for item in q.items:
+        if item.entry["id"] in known:
+            continue
+        entry = {**item.entry, "id": unique_id({"entries": manifest["entries"] + imports}, item.entry["branch"]),
+                 "area": q.area(item), "priority": item.priority, "needs": q.inferred_needs(item),
+                 "worktree": trees.get(item.entry["branch"])}
+        imports.append(entry)
+        report.append(f"#{item.number} imported as {entry['id']} ({entry['area']}, {entry['priority'] or 'unranked'}"
+                      + (f", needs {' '.join(entry['needs'])}" if entry["needs"] else "") + ")")
+
+    def apply(m, files):
+        for entry in m["entries"]:
+            if entry["id"] in requeued and entry.get("requeue") == entry.get("pr"):
+                finish_requeue(entry)
+            if entry["id"] in changes:
+                entry.pop("requeue", None)
+                entry.update({k: v for k, v in changes[entry["id"]].items() if v is not None}, updated=stamp())
+        have = {e["id"] for e in m["entries"]} | {e.get("pr") for e in m["entries"] if e.get("pr")}
+        m["entries"] += [e for e in imports if e["id"] not in have and e["pr"] not in have]
+
+    if changes or imports or requeued:
+        store.update(apply, f"sync: {len(imports)} imported, {len(changes)} updated")
+    print("\n".join(report) or "manifest matches GitHub and origin/main")
+    for note in notes:
+        print(note, file=sys.stderr)
+    by_id = {e["id"]: e for e in manifest["entries"]}
+    return ({by_id[i]["pr"] for i in changes if i in by_id and by_id[i].get("pr") and "state" in changes[i]}
+            | {e["pr"] for e in imports} | {by_id[i]["pr"] for i in requeued if by_id[i].get("pr")})
+
+
+# --- add / set / show ---------------------------------------------------------------------------------
+
+def read_file(path):
+    with open(path) as f:
+        return f.read()
+
+
+def cmd_add(args, repo, store, gh):
+    branch = args.branch
+    local, fork = rev(repo, f"refs/heads/{branch}"), rev(repo, f"refs/remotes/{STORE_REMOTE}/{branch}")
+    if not local and not fork:
+        raise Refused(f"no branch {branch} locally or on {STORE_REMOTE}")
+    manifest, _ = store.load()
+    ident = args.id or topic(branch)
+    if find_entry(manifest, ident) or any(e["branch"] == branch and e["state"] in ("queued", "open")
+                                          for e in manifest["entries"]):
+        raise Refused(f"{ident} / {branch} is already in the queue: use `set`")
+    needs = args.needs or []
+    check_needs(manifest, needs)
+    if args.priority and args.priority not in RANKS:
+        raise Refused("--priority is one of P0, P1, P2, P3")
+    if args.p2_decision is not None and not args.p2_decision.strip():
+        raise Refused("--p2-decision takes the one decision the change asks the maintainer for")
+    body = read_file(args.body) if args.body else None
+    if local and not args.no_push and local != fork:
+        push(repo, branch, fork)
+    entry = new_entry(branch, id=ident, title=args.title, priority=args.priority, needs=needs,
+                      worktree=worktrees(repo).get(branch), body=f"bodies/{ident}.md" if body else None,
+                      p2_decision=(args.p2_decision or "").strip() or None)
+    probe = {**manifest, "entries": manifest["entries"] + [entry]}
+    q = Queue(repo, probe, gh)
+    item = q.by_id[ident]
+    if args.base:
+        if not rev(repo, args.base):
+            raise Refused(f"--base {args.base} is not a commit")
+        entry["base"] = rev(repo, args.base)
+    else:
+        entry["base"] = q.base(item)
+        if not entry["base"]:
+            raise Refused("its own commits are interleaved with other entries' commits: pass --base")
+    entry["area"] = args.area or q.area(item)
+
+    def apply(m, files):
+        if find_entry(m, ident) or any(e["branch"] == branch and e["state"] in ("queued", "open")
+                                       for e in m["entries"]):
+            raise Refused(f"{ident} / {branch} was queued meanwhile: use `set`")
+        m["entries"].append(entry)
+        if body:
+            files[entry["body"]] = body
+    store.update(apply, f"add {ident}")
+    own = len(q.own(item))
+    print(f"queued {ident}: {own} own commit(s) on {entry['base'][:10]}, area {entry['area']}"
+          + (f", needs {' '.join(needs)}" if needs else ""))
+    if awaiting_user(entry):
+        print(f"held until you approve its maintainer decision: {entry['p2_decision']} (pr-queue approve {ident})")
+    note = merge_note(repo, ident, entry["base"], q.tip(item))
+    if note:
+        print(note, file=sys.stderr)
+
+
+def rename_branch(args, repo, store):
+    """Push a queued entry's branch under `args.branch`, rename its worktree's branch and move its
+    review record (review-stamp); the old fork branch is deleted once the manifest names the new one,
+    unless --keep-old. A `<fork remote>/<args.branch>` that exists already (a restack pushed it) is recorded as
+    it is, with the worktree that has it checked out: pushing the old tip over it would undo the restack."""
+    entry = find_entry(store.load()[0], args.key)
+    if not entry:
+        raise Refused(f"no entry {args.key}")
+    if entry["state"] != "queued":
+        raise Refused("--branch renames a queued entry only: an open PR's head branch is fixed")
+    old = entry["branch"]
+    tip = rev(repo, f"refs/remotes/{STORE_REMOTE}/{old}")
+    if not tip:
+        raise Refused(f"no {STORE_REMOTE}/{old} to rename")
+    worktree = None
+    if rev(repo, f"refs/remotes/{STORE_REMOTE}/{args.branch}"):
+        if not args.base:
+            raise Refused(f"{STORE_REMOTE}/{args.branch} exists: pass --base, the commit its own commits sit on")
+        worktree = worktrees(repo).get(args.branch)
+    else:
+        git_out(repo, *PUSH, "-q", STORE_REMOTE, f"{tip}:refs/heads/{args.branch}")
+        wt = entry.get("worktree")
+        if wt and os.path.isdir(wt) and rev(wt, f"refs/heads/{old}"):
+            git_out(wt, "branch", "-m", old, args.branch)
+            git_out(wt, "branch", "-q", "--set-upstream-to", f"{STORE_REMOTE}/{args.branch}", args.branch)
+    reviews = review_log(old, repo)
+    if os.path.exists(reviews):
+        os.replace(reviews, review_log(args.branch, repo))
+    return {"old": old, "body": store.read(entry["body"]) if entry.get("body") else None, "worktree": worktree}
+
+
+def cmd_set(args, repo, store, gh):
+    body = read_file(args.body) if args.body else None
+    if args.priority and args.priority not in RANKS and args.priority != "none":
+        raise Refused("--priority is one of P0, P1, P2, P3, none")
+    if args.state and args.state not in STATES:
+        raise Refused(f"--state is one of {', '.join(STATES)}")
+    if args.hold is not None and (args.unhold or not args.hold.strip()):
+        raise Refused("--hold takes a reason (\"WHO, DATE: REASON\") and goes without --unhold")
+    if args.p2_decision is not None and (args.no_p2_decision or not args.p2_decision.strip()):
+        raise Refused("--p2-decision takes the decision and goes without --no-p2-decision")
+    base = None
+    if args.base:
+        base = rev(repo, args.base)
+        if not base:
+            raise Refused(f"--base {args.base} is not a commit")
+    rename = rename_branch(args, repo, store) if args.branch else None
+
+    def apply(m, files):
+        entry = find_entry(m, args.key)
+        if not entry:
+            raise Refused(f"no entry {args.key}")
+        if rename:
+            old_id, new_id = entry["id"], topic(args.branch)
+            if new_id != old_id and find_entry(m, new_id):
+                raise Refused(f"an entry {new_id} exists already")
+            entry["id"], entry["branch"] = new_id, args.branch
+            for other in m["entries"]:
+                other["needs"] = [new_id if n == old_id else n for n in other.get("needs", [])]
+            if rename["body"] is not None:
+                entry["body"] = f"bodies/{new_id}.md"
+                files[entry["body"]] = rename["body"]
+            if rename["worktree"]:
+                entry["worktree"], entry["host"] = rename["worktree"], socket.gethostname().split(".")[0]
+        if args.needs is not None:
+            check_needs(m, args.needs)
+            entry["needs"] = args.needs
+        for field in ("title", "area", "state", "note"):
+            if getattr(args, field) is not None:
+                entry[field] = getattr(args, field)
+        if args.priority:
+            entry["priority"] = None if args.priority == "none" else args.priority
+        if base:
+            entry["base"] = base
+        if args.hold is not None:
+            if entry["state"] != "queued":
+                raise Refused(f"{entry['id']} is {entry['state']}: only a queued entry is held")
+            entry["hold"] = args.hold.strip()
+        if args.unhold:
+            entry.pop("hold", None)
+        if args.p2_decision is not None and args.p2_decision.strip() != entry.get("p2_decision"):
+            entry["p2_decision"] = args.p2_decision.strip()
+            entry.pop("p2_approved", None)  # a new decision needs its own approval
+        if args.no_p2_decision:
+            entry.pop("p2_decision", None)
+            entry.pop("p2_approved", None)
+        if args.pr is not None:
+            entry["pr"] = int(args.pr.lstrip("#")) if args.pr.lstrip("#") else None
+        if body is not None:
+            entry["body"] = f"bodies/{entry['id']}.md"
+            files[entry["body"]] = body
+        entry["updated"] = stamp()
+        return entry
+    entry = store.update(apply, f"set {args.key}")
+    print(json.dumps(entry, indent=1))
+    if rename and rename["old"] != entry["branch"]:
+        if args.keep_old:
+            print(f"recorded {entry['branch']}; {rename['old']} stays on {STORE_REMOTE}")
+        else:
+            git_out(repo, *PUSH, "-q", STORE_REMOTE, "--delete", rename["old"])
+            print(f"renamed {rename['old']} -> {entry['branch']} on {STORE_REMOTE}")
+    if base:
+        branch = entry["branch"]
+        tip = rev(repo, f"refs/remotes/{STORE_REMOTE}/{branch}") or rev(repo, f"refs/heads/{branch}")
+        note = merge_note(repo, entry["id"], base, tip)
+        if note:
+            print(note, file=sys.stderr)
+
+
+def cmd_show(args, repo, store, gh):
+    manifest, token = store.load()
+    if args.key:
+        entry = find_entry(manifest, args.key)
+        if not entry:
+            raise Refused(f"no entry {args.key}")
+        body = store.read(entry["body"], token) if entry.get("body") else None
+        if args.json:
+            print(json.dumps({**entry, "body_text": body}, indent=1))
+        else:
+            print(json.dumps(entry, indent=1))
+            print(f"\n--- {entry.get('body') or 'no body stored'}\n{body or ''}")
+        return
+    if args.json:
+        print(json.dumps(manifest, indent=1))
+        return
+    for e in manifest["entries"]:
+        pr = f"#{e['pr']}" if e.get("pr") else "-"
+        needs = " ".join(e.get("needs") or []) or "-"
+        state = "held" if e["state"] == "queued" and entry_hold(e) else e["state"]
+        print(f"{state:<7} {pr:<7} {e['id'][:28]:<28} {e.get('area') or '?':<9} {e.get('priority') or '-':<3} "
+              f"needs {needs[:30]:<30} {(e.get('title') or '')[:60]}")
+
+
+def cmd_body_home(args, repo, store, gh):
+    number = int(args.number.lstrip("#"))
+    entry = stored_body_entry(store.load()[0], number, gh.states([number]).get(number))
+    print(json.dumps({"number": number, "entry": entry and entry["id"],
+                      "message": entry and stored_body_message(number, entry)}))
+
+
+def find_item(q, key):
+    """The queued or open item for an entry id, branch or #N, an open PR the manifest lacks included; else None."""
+    entry = find_entry(q.manifest, key)
+    item = q.by_id.get(entry["id"]) if entry else None
+    if not item and re.fullmatch(r"#?\d+", key):
+        item = q.by_number.get(int(key.lstrip("#")))
+    return item
+
+
+def queue_item(q, key):
+    item = find_item(q, key)
+    if not item:
+        raise Refused(f"{key} is neither a queued or open entry nor an open PR of ours")
+    return item
+
+
+def built_record(q, item, other, tree=None):
+    """The `built` record of `item`'s merged tree with `other`, keyed to both sides' code (Queue.code_id)."""
+    code, with_code = q.code_id(item), q.code_id(other)
+    for label, found in ((item.label, code), (other.label, with_code)):
+        if not found:
+            raise Refused(f"{label} has no change past {MAIN} to record (or its branch is missing): fetch first")
+    record = {"with": other.label, "code": code, "with_code": with_code, "tip": q.tip(item),
+              "with_tip": q.tip(other), "at": stamp(), "host": socket.gethostname().split(".")[0]}
+    return {**record, "tree": tree} if tree else record
+
+
+def store_built(store, records, lines=()):
+    """Write {entry id: [record]} in one manifest commit, replacing each entry's records of the same
+    `with`, then print `lines`: nothing claims a record before the commit holds it."""
+    def apply(m, files):
+        for ident, new in records.items():
+            entry = find_entry(m, ident)
+            names = {r["with"] for r in new}
+            entry["built"] = [r for r in entry.get("built") or [] if r["with"] not in names] + new
+            entry["updated"] = stamp()
+    store.update(apply, "built " + "; ".join(f"{i} with {' '.join(sorted(r['with'] for r in new))}"
+                                             for i, new in records.items()))
+    for line in lines:
+        print(line)
+    print("a change to either side's code voids a record; a rebase or CHANGELOG link keeps it")
+
+
+def gone_reason(q, key):
+    """Why `key` names no queued or open item: "merged" or "closed" (the manifest's state, else
+    GitHub's for a PR merged or closed since the last sync), else "unknown"."""
+    entry = find_entry(q.manifest, key)
+    if entry and entry["state"] in ("merged", "closed"):
+        return entry["state"]
+    number = entry.get("pr") if entry else int(key.lstrip("#")) if re.fullmatch(r"#?\d+", key) else None
+    state = q.gh.states([number]).get(number) if number else None
+    if state in ("MERGED", "CLOSED"):
+        return state.lower() + " since the last sync"
+    return "unknown: neither a queued or open entry nor an open PR of ours"
+
+
+def cmd_built(args, repo, store, gh):
+    """Record that the merged tree of KEY with each WITH was built and tested, keyed to both sides'
+    code (Queue.code_id) so `open` asks again once either changes. Records every pair it can and
+    names each WITH it skips (merged, closed, unknown, unrecordable); refused only when none records."""
+    if not args.no_fetch:
+        fetch(repo)
+    manifest, _ = store.load(fetch=False)
+    q = Queue(repo, manifest, gh)
+    item = queue_item(q, args.key)
+    ident = item.entry["id"]
+    if ident not in {e["id"] for e in manifest["entries"]}:
+        raise Refused(f"{args.key} has no manifest entry yet: pr-queue sync first")
+    records, done, skipped = [], [], []
+    for key in args.others:
+        other = find_item(q, key)
+        if not other:
+            skipped.append(f"not recorded: {ident} with {key}: {gone_reason(q, key)}")
+            continue
+        if other is item:
+            skipped.append(f"not recorded: {ident} with {key}: {args.key} itself")
+            continue
+        try:
+            records.append(built_record(q, item, other))
+        except Refused as e:
+            skipped.append(f"not recorded: {ident} with {key}: {e}")
+            continue
+        shared = dict(q.sharing(item, [other])).get(other)
+        done.append(f"{ident} with {other.label}: merged tree recorded as built and tested"
+                    + (f" ({', '.join(shared)} in both)" if shared else " (they share no crate or package)"))
+    if not records:
+        raise Refused("\n".join(skipped + ["nothing recorded"]))
+    store_built(store, {ident: records}, done + skipped)
+
+
+def cmd_tree(args, repo, store, gh):
+    """The round's one merged tree: every unbuilt pair plan lists under an `open` or `next-hour` row,
+    merged by tip SHA in plan order, so one agent builds it once and extends it as entries arrive.
+    Members that conflict in code (an opening over a P2 beside it, Open-PR rule 3) never share a tree:
+    the round then has one tree per side, each pair built in a tree holding both of its sides, and
+    a SHA given names the tree it holds most of."""
+    if args.record and not args.sha:
+        raise Refused("--record needs the SHA of the tree that was built and tested")
+    if not args.no_fetch:
+        fetch(repo)
+    manifest, _ = store.load(fetch=False)
+    q = Queue(repo, manifest, gh)
+    by_label = {i.label: i for i in q.items}
+    trees = []  # [(pairs {ident: (item, [others])}, members, units, crate pairs)]
+
+    def clash(a, b):
+        return a is not b and bool((q.pair(a, b) or [[]])[0])
+
+    for row in q.plan(github=False)["rows"]:
+        if row["action"] not in ("open", "next-hour"):
+            continue
+        for s in row["build_with"]:
+            if s["built"] or s.get("excluded"):
+                continue
+            item, other = q.by_id[row["id"]], by_label[s["label"]]
+            tree = next((t for t in trees if not any(clash(m, x) for m in t[1] for x in (item, other))), None)
+            if tree is None:
+                tree = ({}, [], set(), set())
+                trees.append(tree)
+            pairs, members, units, crate_pairs = tree
+            pairs.setdefault(row["id"], (item, []))[1].append(other)
+            members.extend(m for m in (item, other) if m not in members)
+            units.update(s["units"])
+            if any(u.startswith("crates/") for u in s["units"]):
+                crate_pairs.add((row["id"], s["label"]))
+    if not trees:
+        print("nothing to build: every opening's merged tree is recorded (pr-queue plan)")
+        return
+    tips = {m.label: q.tip(m) for t in trees for m in t[1]}
+    missing = [label for label, tip in tips.items() if not tip]
+    if missing:
+        raise Refused(f"no branch tip for {', '.join(missing)}: fetch, or push it")
+    sha = rev(repo, args.sha) if args.sha else None
+    if args.sha and not sha:
+        raise Refused(f"{args.sha} is no commit here: build the tree in this clone, or fetch it")
+    if sha:
+        trees = [max(trees, key=lambda t: sum(is_ancestor(repo, tips[m.label], sha) for m in t[1]))]
+    for n, (pairs, members, units, crate_pairs) in enumerate(trees, 1):
+        lacking = [m.label for m in members if not (sha and is_ancestor(repo, tips[m.label], sha))]
+        if args.record:
+            record_tree(q, store, sha, pairs, crate_pairs, lacking, args.rust)
+            return
+        of = f" {n} of {len(trees)}" if len(trees) > 1 else ""
+        if n > 1:
+            print()
+        print(f"merged tree{of}: {len(members)} branches, {len(pairs)} opening(s); build and test "
+              f"{', '.join(sorted(units))}")
+        for m in members:
+            print(f"  {tips[m.label][:10]}  {m.label}" + ("" if m.label in lacking else "  (in the tree)"))
+        if not lacking:
+            print(f"{sha[:10]} holds them all: once built and tested there, pr-queue tree {sha[:10]} --record")
+            continue
+        if not sha:
+            print(f"git worktree add --detach DIR{n if of else ''} {q.main}")
+        print(f"git -C {('DIR' + (str(n) if of else '')) if not sha else '<the tree worktree>'} merge --no-edit "
+              + " ".join(tips[label] for label in lacking))
+        print("then build and test those units there, and pr-queue tree <the merged SHA> --record "
+              "(name the SHA: a shared worktree's HEAD can move)")
+    if len(trees) > 1:
+        print("\nthe trees differ by branches that conflict in code (an opening over a P2, shaping.md, Open-PR "
+              "rule 3): build and record each")
+
+
+def record_tree(q, store, sha, pairs, crate_pairs, lacking, rust):
+    if lacking:
+        raise Refused(f"{sha[:10]} lacks {', '.join(lacking)} at its current tip: merge, build and test, "
+                      "then record the new SHA")
+    # A pair sharing a crate needs cargo build and test, not bun alone: a tree checked with bun alone
+    # once recorded a pair as built whose Rust never compiled together.
+    skipped = sorted(crate_pairs) if not rust else []
+    records = {ident: [built_record(q, item, other, sha) for other in others
+                       if (ident, other.label) not in skipped]
+               for ident, (item, others) in pairs.items()}
+    records = {ident: rs for ident, rs in records.items() if rs}
+    lines = [f"{ident} with {', '.join(r['with'] for r in rs)}: recorded as built in {sha[:10]}"
+             for ident, rs in records.items()]
+    lines += [f"not recorded: {ident} with {label} share a crate; once cargo build and test passed in "
+              f"{sha[:10]} (where `build.*` in your config says Rust builds), pr-queue tree {sha[:10]} --record --rust"
+              for ident, label in skipped]
+    if records:
+        store_built(store, records, lines)
+    else:
+        print("\n".join(lines))
+
+
+# --- advance ----------------------------------------------------------------------------------------
+
+def rebase_own(wt, base, own):
+    """`git rebase --onto MAIN base` in `wt` with a todo of `own` alone: base..HEAD of a branch that
+    merged main also lists every main commit the merges brought in. Stops on a conflict like any
+    rebase, so `git rebase --continue` resumes it."""
+    keep = os.path.join(git_out(wt, "rev-parse", "--absolute-git-dir"), "pr-queue-own")
+    with open(keep, "w") as f:
+        f.write("\n".join(own) + "\n")
+    editor = (f"{shlex.quote(sys.executable)} -c {shlex.quote(TODO_FILTER)} {shlex.quote(keep)}")
+    return git(wt, "rebase", "-q", "-i", "--onto", MAIN, base,
+               env={**os.environ, "GIT_SEQUENCE_EDITOR": editor, "GIT_EDITOR": ":"})
+
+
+# GIT_SEQUENCE_EDITOR body: drop each `pick <sha>` whose commit is not listed in argv[1].
+TODO_FILTER = """import sys
+keep = open(sys.argv[1]).read().split()
+todo = open(sys.argv[2]).readlines()
+def wanted(line):
+    parts = line.split()
+    return not (parts and parts[0] in ("pick", "p")) or any(s.startswith(parts[1]) for s in keep)
+open(sys.argv[2], "w").writelines(l for l in todo if wanted(l))
+"""
+
+
+def fold_changelogs(wt, tips, bases):
+    """Run changelog-to-unreleased in `wt` and fold each rebuilt CHANGELOG into the newest own commit
+    that touches it (Cadence: the commit that owns the entry). `tips` and `bases` are the branch before
+    the rebase and the commit it sat on, oldest first: a rebase leaves no merge for the script to read
+    them from. Returns its report lines."""
+    args = [a for tip, base in zip(tips, bases) for a in ("--tip", tip, "--old-base", base)]
+    out = script("changelog-to-unreleased", *args, cwd=wt)
+    lines = [line for line in out.stdout.splitlines() if line.strip() and line != "nothing to place"]
+    changed = [p for p in git_out(wt, "diff", "--name-only").split() if p.endswith("CHANGELOG.md")]
+    if not changed:
+        return lines
+    for path in changed:
+        owner = git_out(wt, "log", "-1", "--format=%H", f"{MAIN}..HEAD", "--", path)
+        git_out(wt, "add", "--", path)
+        if owner:
+            git_out(wt, "commit", "-q", "--no-verify", f"--fixup={owner}")
+        else:
+            git_out(wt, "commit", "-q", "--no-verify", "-m", "docs: keep the CHANGELOG entries under [Unreleased]")
+    env = {**os.environ, "GIT_SEQUENCE_EDITOR": ":", "GIT_EDITOR": ":"}
+    p = git(wt, "rebase", "-q", "-i", "--autosquash", MAIN, env=env)
+    if p.returncode:
+        git(wt, "rebase", "--abort")
+        raise GitError("CHANGELOG fixup commits left unsquashed: fold them by hand: "
+                       + (p.stderr or p.stdout).strip()[:300])
+    return lines
+
+
+def cmd_advance(args, repo, store, gh):
+    if not args.no_fetch:
+        fetch(repo)
+    manifest, _ = store.load()
+    q = Queue(repo, manifest, gh)
+    named = set()
+    for key in args.keys:
+        entry = find_entry(manifest, key)
+        if not entry:
+            raise Refused(f"no entry {key}")
+        named.add(entry["id"])
+    # Queued entries by default; an open PR only by name, for the `rebase` plan gives a PR whose one
+    # break is a conflict with main: it is rebased in place and stays open.
+    targets = [i for i in q.items if (i.entry["id"] in named and i.state in ("queued", "open"))
+               or (not named and i.state == "queued")]
+    main = rev(repo, MAIN)
+    bases, failed = {}, 0
+
+    def apply(m, files):
+        for entry in m["entries"]:
+            if entry["id"] in bases:
+                entry.update(base=bases[entry["id"]], advanced=stamp(), updated=stamp())
+
+    # One entry's git error or refusal stops only that entry: the others still advance. The bases of the
+    # entries already advanced are stored in `finally`, whatever else stops the loop.
+    try:
+        for item in targets:
+            ident, branch = item.entry["id"], item.entry["branch"]
+            try:
+                unmet = [label for _, met, label in q.need_status(item) if not met]
+                if unmet:
+                    print(f"{ident}: waits on {', '.join(unmet)}")
+                    continue
+                base = q.base(item)
+                if not base:
+                    print(f"{ident}: its own commits are interleaved with others': "
+                          f"pr-queue set {ident} --base <sha>")
+                    failed += 1
+                    continue
+                tip = q.tip(item)
+                land = q.landing(item, whole=False)
+                misplaced = changelog_drift(tip, cwd=repo)
+                merged = q.merges(item)
+                # GitHub's CHANGELOG-only conflict (Queue.github) is no reason to push by itself: only an
+                # entry named here, as a needed push or an opening is about to go out, is rebased for it.
+                github = q.github(item, whole=False) if ident in named else []
+                keep_local_ahead = False
+                if (is_ancestor(repo, base, main) and not merged and not land.code and not misplaced
+                        and not github):
+                    # A newer local tip still goes through the worktree guards and the rebase,
+                    # CHANGELOG fold and message quieting below, before its one push.
+                    local = rev(repo, f"refs/heads/{branch}")
+                    keep_local_ahead = bool(local and local != tip and is_ancestor(repo, tip, local))
+                    if not keep_local_ahead:
+                        if item.entry.get("base") != base:
+                            bases[ident] = base
+                        print(f"{ident}: already on {MAIN}'s line and merges alone; nothing to do")
+                        continue
+                wt = ensure_worktree(repo, branch)
+                if in_rebase(wt):
+                    raise Refused(f"a rebase is in progress in {wt}: finish it (git rebase --continue), then rerun")
+                # A conflict an agent resolved by hand after the last `advance` leaves the worktree's
+                # branch on a newer main than the fork's copy: carry on from there, onto whatever main
+                # is now.
+                head = rev(wt, "HEAD")
+                resumed = head != tip and (git_out(wt, "merge-base", head, main)
+                                           != git_out(wt, "merge-base", tip, main))
+                if resumed and git_out(wt, "status", "--porcelain", "--untracked-files=no"):
+                    raise Refused(f"{wt} has uncommitted changes")
+                if not resumed:
+                    sync_worktree(wt, branch, keep_ahead=args.no_push or keep_local_ahead)
+                    ahead = rev(wt, "HEAD")
+                    if ahead != tip:
+                        # Local fix commits past the fork's tip: replay them too, and rebuild the
+                        # CHANGELOGs from them (a line the tip lacks counts as a union leftover).
+                        if merged:
+                            raise Refused(f"{branch} merged {MAIN} or a need, and {wt} has commits "
+                                          f"{STORE_REMOTE}/{branch} lacks: push them first")
+                        tip = ahead
+                old_fork = rev(repo, f"refs/remotes/{STORE_REMOTE}/{branch}")
+                # A base on main's line replays MAIN..HEAD: `--onto MAIN base` would also replay every main
+                # commit a past merge of main brought in (hundreds, conflicting on 2026-10-13). Off main's line
+                # (a need's old tip) with merges since, the todo keeps only its own commits.
+                on_main = is_ancestor(repo, base, main)
+                old_main = git_out(repo, "merge-base", tip, main) if on_main or merged else base
+                # A worktree an earlier `advance --no-push` or a hand-resolved conflict left past the
+                # fork's tip replays its own commits from its own main: the rebuild reads both, or the
+                # replay's old wording of a line main rewords since that main counts as ours (2026-10-29).
+                tips, bases_before = [tip], [old_main]
+                if resumed:
+                    tips.append(head)
+                    bases_before.append(git_out(wt, "merge-base", head, main))
+                if resumed or on_main:
+                    p = git(wt, "rebase", "-q", MAIN)
+                elif merged:
+                    p = rebase_own(wt, base, q.own(item))
+                else:
+                    p = git(wt, "rebase", "-q", "--onto", MAIN, base)
+                if p.returncode:
+                    conflicted = git_out(wt, "diff", "--name-only", "--diff-filter=U").split()
+                    if not conflicted:
+                        git(wt, "rebase", "--abort")
+                        print(f"{ident}: rebase failed: {(p.stderr or p.stdout).strip()[:300]}")
+                    else:
+                        print(f"{ident}: CONFLICT replaying its own commits onto {MAIN} in {wt}: "
+                              f"{', '.join(conflicted)}\n"
+                              f"  resolve there toward {MAIN}'s version of what its needs landed, `git add`, "
+                              f"`git rebase --continue`, then `pr-queue advance {ident}`")
+                    failed += 1
+                    continue
+                placed = fold_changelogs(wt, tips, bases_before)
+                # The replay gave its commits new SHAs, so their messages lose `#N` links now (quiet_refs).
+                quieted = quiet_replayed(wt, MAIN, (tip, old_fork))
+                if quieted:
+                    placed.append(f"{quieted} replayed commit message(s) name PRs as `PR N` now")
+                if not args.no_push:
+                    push(wt, branch, old_fork)
+                bases[ident] = main
+                own = len(git_out(wt, "rev-list", f"{main}..HEAD").split())
+                print(f"{ident}: {own} own commit(s) rebased onto {MAIN} {main[:10]}"
+                      + ("" if args.no_push else f", pushed to {STORE_REMOTE}"))
+                for line in placed:
+                    print(f"  {line}")
+            except (Refused, GitError) as e:
+                print(f"{ident}: {e}")
+                failed += 1
+    finally:
+        if bases:
+            store.update(apply, f"advance {' '.join(sorted(bases))}")
+    if failed:
+        sys.exit(1)
+
+
+# --- plan / audit -------------------------------------------------------------------------------------
+
+def render_plan(result):
+    if result["pause"]:
+        print(pause_line(result["pause"]))
+    b = result["budget"]
+    cap = (f"roboomp caps a {b['tier']} author at {b['cap']} an hour" if b.get("cap") is not None
+           else f"roboomp does not cap a {b.get('tier') or 'maintainer'} author")
+    print(f"Ready budget: {b['used']} of {b['limit']} events used in the last hour, {b['left']} left ({cap}).")
+    supervised = result.get("supervised_opens") or 0
+    if supervised:
+        print(f"Supervised start: the next {supervised} open(s) need your explicit OK first: show the body, the diff "
+              "summary and your own-words sentence, then `pr-queue open ID --user-approved` (autonomy.supervised_opens)")
+    waiting = [r for r in result["rows"] if r.get("awaiting_user")]
+    if waiting:
+        print("Awaiting your decision (P2 by design; `pr-queue approve ID` lets it open, autonomy.open_p2):")
+        for r in waiting:
+            print(f"  {r['id']}: {r['p2_decision']}")
+    areas = {}
+    for row in result["rows"]:
+        areas.setdefault(row["area"], []).append(row)
+    for area in sorted(areas):
+        rows = areas[area]
+        counts = {a: sum(1 for r in rows if r["action"] == a)
+                  for a in ("keep", "rebase", "open", "next-hour", "paused", "requeue", "close", "held", "wait")}
+        print(f"\n{area}: " + ", ".join(f"{a} {n}" for a, n in counts.items() if n))
+        for row in rows:
+            tags = [row["priority"] or "unranked"] + (["active"] if row["active"] else []) + (
+                [row["note"]] if row["note"] else [])
+            why = f"  <- {'; '.join(row['reasons'])}" if row["reasons"] else ""
+            print(f"  {action_label(row):<9} {row['label'][:24]:<24} {' '.join(tags):<18} {row['title'][:70]}{why}")
+            if row["build_with"]:
+                print(f"            {build_line(row['id'], row['build_with'])}")
+            for line in github_lines(row["github"], row["state"] == "open", row["id"]):
+                print(f"            {line}")
+    if result["drafts"]:
+        print("\nDrafts (shape still being decided; not planned):")
+        for d in result["drafts"]:
+            print(f"  {d['label']:<8} {d['area']:<9} {d['age_days']:>3}d  {d['title'][:80]}")
+    if result["stale"]:
+        print(f"\nManifest entries whose PR merged or closed: {', '.join(result['stale'])} (run sync)")
+
+
+def build_line(ident, steps):
+    """The plan's and open's step for the open ready PRs and openings sharing a crate or package with
+    entry `ident`: one merge of all those not yet recorded, built and tested, then one `built`. One
+    that conflicts with main itself is named as left out: its own rebase builds with the rest."""
+    todo = [s for s in steps if not s["built"] and not s.get("excluded")]
+    left_out = "".join(f"; not with {s['label']}: {s['excluded']}, so its own rebase builds with the rest"
+                       for s in steps if not s["built"] and s.get("excluded"))
+    if not todo:
+        done = [s["label"] for s in steps if s["built"]]
+        return (f"merged tree built and tested with {', '.join(done)}" if done else "nothing to build beside") + left_out
+    return ("build and test the merged tree with " + ", ".join(f"{s['label']} ({', '.join(s['units'])})" for s in todo)
+            + f", then pr-queue built {ident} " + " ".join(s["label"] for s in todo) + left_out)
+
+
+def github_lines(github, is_open, ident):
+    """What GitHub shows for a row that lands with no code conflict (Queue.github_rows): its merge
+    ignores merge=union, so a CHANGELOG both sides add lines to reads CONFLICTING there. No rule counts
+    it and it is no push of its own; the next needed push rebases onto main (Cadence)."""
+    out = []
+    if github["main"]:
+        then = (f"the next needed push rebases onto main (`pr-queue advance {ident} --no-push` with it)" if is_open
+                else f"`pr-queue advance {ident}` rebases it before opening")
+        out.append(f"GitHub: conflicting (CHANGELOG only: {', '.join(github['main'])}); {then}")
+    groups = {}
+    for label, paths in github["pairs"]:
+        groups.setdefault(tuple(paths), []).append(label)
+    for paths, labels in groups.items():
+        out.append(f"GitHub, once either merges: conflicting with {', '.join(labels)} "
+                   f"(CHANGELOG only: {', '.join(paths)})")
+    return out
+
+
+def cmd_plan(args, repo, store, gh):
+    if not args.no_fetch:
+        fetch(repo)
+    manifest, _ = store.load(fetch=False)
+    started = omp_queue_view.plan_stamp()
+    result = Queue(repo, manifest, gh).plan()
+    if args.json:
+        print(json.dumps(result, indent=1))
+    else:
+        render_plan(result)
+    save_plan(store, manifest, result, started)
+
+
+def save_plan(store, manifest, result, at):
+    """Cache `result`, a plan of the manifest and refs as of `at`, in the manifest's `plan` for
+    QUEUE.md (omp_queue_view), when it says something the cached one does not or that one is an hour
+    old; never over a plan started later (a live plan takes minutes). A host that cannot write the
+    queue still gets its plan: the failure is a warning."""
+    record = omp_queue_view.plan_record(result, at, socket.gethostname().split(".")[0])
+    if not omp_queue_view.plan_due(manifest.get("plan"), record):
+        return
+
+    def apply(m, files):
+        if omp_queue_view.started_no_earlier(record, m.get("plan")):
+            m["plan"] = record
+    try:
+        store.update(apply, "plan: cache for QUEUE.md")
+    except GitError as e:
+        print(f"warning: plan not cached for QUEUE.md: {e}", file=sys.stderr)
+
+
+def flag_text(kind, detail):
+    if kind == "merge-order":
+        return f"{FLAG_NAMES[kind]}: {detail[0][:110]}" + (f" (+{len(detail) - 1} more)" if len(detail) > 1 else "")
+    if kind == "carries":
+        return "carries commits of " + ", ".join(f"{label} ({n})" for label, n in detail)
+    if kind == "carries-main":
+        return f"carries {detail} commit(s) main already has under other SHAs"
+    if kind == "conflicts-main":
+        return "conflicts with main in " + ", ".join(detail)
+    if kind == "conflicts-pr":
+        return "conflicts with " + "; ".join(f"{label} in {', '.join(files)}" for label, files in detail)
+    if kind == "stale-draft":
+        return f"draft for {detail} days"
+    return f"{FLAG_NAMES[kind]}: {detail}"
+
+
+def cmd_audit(args, repo, store, gh):
+    if not args.no_fetch:
+        fetch(repo)
+    manifest, _ = store.load(fetch=False)
+    rows = Queue(repo, manifest, gh).audit()
+    if args.json:
+        print(json.dumps(rows, indent=1))
+        return
+    shown = [r for r in rows if r["flags"] or github_lines(r["github"], True, f"#{r['number']}")]
+    for r in shown:
+        state = "draft" if r["draft"] else "ready"
+        print(f"#{r['number']} {r['area']} {r['priority'] or 'unranked'} {state}  {r['title'][:80]}")
+        for kind, detail in r["flags"]:
+            print(f"  {flag_text(kind, detail)}")
+        for line in github_lines(r["github"], True, f"#{r['number']}"):
+            print(f"  {line}")
+    broken = [r for r in rows if r["flags"]]
+    counts = {k: sum(1 for r in rows if any(f[0] == k for f in r["flags"])) for k in FLAG_NAMES}
+    print(f"\n{len(broken)} of {len(rows)} open PRs break the rule: "
+          + ", ".join(f"{FLAG_NAMES[k]} {n}" for k, n in counts.items() if n))
+
+
+# --- watch --------------------------------------------------------------------------------------------
+
+def series_posts(path=None):
+    """Discussion numbers listed in `series-posts`: the first word of each line, `#` starting a comment."""
+    try:
+        with open(path or SERIES_POSTS) as f:
+            return [int(w[0]) for line in f for w in [line.split("#", 1)[0].split()] if w and w[0].isdigit()]
+    except FileNotFoundError:
+        return []
+
+
+def refresh_posts(repo, touched, posts):
+    """Run post-status for each post in `posts` with the PRs whose state `touched`: it does nothing for
+    a post whose block lists none of them, and writes only when the block changed. A failure is
+    printed and leaves the watch run successful: the record is already written."""
+    if not touched:
+        return
+    for number in posts:
+        p = subprocess.run([sys.executable, os.path.join(SCRIPTS, "post-status"), str(number), "--repo", repo,
+                            "--if-touched", ",".join(map(str, sorted(touched)))], capture_output=True, text=True)
+        for line in (p.stdout + p.stderr).splitlines():
+            print(f"post #{number}: {line}")
+
+
+# Below this many GraphQL points left, `watch` skips its run: it is background bookkeeping, and the
+# hour's last points belong to the agents' interactive calls (the budget ran out twice on 2026-10-18
+# and stalled every PR lane). The next timer run after the reset catches up; nothing is lost.
+WATCH_FLOOR = 1000
+
+
+def cmd_watch(args, repo, store, gh):
+    """`sync`, then what changed since the last run (omp_watch.observe), kept in the manifest's `watch`
+    record. It writes that record only when it changed or its heartbeat is due, and never opens,
+    advances, requeues, pushes a branch or comments. A run while an `open` holds the lock is skipped,
+    and so is one with under WATCH_FLOOR GraphQL points left. When a PR merged, closed, opened, turned
+    ready or shipped in a release, it refreshes the series posts listed in `series-posts`
+    (post-status); never with --manifest."""
+    left, reset = gh.budget()
+    if left is not None and left < WATCH_FLOOR:
+        print(f"GitHub GraphQL budget low ({left} points left, under {WATCH_FLOOR}; resets "
+              f"{reset:%H:%MZ}): skipping this run, the next one after the reset catches up")
+        return
+    manifest, _ = store.load()
+    lock = manifest.get("opening")
+    if lock and now() - omp_watch.parse(lock["at"]) < OPEN_LOCK:
+        # Said, not silent: two timer runs in a row skipped this way on 2026-10-20 left nothing in
+        # the journal to tell them from a run that never started.
+        print(f"skipping this run: `open` holds the queue lock ({lock.get('id')} on {lock.get('host')} since "
+              f"{lock['at']}); the next run catches up")
+        return
+    touched = cmd_sync(args, repo, store, gh)
+    manifest, _ = store.load(fetch=False)
+    prev, at = manifest.get("watch"), stamp()
+    q = Queue(repo, manifest, gh)
+    planned = omp_queue_view.plan_stamp()
+    plan = q.plan(github=False)
+    rows = [r for r in plan["rows"] if r["state"] == "queued"]
+    conflicts = {}
+    for item in q.ready_items():
+        land = q.landing(item, whole=True)
+        if land.code and q.tip(item):
+            conflicts[item.label] = {"title": item.title, "files": land.code}
+    through = (prev or {}).get("merged_through")
+    since = omp_watch.parse(through) if through else now() - datetime.timedelta(days=omp_watch.SEED_DAYS)
+    merges = gh.merged_since(since.date(), through or "")
+    commits = {int(n): m["merge_commit"] for n, m in (prev or {}).get("unreleased", {}).items()}
+    commits.update({m["number"]: m["merge_commit"] for m in merges})
+    # A record from before post-merge tracking: its first run asks for the last POST_MERGE_DAYS' merges.
+    seed = (gh.merged_since((now() - datetime.timedelta(days=omp_watch.POST_MERGE_DAYS)).date())
+            if prev is not None and "post_merge" not in prev else [])
+    candidates = omp_watch.post_merge_candidates(prev, merges + seed, at)
+    if (any(commits.values()) or candidates) and not args.no_fetch:
+        git(repo, "fetch", "-q", "--tags", "origin", "main")
+    cur = {"openable": {r["id"]: r["title"] for r in rows if r["action"] in omp_watch.OPENABLE},
+           "rows": {r["id"]: {"action": r["action"], "reasons": r["reasons"]} for r in rows},
+           "entries": {e["id"]: {"state": e["state"], "pr": e.get("pr")} for e in manifest["entries"]},
+           "conflicts": conflicts, "merges": merges,
+           "releases": {n: first_release(sha, cwd=repo) for n, sha in commits.items()},
+           "host": socket.gethostname().split(".")[0], "ready": [i.number for i in q.ready_items()]}
+    try:
+        found = gh.post_merge_open(candidates, cwd=repo) if candidates else {}
+        cur["post_merge"] = {m["number"]: {**m, "findings": found.get(m["number"], [])} for m in candidates}
+    except GitError as e:
+        print(f"post-merge findings not checked this run: {e}")
+        cur["post_merge_unchecked"] = candidates
+    record, events = omp_watch.observe(prev, cur, at)
+    when = now()
+    for e in events:
+        print(omp_watch.event_line(e, when))
+    # The same commit refreshes the plan QUEUE.md shows (save_plan's rule).
+    cached = omp_queue_view.plan_record(plan, planned, cur["host"])
+    fields = {"plan": cached} if omp_queue_view.plan_due(manifest.get("plan"), cached) else {}
+    if omp_watch.changed(prev, record) or omp_watch.heartbeat_due(prev, at):
+        fields["watch"] = record
+    if fields:
+        def apply(m, files):
+            m.update({k: v for k, v in fields.items()
+                      if k != "plan" or omp_queue_view.started_no_earlier(cached, m.get("plan"))})
+        store.update(apply, f"watch: {len(events)} event(s)" if events else "watch: checked" if "watch" in fields
+                     else "watch: plan cache for QUEUE.md")
+    print("\n".join(omp_watch.headline(record, when)))
+    if not args.manifest:
+        turned = set(cur["ready"]) ^ set((prev or {}).get("ready", []))
+        shipped = {e["number"] for e in events if e["kind"] == "released"}
+        refresh_posts(repo, touched | turned | shipped, series_posts())
+
+
+# --- open / requeue ---------------------------------------------------------------------------------
+
+def changelog_suffix(number):
+    return f" ([#{number}](https://github.com/{REPO}/pull/{number}) by [@{ME}](https://github.com/{ME}))"
+
+
+def link_changelogs(wt, base, number, title, closed=()):
+    """Append the PR link and credit to each CHANGELOG entry the branch adds without one (step 5), as
+    one `docs(<scope>):` commit; an entry linked to a PR this one reopens (`closed`, the entry's
+    `closed_prs`) is pointed at `number` instead. Returns the number of entries linked.
+    The branch's lines are those it adds since the later of `base` and its merge base with main:
+    #16556, rebased by hand onto a newer main with its recorded base left behind, diffed from that
+    base and got our credit on maintainers' issue-only entries in three packages (2026-10-20)."""
+    fork = git_out(wt, "merge-base", MAIN, "HEAD")
+    start = fork if fork and is_ancestor(wt, base, fork) else base
+    diff = git_out(wt, "diff", "-U0", "--no-color", "--no-ext-diff", "--no-renames", f"{start}..HEAD", "--",
+                   ":(glob)**/CHANGELOG.md")
+    numbers = "|".join(map(str, closed)) or r"(?!)"
+    stale = re.compile(rf"\[#({numbers})\]\(https://github\.com/{re.escape(REPO)}/pull/\1\)")
+    targets, path, n = {}, None, 0
+    for line in diff.splitlines():
+        if line.startswith("+++ "):
+            path = line[6:] if line.startswith("+++ b/") else None
+        elif line.startswith("@@ "):
+            n = int(re.match(r"@@ -\S+ \+(\d+)", line).group(1))
+        elif line.startswith("+"):
+            if path and line.startswith("+- ") and ("/pull/" not in line or stale.search(line)):
+                targets.setdefault(path, []).append((n, line[1:]))
+            n += 1
+    count = 0
+    for path, entries in targets.items():
+        full = os.path.join(wt, path)
+        text = read_file(full).split("\n")
+        for n, entry in entries:
+            if text[n - 1] == entry:
+                linked = stale.sub(f"[#{number}](https://github.com/{REPO}/pull/{number})", entry)
+                text[n - 1] = linked if linked != entry else entry.rstrip().removesuffix(".") + changelog_suffix(number)
+                count += 1
+        with open(full, "w") as f:
+            f.write("\n".join(text))
+        git_out(wt, "add", "--", path)
+    if count:
+        m = re.match(r"\w+(\([^)]*\))?", title or "")
+        scope = (m.group(1) or "") if m else ""
+        git_out(wt, "commit", "-q", "--no-verify", "-m", f"docs{scope}: link the CHANGELOG entries to PR {number}")
+    return count
+
+
+def open_problems(q, item, store, token):
+    """(problems, over): why `open` refuses `item`, and the open P2s plan opens it over (Open-PR rule
+    3), whose code conflicts with it are then no problem."""
+    entry = item.entry
+    problems = []
+    row = next(r for r in q.plan(github=False)["rows"] if r["id"] == entry["id"])
+    over = [q.by_number[int(label.lstrip("#"))] for label in row.get("over") or []]
+    for other in over:
+        if not find_entry(q.manifest, other.label):
+            problems.append(f"opens over {other.label}, which has no manifest entry to mark: pr-queue sync first")
+    if not entry.get("title"):
+        problems.append(f"no title: pr-queue set {entry['id']} --title '<conventional commit>'")
+    body = store.read(entry["body"], token) if entry.get("body") else None
+    if body is None:
+        problems.append(f"no body stored: pr-queue set {entry['id']} --body FILE")
+    for line in merge_order_lines(body, set(q.by_number)):
+        problems.append(f"merge-order line in the body: {line[:90]}")
+    unmet = [label for _, met, label in q.need_status(item) if not met]
+    if unmet:
+        problems.append("needs " + ", ".join(unmet))
+    base = q.base(item)
+    if not base or not is_ancestor(q.repo, base, q.main):
+        problems.append(f"its own commits are not on {MAIN} yet: pr-queue advance {entry['id']}")
+    land = q.landing(item, whole=False)
+    if land.code:
+        problems.append("conflicts with main in " + ", ".join(land.code))
+    for other in q.ready_items():
+        if not q.tip(other):
+            problems.append(f"cannot compare with open ready {other.label}: {STORE_REMOTE}/{other.entry['branch']} "
+                            "is missing locally; fetch first")
+            continue
+        hit = q.pair(item, other)
+        if hit and hit[0] and other not in over:
+            problems.append(f"conflicts with open ready {other.label} in {', '.join(hit[0])}")
+    problems += unbuilt(q, item)
+    if row["action"] != "open":
+        why = "; ".join(row["reasons"]) or "the hour's ready budget is spent"
+        problems.append(f"plan marks it {row['action']}: {why}")
+    branch = entry["branch"]
+    local, fork = rev(q.repo, f"refs/heads/{branch}"), rev(q.repo, f"refs/remotes/{STORE_REMOTE}/{branch}")
+    if not fork:
+        problems.append(f"{branch} is not on {STORE_REMOTE}")
+    elif local and local != fork:
+        problems.append(f"local {branch} differs from {STORE_REMOTE}/{branch}: push or reset it first")
+    return problems, over
+
+
+def unbuilt(q, item):
+    """[the build-and-test step] when an open ready PR shares a crate or package with `item` and their
+    merged tree has no `built` record for both sides' current code, else []."""
+    steps = q.build_steps(item, q.ready_items())
+    return [build_line(item.entry["id"], steps)] if any(not s["built"] and not s.get("excluded") for s in steps) else []
+
+
+def budget_left(q):
+    return q.ready_limit()[0] - q.gh.ready_events_since(now() - datetime.timedelta(hours=1))
+
+
+# One `open` at a time across hosts, held in the manifest: two opens checked against the same ready
+# set could each pass and ready a conflicting pair. A lock older than this is a crashed run's; the
+# opener re-takes it (by its own token) right before `gh pr ready`, so one that outlived its lock
+# stops there instead of readying.
+OPEN_LOCK = datetime.timedelta(minutes=20)
+
+
+def lock_open(store, ident, lease):
+    """Take the open lock for `lease` (a token unique to this run), or refresh it if still ours."""
+    def take(m, files):
+        lock = m.get("opening")
+        if fence and (lock or {}).get("token") != lease:
+            raise Refused("this run's open lock expired and another run took it")
+        if lock and lock.get("token") != lease:
+            at = datetime.datetime.fromisoformat(lock["at"].replace("Z", "+00:00"))
+            if now() - at < OPEN_LOCK:
+                raise Refused(f"another open is in progress: {lock['id']} on {lock['host']} since {lock['at']}. "
+                              "One opener opens a round (queue.md, Opening): a worker leaves its entry to it")
+        m["opening"] = {"id": ident, "token": lease, "host": socket.gethostname().split(".")[0], "at": stamp()}
+    fence = False
+    store.update(take, f"lock open {ident}")
+
+    def refresh():
+        nonlocal fence
+        fence = True
+        store.update(take, f"refresh open lock {ident}")
+    return refresh
+
+
+def unlock_open(store, lease):
+    def drop(m, files):
+        if (m.get("opening") or {}).get("token") == lease:
+            del m["opening"]
+    try:
+        store.update(drop, "unlock open")
+    except GitError as e:
+        print(f"warning: could not release the open lock ({e}); it expires after {OPEN_LOCK}", file=sys.stderr)
+
+
+def ready_problems(repo, store, gh, number):
+    """Re-check a draft just before it goes ready, against the open PRs as they are now."""
+    fetch(repo)
+    manifest, _ = store.load(fetch=False)
+    q = Queue(repo, manifest, gh)
+    item = q.by_number[number]
+    problems = [f"cannot compare with open ready {i.label}: its branch is missing" for i in q.ready_items()
+                if not q.tip(i)]
+    problems += [f"conflicts with open ready {label} in {', '.join(code)}"
+                 for label, code, _, accepted in q.conflicts_with_ready(item) if code and not accepted]
+    land = q.landing(item, whole=True)
+    if land.code:
+        problems.append("conflicts with main in " + ", ".join(land.code))
+    problems += unbuilt(q, item)
+    pause = opening_pause(manifest)
+    if pause:
+        problems.append(pause_line(pause))
+    if budget_left(q) <= 0:
+        _, tier, cap = q.ready_limit()
+        problems.append(f"the hour's ready budget ran out (roboomp skips a {tier} author's events past {cap} an hour): "
+                        "open it next hour")
+    return problems
+
+
+def cmd_open(args, repo, store, gh):
+    if not args.no_fetch:
+        fetch(repo)
+    manifest, token = store.load(fetch=False)
+    pause = opening_pause(manifest)
+    if pause:
+        raise Refused(f"not opening {args.key}: {pause_line(pause)}")
+    entry = find_entry(manifest, args.key)
+    if not entry:
+        raise Refused(f"no entry {args.key}")
+    if entry["state"] != "queued":
+        raise Refused(f"{entry['id']} is {entry['state']}, not queued")
+    if awaiting_user(entry):
+        raise Refused(f"{entry['id']} is held: {entry_hold(entry)}. It is P2 by design: only the user approves "
+                      f"putting that decision to the maintainer: pr-queue approve {entry['id']}")
+    if entry_hold(entry):
+        raise Refused(f"{entry['id']} is held: {entry['hold']}. Only whoever holds it lifts that: "
+                      f"pr-queue set {entry['id']} --unhold")
+    supervised = omp_config.load().supervised_opens
+    if supervised > 0 and not args.user_approved:
+        raise Refused(f"not opening {entry['id']}: supervised start, {supervised} open(s) left that need the user's "
+                      "explicit OK. Show them the body, the diff summary and their own-words sentence; once they "
+                      f"approve, pr-queue open {entry['id']} --user-approved")
+    lease = uuid.uuid4().hex
+    refresh = lock_open(store, entry["id"], lease)
+    try:
+        open_entry(args, repo, store, gh, entry["id"], refresh)
+    finally:
+        unlock_open(store, lease)
+
+
+def open_entry(args, repo, store, gh, ident, refresh):
+    manifest, token = store.load(fetch=False)
+    entry = find_entry(manifest, ident)
+    q = Queue(repo, manifest, gh)
+    item = q.by_id[ident]
+    problems, over = open_problems(q, item, store, token)
+    if problems:
+        raise Refused(f"not opening {ident}:\n  " + "\n  ".join(problems))
+    branch, ref = entry["branch"], f"refs/remotes/{STORE_REMOTE}/{entry['branch']}"
+
+    def record(**fields):
+        def apply(m, files):
+            find_entry(m, ident).update(fields, updated=stamp())
+        return apply
+
+    def opened(number):
+        """Mark it open as `number`, and each P2 it opens over (Open-PR rule 3) as the one that
+        rebases onto main once `number` merges: `rebases_after` on the P2's entry."""
+        def apply(m, files):
+            record(state="open", pr=number, opened=stamp())(m, files)
+            for other in over:
+                p2 = find_entry(m, other.label)
+                if p2 and number not in p2.setdefault("rebases_after", []):
+                    p2["rebases_after"].append(number)
+                    p2["updated"] = stamp()
+        return apply
+
+    with tempfile.NamedTemporaryFile("w", suffix=".md", prefix="pr-queue-body-") as body:
+        body.write(store.read(entry["body"], token))
+        body.flush()
+        check = script("precheck", "--ref", ref, "--body", body.name, "--title", entry["title"], "--no-siblings",
+                       cwd=repo)
+        print(check.stdout.rstrip())
+        if check.returncode:
+            raise Refused(f"precheck printed FIX lines: fix the branch or the body (pr-queue set {ident} "
+                          "--body FILE), then open again")
+        number = gh.create_draft(branch, entry["title"], body.name)
+        print(f"opened draft #{number} https://github.com/{REPO}/pull/{number}")
+        if omp_config.load().supervised_opens > 0:
+            left = omp_config.decrement_supervised()
+            print(f"supervised start: {left} supervised open(s) left" + ("; opens are autonomous from now" if not left
+                                                                          else ""))
+        try:
+            store.update(opened(number), f"open {ident} as PR {number}"
+                         + (f" over P2 {', '.join(o.label for o in over)}" if over else ""))
+            if over:
+                print(f"#{number} opens over P2 {', '.join(o.label for o in over)}: marked to rebase onto main "
+                      f"once #{number} merges; if one merges first, #{number} rebases (shaping.md, Open-PR rule 3)")
+            wt = ensure_worktree(repo, branch)
+            sync_worktree(wt, branch)
+            old = rev(repo, ref)
+            linked = link_changelogs(wt, q.base(item), number, entry["title"], entry.get("closed_prs", []))
+            if linked:
+                push(wt, branch, old)
+                print(f"linked {linked} CHANGELOG entr{'y' if linked == 1 else 'ies'} to #{number}")
+            check = script("precheck", "--ref", ref, "--body", body.name, "--title", entry["title"], "--number",
+                           str(number), "--no-siblings", cwd=repo)
+            print(check.stdout.rstrip())
+            if check.returncode:
+                raise Refused("precheck printed FIX lines; fix and push")
+            refresh()  # still ours, and fresh for the re-check below
+            late = ready_problems(repo, store, gh, number)
+            if late:
+                raise Refused("; ".join(late))
+            # Fence again: the re-check fetches and analyses, so it can take a while. What is left
+            # is one `gh pr ready`, bounded at 60 s, well inside a fresh lock.
+            refresh()
+        except (Refused, GitError) as e:
+            raise Refused(f"#{number} stays a draft: {e}.\n  If `pr-queue show {ident}` does not list #{number}, "
+                          f"record it: pr-queue set {ident} --state open --pr {number}. Finish workflow step 5 "
+                          f"by hand, then `gh pr ready {number} -R {REPO}`")
+        gh.ready(number)
+    store.update(record(readied=stamp()), f"ready PR {number}")
+    print(f"#{number} is ready for review: wait for the bots (workflow step 7)")
+
+
+def cmd_requeue(args, repo, store, gh):
+    number = int(args.number.lstrip("#"))
+    if not args.no_fetch:
+        fetch(repo)
+    manifest, _ = store.load(fetch=False)
+    prs = gh.open_prs()
+    if number not in prs:
+        raise Refused(f"#{number} is not an open PR of ours")
+    q = Queue(repo, manifest, gh, prs)
+    item = q.by_number[number]
+    needs = args.needs if args.needs is not None else q.inferred_needs(item)
+    check_needs(manifest, needs)
+    base = rev(repo, args.base) if args.base else q.base(item)
+    if not base:
+        raise Refused("its own commits are interleaved with other PRs' commits: pass --base")
+    try:
+        body = gh.body(number)
+    except GitError as e:
+        raise Refused(f"#{number} stays open, nothing closed: reading its body failed: {e}")
+    if not body.strip() and (prs[number].get("body") or "").strip():
+        raise Refused(f"#{number}: gh returned an empty body for a PR that has one; nothing closed, retry")
+
+    # 1. Store the entry and body, still open with the requeue pending, and confirm the write
+    #    (on the fork, the push) before anything changes upstream.
+    def store_pending(m, files):
+        entry = find_entry(m, f"#{number}")
+        if not entry:
+            entry = {**item.entry, "id": unique_id(m, item.entry["branch"]), "area": q.area(item),
+                     "priority": item.priority}
+            m["entries"].append(entry)
+        entry.update(state="open", pr=number, needs=needs, base=base, body=f"bodies/{entry['id']}.md",
+                     requeue=number, updated=stamp())
+        files[entry["body"]] = body
+        return entry
+    try:
+        entry = store.update(store_pending, f"requeue PR {number}: store its body")
+    except GitError as e:
+        raise Refused(f"#{number} stays open, nothing closed: storing its entry failed: {e}")
+    stored, token = store.load(fetch=False)
+    if store.read((find_entry(stored, entry["id"]) or {}).get("body") or "", token) != body:
+        raise Refused(f"#{number} stays open, nothing closed: its stored body does not read back")
+    # 2. Close.
+    try:
+        gh.close(number)
+    except GitError as e:
+        raise Refused(f"#{number} stays open: {e}. Its entry {entry['id']} is stored and still open; "
+                      f"rerun `pr-queue requeue {number}`")
+    # 3. Mark it queued. If this write fails, the next `sync` finishes it from the pending mark.
+    try:
+        entry = store.update(lambda m, f: finish_requeue(find_entry(m, entry["id"])), f"requeue PR {number}")
+    except GitError as e:
+        raise Refused(f"closed #{number}; its body and entry {entry['id']} are stored, but marking it queued "
+                      f"failed: {e}. `pr-queue sync` finishes it")
+    lines = merge_order_lines(body, set(prs))
+    print(f"closed #{number}; queued as {entry['id']}" + (f", needs {' '.join(needs)}" if needs else ""))
+    if lines:
+        print(f"  its stored body has {len(lines)} merge-order line(s): remove them before `pr-queue open`")
+
+
+def finish_requeue(entry):
+    """Queue an entry whose PR `requeue` closed (the PR number in its `requeue` mark). Its
+    `rebases_after` marks go with that PR: the reopened one is judged afresh."""
+    number = entry.pop("requeue")
+    entry.pop("rebases_after", None)
+    entry.update(state="queued", pr=None, closed_prs=entry.get("closed_prs", []) + [number], updated=stamp())
+    return entry
+
+
+def cmd_approve(args, repo, store, gh):
+    """The user's go-ahead for a P2-by-design entry's maintainer decision: lifts its P2 hold."""
+    def apply(m, files):
+        entry = find_entry(m, args.key)
+        if not entry:
+            raise Refused(f"no entry {args.key}")
+        if not entry.get("p2_decision"):
+            raise Refused(f"{entry['id']} carries no P2 decision to approve (pr-queue set {entry['id']} --p2-decision)")
+        entry["p2_approved"] = stamp()
+        entry["updated"] = stamp()
+        return entry
+    entry = store.update(apply, f"approve P2 decision of {args.key}")
+    rest = entry_hold(entry)
+    print(f"approved {entry['id']}'s decision: {entry['p2_decision']}"
+          + (f"; still held: {rest}" if rest else "; it opens when plan says so"))
+
+
+def cmd_pause(args, repo, store, gh):
+    reason = args.reason.strip()
+    if not reason:
+        raise Refused('pause takes a reason: pr-queue pause "WHO, DATE: REASON"')
+    store.update(lambda m, files: m.setdefault("config", {}).update(pause=reason), f"pause opening: {reason}")
+    print(pause_line(reason))
+
+
+def cmd_unpause(args, repo, store, gh):
+    def lift(m, files):
+        return m.setdefault("config", {}).pop("pause", None)
+    was = store.update(lift, "unpause opening")
+    print(f"opening resumed (was: {was})" if was else "opening was not paused")
+
+
+def main(argv, github=None):
+    parser = argparse.ArgumentParser(prog="pr-queue", usage=__doc__.split("\n\n", 2)[1].removeprefix("usage: "))
+    parser.add_argument("--repo", default=CHECKOUT)
+    parser.add_argument("--manifest", help="a local manifest file instead of the fork's queue branch")
+    sub = parser.add_subparsers(dest="command", required=True)
+    p = sub.add_parser("sync")
+    p.add_argument("--no-fetch", action="store_true")
+    p = sub.add_parser("add")
+    p.add_argument("branch")
+    p.add_argument("--title", required=True)
+    p.add_argument("--area")
+    p.add_argument("--priority")
+    p.add_argument("--needs", nargs="*")
+    p.add_argument("--body")
+    p.add_argument("--base")
+    p.add_argument("--id")
+    p.add_argument("--p2-decision")
+    p.add_argument("--no-push", action="store_true")
+    p = sub.add_parser("set")
+    p.add_argument("key")
+    for field in ("title", "area", "priority", "body", "base", "state", "note", "pr", "branch"):
+        p.add_argument(f"--{field}")
+    p.add_argument("--needs", nargs="*")
+    p.add_argument("--keep-old", action="store_true")
+    p.add_argument("--hold")
+    p.add_argument("--unhold", action="store_true")
+    p.add_argument("--p2-decision")
+    p.add_argument("--no-p2-decision", action="store_true")
+    p = sub.add_parser("approve")
+    p.add_argument("key")
+    p = sub.add_parser("built")
+    p.add_argument("key")
+    p.add_argument("others", nargs="+", metavar="with")
+    p.add_argument("--no-fetch", action="store_true")
+    p = sub.add_parser("tree")
+    p.add_argument("sha", nargs="?")
+    p.add_argument("--record", action="store_true")
+    p.add_argument("--rust", action="store_true")
+    p.add_argument("--no-fetch", action="store_true")
+    p = sub.add_parser("show")
+    p.add_argument("key", nargs="?")
+    p.add_argument("--json", action="store_true")
+    p = sub.add_parser("body-home")
+    p.add_argument("number")
+    p = sub.add_parser("advance")
+    p.add_argument("keys", nargs="*")
+    p.add_argument("--no-push", action="store_true")
+    p.add_argument("--no-fetch", action="store_true")
+    for name in ("plan", "audit"):
+        p = sub.add_parser(name)
+        p.add_argument("--json", action="store_true")
+        p.add_argument("--no-fetch", action="store_true")
+    p = sub.add_parser("open")
+    p.add_argument("key")
+    p.add_argument("--user-approved", action="store_true")
+    p.add_argument("--no-fetch", action="store_true")
+    p = sub.add_parser("pause")
+    p.add_argument("reason")
+    sub.add_parser("unpause")
+    p = sub.add_parser("requeue")
+    p.add_argument("number")
+    p.add_argument("--needs", nargs="*")
+    p.add_argument("--base")
+    p.add_argument("--no-fetch", action="store_true")
+    p = sub.add_parser("watch")
+    p.add_argument("--no-fetch", action="store_true")
+    args = parser.parse_args(argv)
+    repo = os.path.abspath(os.path.expanduser(args.repo))
+    store = Store(repo, os.path.abspath(args.manifest) if args.manifest else None)
+    gh = github or GitHub()
+    command = globals()[f"cmd_{args.command.replace('-', '_')}"]
+    try:
+        command(args, repo, store, gh)
+    except (Refused, GitError) as e:
+        print(e, file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

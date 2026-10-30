@@ -1,0 +1,12 @@
+{
+	"name": "omp-contrib",
+	"version": "0.1.0",
+	"description": "Contribute to oh-my-pi from your own omp sessions: find what went wrong, fix it, and open reviewed, bot-clean PRs",
+	"license": "MIT",
+	"private": true,
+	"keywords": ["omp-plugin"],
+	"omp": {
+		"name": "omp-contrib",
+		"extensions": ["./extensions/reviewer-family.ts"]
+	}
+}

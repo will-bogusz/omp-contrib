@@ -1,0 +1,31 @@
+#!/usr/bin/env bun
+/*
+usage: models-json decode CATALOG > PLAIN.json
+       models-json encode PLAIN.json CATALOG
+  Run in an oh-my-pi worktree. Since main's 6693ddbfd58 (2026-10-29) `packages/catalog/src/models.json`
+  is a compact encoded catalog, not `{provider: {id: model}}`: decode turns one (a path; `git show
+  REF:packages/catalog/src/models.json > f` for another commit's) into that plain JSON, encode writes
+  plain JSON back in main's format with the worktree's own `encodeModelCatalog`. decode then encode
+  reproduces the file byte for byte. For a generated-file conflict on a rebase, regenerate first
+  (`bun run gen:compat`, `bun run gen:models --provider <id>`); this is for replaying a PR's row
+  changes onto main's catalog when the generator cannot reach the provider.
+*/
+import * as path from "node:path";
+
+const [mode, from, to] = Bun.argv.slice(2);
+const format = path.resolve("packages/catalog/src/model-catalog-format.ts");
+if (!(await Bun.file(format).exists())) {
+	console.error(`no ${format}: run in an oh-my-pi worktree on a main that has the encoded catalog`);
+	process.exit(2);
+}
+const { encodeModelCatalog, getCatalogProvider, getCatalogProviders, openModelCatalog } = await import(format);
+if (mode === "decode" && from && !to) {
+	const catalog = openModelCatalog(await Bun.file(from).json());
+	const names: string[] = getCatalogProviders(catalog);
+	console.log(JSON.stringify(Object.fromEntries(names.map(name => [name, getCatalogProvider(catalog, name)]))));
+} else if (mode === "encode" && from && to) {
+	await Bun.write(to, encodeModelCatalog(await Bun.file(from).json()));
+} else {
+	console.error("usage: models-json decode CATALOG > PLAIN.json | models-json encode PLAIN.json CATALOG");
+	process.exit(2);
+}

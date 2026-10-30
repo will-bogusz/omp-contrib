@@ -1,0 +1,7 @@
+# Template. `pr-queue watch` reads the live list from `series-posts` beside your config file
+# (${XDG_CONFIG_HOME:-~/.config}/omp-contrib/series-posts; references/config.md), not this copy.
+# It lists discussions on the upstream repo whose series-status block `pr-queue watch` refreshes with
+# post-status after a sync sees one of the block's PRs merge, close, open, turn ready or ship.
+# One discussion number per line, first word; `#` starts a comment. references/queue.md, *Series posts*.
+# Add a discussion only after you approved its block and its automatic updates: each refresh edits a
+# public post.

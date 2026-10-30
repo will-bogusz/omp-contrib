@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+"""Run a command and report what its `gh` calls cost against your GitHub rate limits.
+
+usage: gh-cost [--json] -- COMMAND [ARG ...]
+
+Every `gh` the command starts runs with GH_DEBUG=api through a shim on PATH. Afterwards each GraphQL
+request is priced with `rateLimit(dryRun:true){cost}` (GitHub's own count, which a dry run does not
+spend), mutations at 1, and REST calls counted per resource; a 304 and an answer from `gh api
+--cache` (served in under 5 ms) cost nothing. Points are per query shape (operation name, else its
+first fields), so the expensive ones stand out. The dry runs are one GraphQL call per distinct
+query; repeated identical queries are priced once. GH_COST_KEEP=DIR keeps the debug logs.
+"""
+import collections
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+
+SHIM = """#!/bin/bash
+f=$(mktemp "$GHQ_DIR/req.XXXXXX")
+GH_DEBUG=api "$GHQ_REAL" "$@" 2>"$f"
+rc=$?
+[ $rc -ne 0 ] && grep -v '^[*<>]' "$f" | grep -v '^GraphQL ' >&2
+exit $rc
+"""
+
+
+def requests(text):
+    """[(kind, label, query, variables)] from one gh debug log: kind graphql, or the REST resource."""
+    out = []
+    for block in text.split("* Request to ")[1:]:
+        url = block.split("\n", 1)[0].strip()
+        resource = re.search(r"^< X-Ratelimit-Resource: (\S+)", block, re.M)
+        status = re.search(r"^< HTTP/\S+ (\d+)", block, re.M)
+        took = re.search(r"^\* Request took ([\d.]+)(µs|ms|s)$", block, re.M)
+        if took and (took.group(2) == "µs" or (took.group(2) == "ms" and float(took.group(1)) < 5)):
+            continue  # gh's own cache answered
+        if "GraphQL query:" in block:
+            query = block.split("GraphQL query:\n", 1)[1].split("\nGraphQL variables:", 1)[0]
+            vars_ = re.search(r"^GraphQL variables: (.*)$", block, re.M)
+            out.append(("graphql", shape(query), query, vars_.group(1) if vars_ else "{}"))
+        elif url.endswith("/graphql"):
+            raw = re.search(r"\n\n(\{.*?\n\})\n", block, re.S)
+            try:
+                body = json.loads(raw.group(1)) if raw else None
+            except ValueError:
+                body = None
+            query = body.get("query") if body else None
+            out.append(("graphql", shape(query) if query else "(body not logged)", query,
+                        json.dumps(body.get("variables") or {}) if body else None))
+        elif status and status.group(1) != "304":
+            method = re.search(r"^> (\w+) (\S+)", block, re.M)
+            label = f"{method.group(1)} {re.sub(r'/[0-9]+', '/N', method.group(2).split('?')[0])}" if method else url
+            out.append((resource.group(1) if resource else "rest", label, None, None))
+    return out
+
+
+def shape(query):
+    name = re.match(r"\s*(query|mutation)\s+(\w+)", query)
+    if name:
+        return f"{name.group(1)} {name.group(2)}"
+    flat = re.sub(r"\s+", "", query)
+    flat = re.sub(r'\([^()]*\)', "", flat)
+    return flat[:70]
+
+
+def with_dry_run(query):
+    """`query` with `rateLimit(dryRun:true){cost}` added to its operation's selection set (its own
+    rateLimit field dropped: the two would conflict)."""
+    query = re.sub(r"rateLimit\s*\{[^{}]*\}", "", query)
+    op = re.search(r"(^|\n)\s*(query|mutation)\b", query) if re.match(r"\s*fragment\b", query) else None
+    depth = 0
+    for i in range(op.start() if op else 0, len(query)):
+        ch = query[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch == "{" and depth == 0:
+            return query[:i + 1] + "rateLimit(dryRun:true){cost} " + query[i + 1:]
+    return None
+
+
+def price(real, query, variables, cache):
+    if query is None:
+        return None
+    if re.match(r"\s*mutation", query):
+        return 1
+    key = (query, variables)
+    if key not in cache:
+        dry = with_dry_run(query)
+        body = json.dumps({"query": dry, "variables": json.loads(variables or "{}")})
+        p = subprocess.run([real, "api", "graphql", "--input", "-"], input=body, capture_output=True, text=True)
+        try:
+            cache[key] = json.loads(p.stdout)["data"]["rateLimit"]["cost"]
+        except (ValueError, KeyError, TypeError):
+            cache[key] = None
+    return cache[key]
+
+
+def main(argv):
+    as_json = argv[:1] == ["--json"]
+    argv = argv[1:] if as_json else argv
+    if argv[:1] == ["--"]:
+        argv = argv[1:]
+    if not argv:
+        sys.exit(__doc__)
+    real = shutil.which("gh")
+    with tempfile.TemporaryDirectory(prefix="gh-cost-") as tmp:
+        logs = os.path.join(tmp, "logs")
+        os.mkdir(logs)
+        bindir = os.path.join(tmp, "bin")
+        os.mkdir(bindir)
+        shim = os.path.join(bindir, "gh")
+        with open(shim, "w") as f:
+            f.write(SHIM)
+        os.chmod(shim, os.stat(shim).st_mode | stat.S_IEXEC)
+        env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}", "GHQ_DIR": logs, "GHQ_REAL": real}
+        code = subprocess.run(argv, env=env).returncode
+        found = []
+        if os.environ.get("GH_COST_KEEP"):
+            shutil.copytree(logs, os.environ["GH_COST_KEEP"], dirs_exist_ok=True)
+        for name in sorted(os.listdir(logs)):
+            with open(os.path.join(logs, name), errors="replace") as f:
+                found += requests(f.read())
+    cache, rows = {}, collections.OrderedDict()
+    for kind, label, query, variables in found:
+        cost = price(real, query, variables, cache) if kind == "graphql" else 0
+        row = rows.setdefault((kind, label), {"kind": kind, "shape": label, "calls": 0, "points": 0, "unpriced": 0})
+        row["calls"] += 1
+        if cost is None:
+            row["unpriced"] += 1
+        else:
+            row["points"] += cost
+    total = {"graphql_points": sum(r["points"] for r in rows.values() if r["kind"] == "graphql"),
+             "graphql_calls": sum(r["calls"] for r in rows.values() if r["kind"] == "graphql"),
+             "rest_calls": sum(r["calls"] for r in rows.values() if r["kind"] != "graphql"), "exit": code}
+    if as_json:
+        print(json.dumps({"total": total, "rows": list(rows.values())}, indent=1), file=sys.stderr)
+    else:
+        print(f"\ngh-cost: {total['graphql_points']} GraphQL points in {total['graphql_calls']} calls, "
+              f"{total['rest_calls']} REST calls (exit {code})", file=sys.stderr)
+        for r in sorted(rows.values(), key=lambda r: (-r["points"], -r["calls"])):
+            extra = f" ({r['unpriced']} unpriced)" if r["unpriced"] else ""
+            print(f"  {r['kind']:<8} {r['calls']:>4} calls {r['points']:>5} pts  {r['shape']}{extra}", file=sys.stderr)
+    sys.exit(code)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

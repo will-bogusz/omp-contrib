@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+"""Refresh the series-status block of one of our GitHub discussion posts from GitHub and the queue.
+
+usage: post-status [--dry-run] [--body FILE] [--if-touched N,...] [--repo DIR] [--manifest FILE] DISCUSSION
+  DISCUSSION      the discussion's number on the upstream repo
+  --dry-run       print the new block and its diff; write nothing
+  --body FILE     read the post from FILE instead of GitHub (implies --dry-run)
+  --if-touched    do nothing unless the block lists one of these PRs (pr-queue watch passes the PRs
+                  its sync saw merge, close, open or turn ready)
+
+The block sits between `<!-- series-status prs=N,N,... -->` and `<!-- /series-status -->`. Inside
+it this rewrites the `**Merged M of N**` headline and, in the table's rows, the status cell and the
+row order; each row's other cells, rows without a PR number, and everything outside the markers
+stay byte for byte. `prs=` may also name a queue entry id for a PR not opened yet: its row's PR
+cell is `<!-- id -->` (renders empty, no link) and its status `queued, after #A` (its recorded
+needs not merged) or `queued`; once `pr-queue open` records its number the cell becomes `#N` and
+the row a PR's, while the marker keeps the id. A PR needing such an entry reads `after the queued PR`.
+The headline names the release once merged PRs ship (pr-trace's first release:
+the earliest `v*` tag holding the merge commit, tags fetched when one is not found):
+  in omp X.Y.Z    every merged PR ships in that one release
+  R of M released (omp X.Y.Z)
+                  R of the M merged PRs have shipped, X.Y.Z the latest release among them
+and nothing while none has. A row's status, keyed by its PR:
+  merged <Mon D>  its merge date (UTC)
+  in review       open and ready, with no needs left unmerged
+  in review, after #A
+                  open and ready, with needs not merged yet (same source as a draft's needs below)
+  after #A, #B    a draft, with the needs not merged yet (the queue entry's recorded needs, else the
+                  body's Builds-on line)
+  up next         a draft whose needs have all merged
+  closed          closed without merging
+Rows run merged (by merge time), in review, waiting (after / up next / in review, after), closed; within each group
+they keep the order as written. Rows without a PR keep their places.
+
+It writes (GraphQL updateDiscussion) only when the block changed beyond its `updated` date, then
+reads the post back and checks everything outside the markers is unchanged. It refuses, writing
+nothing, when the markers are missing or repeated, the table's PRs differ from the marker's list,
+or the post changed between its read and the write. Reference: references/queue.md, *Series posts*.
+"""
+import argparse
+import datetime
+import difflib
+import json
+import os
+import re
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from omp_pr import CHECKOUT, REPO, first_release, run  # noqa: E402
+from omp_queue import GitError, GitHub as QueueGitHub, Store, depends_refs, find_entry  # noqa: E402
+
+OPEN = re.compile(r"<!-- series-status prs=([0-9a-z][0-9a-z, ._-]*) -->")
+QUEUED_CELL = re.compile(r"<!-- ([a-z0-9][a-z0-9._-]*) -->")
+CLOSE = "<!-- /series-status -->"
+HEADLINE = re.compile(r"\*\*Merged \d+ of \d+\*\*")
+UPDATED = re.compile(r" · updated ([A-Z][a-z]{2} \d{1,2})$")
+ROW = re.compile(r"\|\s*([^|]*?)\s*\|\s*([^|]*?)\s*\|(.*)")
+GROUPS = ("merged", "review", "waiting", "closed")
+
+
+class Refused(Exception):
+    pass
+
+
+def day(at):
+    """`Oct 18` for an ISO time or a date, in UTC."""
+    if isinstance(at, str):
+        at = datetime.datetime.fromisoformat(at.replace("Z", "+00:00")).astimezone(datetime.timezone.utc)
+    return f"{at:%b} {at.day}"
+
+
+def split(body):
+    """(before, block lines, after): the body around the markers, the marker lines themselves in
+    `before` and `after`. Lines keep their endings (posts edited on GitHub use CRLF)."""
+    lines = body.splitlines(keepends=True)
+    bare = [line.rstrip("\r\n") for line in lines]
+    opens = [i for i, line in enumerate(bare) if "series-status prs=" in line]
+    closes = [i for i, line in enumerate(bare) if "/series-status" in line]
+    if len(opens) != 1 or len(closes) != 1:
+        raise Refused(f"expected one `<!-- series-status prs=… -->` and one `{CLOSE}` line, "
+                      f"found {len(opens)} and {len(closes)}")
+    start, end = opens[0], closes[0]
+    if not OPEN.fullmatch(bare[start]) or bare[end] != CLOSE or end < start:
+        raise Refused(f"malformed markers: {bare[start]!r} … {bare[end]!r}")
+    return "".join(lines[:start + 1]), lines[start + 1:end], "".join(lines[end:])
+
+
+def listed(body):
+    """What the block's opening marker lists: PR numbers (int) and queue entry ids (str)."""
+    before, _, _ = split(body)
+    line = before.splitlines()[-1]
+    return [int(k) if k.isdigit() else k for k in re.findall(r"[^, ]+", OPEN.fullmatch(line).group(1))]
+
+
+def resolve(keys, manifest):
+    """{key: row key}: a PR number stays itself; a queue entry id becomes its PR number once
+    `pr-queue open` recorded one, else stays the id (a PR not opened yet)."""
+    out = {}
+    for k in keys:
+        if isinstance(k, int):
+            out[k] = k
+            continue
+        entry = find_entry(manifest, k)
+        if not entry:
+            raise Refused(f"prs= lists {k}, which is neither a PR number nor a queue entry")
+        out[k] = entry["pr"] if entry.get("pr") else k
+    return out
+
+
+def parse_block(lines):
+    """(headline index, table rows [(index, status, pr or None, rest)]) of the block's lines."""
+    bare = [line.rstrip("\r\n") for line in lines]
+    heads = [i for i, line in enumerate(bare) if HEADLINE.match(line)]
+    if len(heads) != 1:
+        raise Refused(f"expected one `**Merged M of N**` headline in the block, found {len(heads)}")
+    table = [i for i, line in enumerate(bare) if line.startswith("|")]
+    if len(table) < 2 or table != list(range(table[0], table[0] + len(table))):
+        raise Refused("expected one table (header, separator, rows) in the block")
+    rows = []
+    for i in table[2:]:
+        m = ROW.fullmatch(bare[i])
+        if not m:
+            raise Refused(f"table row without status and PR cells: {bare[i]!r}")
+        status, cell, rest = m.groups()
+        queued = QUEUED_CELL.fullmatch(cell)
+        if cell and not (re.fullmatch(r"#\d+", cell) or queued):
+            raise Refused(f"PR cell is not `#N`, `<!-- entry id -->` or empty: {bare[i]!r}")
+        rows.append((i, status, queued.group(1) if queued else int(cell[1:]) if cell else None, rest))
+    return heads[0], rows
+
+
+def needs_of(number, pr, manifest, entry=None):
+    """What draft `number` (or the queued `entry`, which has no PR) waits on: (#N numbers, entry ids
+    without a PR) from its queue entry's recorded needs, else its body's Builds-on line."""
+    entry = entry or next((e for e in manifest.get("entries", []) if e.get("pr") == number), None)
+    if entry and entry.get("needs"):
+        numbers, ids = [], []
+        for need in entry["needs"]:
+            dep = find_entry(manifest, need)
+            if need.startswith("#") and need[1:].isdigit():
+                numbers.append(int(need[1:]))
+            elif dep and dep.get("pr"):
+                numbers.append(dep["pr"])
+            elif not dep or dep.get("state") != "merged":
+                ids.append(need)
+        return numbers, ids
+    return [n for line in (pr.get("body") or "").splitlines() for n in depends_refs(line)], []
+
+
+def statuses(numbers, prs, manifest, states):
+    """{key: (group, status text, sort key)} from GitHub's `prs` {number: {state, isDraft, mergedAt,
+    body}}, the queue `manifest`, and `states` {number: GitHub state} of every need. A str key is a
+    queue entry with no PR yet: `queued, after #A` (or `queued`), counted as waiting; a PR that needs
+    one of those listed here says `after the queued PR`."""
+    out, here = {}, {k for k in numbers if isinstance(k, str)}
+    label = lambda ids: ["the queued PR" if i in here else i for i in ids]  # noqa: E731
+    for n in numbers:
+        if isinstance(n, str):
+            needs, ids = needs_of(None, {}, manifest, find_entry(manifest, n))
+            waiting = [f"#{d}" for d in dict.fromkeys(needs) if states.get(d) != "MERGED"] + label(ids)
+            out[n] = ("waiting", f"queued, after {', '.join(waiting)}" if waiting else "queued", "")
+            continue
+        pr = prs.get(n)
+        if not pr:
+            raise Refused(f"#{n} is not a pull request on {REPO}")
+        if pr["state"] == "MERGED":
+            out[n] = ("merged", f"merged {day(pr['mergedAt'])}", pr["mergedAt"])
+        elif pr["state"] == "CLOSED":
+            out[n] = ("closed", "closed", "")
+        else:
+            needs, ids = needs_of(n, pr, manifest)
+            waiting = [f"#{d}" for d in dict.fromkeys(needs) if states.get(d) != "MERGED"] + label(ids)
+            if waiting and not pr["isDraft"]:
+                out[n] = ("waiting", f"in review, after {', '.join(waiting)}", "")
+            elif pr["isDraft"]:
+                out[n] = ("waiting", f"after {', '.join(waiting)}" if waiting else "up next", "")
+            else:
+                out[n] = ("review", "in review", "")
+    return out
+
+
+def version(tag):
+    """`v18.12.2` as (18, 12, 2), for picking the latest release."""
+    return tuple(int(n) for n in re.findall(r"\d+", tag))
+
+
+def shipped(status, releases):
+    """The headline's release part for the merged PRs in `status`, `releases` {number: first `v*`
+    tag, or "unreleased"/None}; None while none has shipped."""
+    merged = [n for n, s in status.items() if s[0] == "merged"]
+    tags = [t for n in merged if (t := releases.get(n)) and t.startswith("v")]
+    if not tags:
+        return None
+    latest = f"omp {max(tags, key=version).removeprefix('v')}"
+    if len(tags) == len(merged) and len(set(tags)) == 1:
+        return f"in {latest}"
+    return f"{len(tags)} of {len(merged)} released ({latest})"
+
+
+def headline(status, today, releases=None):
+    counts = {g: sum(1 for s in status.values() if s[0] == g) for g in GROUPS}
+    merged, total = counts["merged"], len(status)
+    parts = [f"**Merged {merged} of {total}** `{'■' * merged}{'□' * (total - merged)}`"]
+    release = shipped(status, releases or {})
+    if release:
+        parts.append(release)
+    if counts["review"]:
+        parts.append(f"{counts['review']} in review")
+    if counts["waiting"]:
+        parts.append(f"{counts['waiting']} waiting {'its' if counts['waiting'] == 1 else 'their'} turn")
+    if counts["closed"]:
+        parts.append(f"{counts['closed']} closed")
+    return " · ".join(parts + [f"updated {today}"])
+
+
+def rebuild(block, numbers, status, today, releases=None, keys=None):
+    """The block's lines with the headline and the PR rows rebuilt from `status` and `releases`
+    (shipped); `today` is the `updated` date; `keys` (resolve) maps a `<!-- id -->` cell to its row
+    key, so an entry that opened gets `#N`. Line endings follow the line each replaces."""
+    head, rows = parse_block(block)
+    keys = keys or {}
+    pr_rows = [(i, s, keys.get(c, c) if isinstance(c, str) else c, rest) for i, s, c, rest in rows if c is not None]
+    seen = [r[2] for r in pr_rows]
+    names = lambda ks: sorted(map(str, ks))  # noqa: E731  (ints and entry ids mixed)
+    if names(seen) != names(set(numbers)) or len(seen) != len(set(seen)):
+        raise Refused(f"the table's PRs {names(seen)} differ from the marker's prs= {names(set(numbers))}")
+    order = {n: i for i, n in enumerate(seen)}
+    ranked = sorted(pr_rows, key=lambda r: (GROUPS.index(status[r[2]][0]), status[r[2]][2], order[r[2]]))
+    out = list(block)
+
+    def put(i, text):
+        line = block[i]
+        out[i] = text + line[len(line.rstrip("\r\n")):]
+
+    put(head, headline(status, today, releases))
+    for (slot, *_), (_, _, n, rest) in zip(pr_rows, ranked):
+        put(slot, f"| {status[n][1]} | {f'<!-- {n} -->' if isinstance(n, str) else f'#{n}'} |{rest}")
+    return out
+
+
+def stamp_of(block):
+    head, _ = parse_block(block)
+    m = UPDATED.search(block[head].rstrip("\r\n"))
+    return m.group(1) if m else None
+
+
+def refresh(body, prs, manifest, states, today, releases=None):
+    """(new body, changed): `changed` is False when the block differs at most in its `updated` date,
+    and then the body comes back unchanged."""
+    before, block, after = split(body)
+    keys = resolve(listed(body), manifest)
+    numbers = list(keys.values())
+    status = statuses(numbers, prs, manifest, states)
+    old_day = stamp_of(block)
+    if old_day and rebuild(block, numbers, status, old_day, releases, keys) == block:
+        return body, False
+    return before + "".join(rebuild(block, numbers, status, today, releases, keys)) + after, True
+
+
+def releases_of(prs, repo):
+    """{number: first `v*` tag, "unreleased" or None} of each merged PR in `prs` with a merge commit
+    (omp_pr.first_release); tags and main are fetched once when one is not found."""
+    commits = {n: sha for n, p in prs.items()
+               if p["state"] == "MERGED" and (sha := (p.get("mergeCommit") or {}).get("oid"))}
+    found = {n: first_release(sha, cwd=repo) for n, sha in commits.items()}
+    if any(tag in (None, "unreleased") for tag in found.values()):
+        run("git", "fetch", "-q", "--tags", "origin", "main", cwd=repo)
+        found = {n: first_release(sha, cwd=repo) for n, sha in commits.items()}
+    return found
+
+
+class GitHub(QueueGitHub):
+    """The discussion and PR reads and the one write post-status makes, through `gh`. Tests
+    substitute a fake."""
+
+    def discussion(self, number):
+        q = f'query{{repository(owner:"{self.owner}",name:"{self.name}"){{discussion(number:{int(number)}){{id body}}}}}}'
+        d = self._graphql(q)["repository"]["discussion"]
+        if not d:
+            raise Refused(f"no discussion #{number} on {REPO}")
+        return d
+
+    def prs(self, numbers, body):
+        fields = "number state isDraft mergedAt mergeCommit{oid}" + (" body" if body else "")
+        rows = self._batch(numbers, f"... on PullRequest{{{fields}}} ... on Issue{{number}}", 25)
+        return {n: r for n, r in rows.items() if "state" in r}
+
+    def states(self, numbers):
+        return {n: r["state"] for n, r in self.prs(numbers, False).items()}
+
+    def update(self, ident, body):
+        query = "mutation($id:ID!,$body:String!){updateDiscussion(input:{discussionId:$id,body:$body}){discussion{id}}}"
+        p = subprocess.run(["gh", "api", "graphql", "--input", "-"], capture_output=True, text=True,
+                           input=json.dumps({"query": query, "variables": {"id": ident, "body": body}}))
+        if p.returncode or '"errors"' in p.stdout:
+            raise GitError(f"updateDiscussion: {(p.stderr or p.stdout).strip()[:300]}")
+
+
+def block_text(body):
+    return "".join(split(body)[1]).replace("\r\n", "\n")
+
+
+def main(argv, github=None, today=None):
+    parser = argparse.ArgumentParser(prog="post-status", usage=__doc__.split("\n\n", 2)[1].removeprefix("usage: "))
+    parser.add_argument("discussion", type=int)
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--body")
+    parser.add_argument("--if-touched", default="")
+    parser.add_argument("--repo", default=CHECKOUT)
+    parser.add_argument("--manifest")
+    args = parser.parse_args(argv)
+    gh = github or GitHub()
+    today = today or day(datetime.datetime.now(datetime.timezone.utc))
+    try:
+        if args.body:
+            with open(args.body, newline="") as f:
+                post = {"id": None, "body": f.read()}
+        else:
+            post = gh.discussion(args.discussion)
+        numbers = listed(post["body"])
+        touched = {int(n) for n in re.findall(r"\d+", args.if_touched)}
+        if args.if_touched and all(isinstance(k, int) for k in numbers) and not touched & set(numbers):
+            return 0
+        repo = os.path.abspath(os.path.expanduser(args.repo))
+        manifest, _ = Store(repo, os.path.abspath(args.manifest) if args.manifest else None).load()
+        keys = resolve(numbers, manifest)
+        numbers = [k for k in keys.values() if isinstance(k, int)]
+        queued = [find_entry(manifest, k) for k in keys.values() if isinstance(k, str)]
+        queued_needs = {d for e in queued for d in needs_of(None, {}, manifest, e)[0]}
+        if args.if_touched and not touched & (set(numbers) | queued_needs):
+            return 0
+        prs = gh.prs(numbers, True)
+        needs = {d for n in numbers if prs.get(n, {}).get("state") == "OPEN"
+                 for d in needs_of(n, prs[n], manifest)[0]} | queued_needs
+        states = {n: p["state"] for n, p in prs.items()}
+        states.update(gh.states(needs - set(states)) if needs - set(states) else {})
+        new, changed = refresh(post["body"], prs, manifest, states, today, releases_of(prs, repo))
+        label = f"discussion #{args.discussion}"
+        if args.dry_run or args.body:
+            print("".join(split(new)[1]).replace("\r\n", "\n"), end="")
+            diff = difflib.unified_diff(block_text(post["body"]).splitlines(), block_text(new).splitlines(),
+                                        "block now", "block rebuilt", lineterm="")
+            print("\n" + ("\n".join(diff) if changed else f"(no change: {label} stays as it is)"))
+            return 0
+        if not changed:
+            print(f"{label}: series status unchanged")
+            return 0
+        if gh.discussion(args.discussion)["body"] != post["body"]:
+            raise Refused(f"{label} changed while its status was rebuilt; nothing written, rerun")
+        gh.update(post["id"], new)
+        back = gh.discussion(args.discussion)["body"]
+        b0, _, a0 = split(post["body"])
+        b1, block1, a1 = split(back)
+        if (b1, a1) != (b0, a0) or "".join(block1) != "".join(split(new)[1]):
+            print(f"{label}: WRITTEN, but the read-back differs outside the block or in it; check the post",
+                  file=sys.stderr)
+            return 2
+        print(f"{label}: series status updated\n" + "\n".join(
+            difflib.unified_diff(block_text(post["body"]).splitlines(), block_text(new).splitlines(),
+                                 "before", "after", lineterm="")))
+        return 0
+    except (Refused, GitError) as e:
+        print(f"post-status: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

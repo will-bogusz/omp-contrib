@@ -1,0 +1,66 @@
+# omp-contrib: the Rust checks of `scripts/rust-check`, run on GitHub Actions on your fork by
+# `scripts/rust-check --ci`. You never commit this file: rust-check pushes a temporary branch
+# `omp-contrib-ci/<id>` holding the PR head plus one commit that adds this workflow (and drops the
+# repository's own workflows, on that branch only, so upstream CI does not run on it), waits for
+# the run, judges the uploaded cargo output against the branch's diff locally, records the result
+# for the PR head, and deletes the branch.
+#
+# The jobs only collect cargo's output; they pass even when clippy or rustfmt finds something.
+# Judging (which diagnostics fall on the branch's lines) happens in rust-check, as for a local run.
+name: omp-contrib rust-check
+on:
+  push:
+    branches: ["omp-contrib-ci/**"]
+permissions:
+  contents: read
+jobs:
+  rust-check:
+    name: rust-check ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux, macos, windows] # rust-check --ci rewrites this line to the platforms asked for
+    runs-on: ${{ fromJSON('{"linux":"ubuntu-24.04","macos":"macos-15","windows":"windows-2025"}')[matrix.platform] }}
+    timeout-minutes: 75
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: System libraries (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends pkg-config cmake clang libclang-dev \
+            libpipewire-0.3-dev libspa-0.2-dev libgbm-dev libdrm-dev libwayland-dev libxkbcommon-dev
+      - name: Toolchain (rust-toolchain.toml)
+        shell: bash
+        run: |
+          rustup toolchain install --profile minimal
+          rustup component add rustfmt clippy
+          rustup show active-toolchain
+      - name: cargo fmt and cargo clippy
+        shell: bash
+        run: |
+          set +e
+          out="$RUNNER_TEMP/rust-check"
+          mkdir -p "$out"
+          git rev-parse HEAD^ > "$out/head"
+          echo "$GITHUB_WORKSPACE" > "$out/root"
+          rustup show active-toolchain > "$out/toolchain"
+          cargo fmt --all -- --check --files-with-diff > "$out/fmt.out" 2> "$out/fmt.err"
+          echo $? > "$out/fmt.code"
+          # Same command as rust-check's clippy_command(windows=False); tests keep them in step.
+          cargo clippy --workspace --exclude brush-core --exclude brush-parser --exclude cfg_aliases --exclude napi --all-targets --no-deps --message-format=json > "$out/clippy.out" 2> "$out/clippy.err"
+          echo $? > "$out/clippy.code"
+          tail -c 3000 "$out/clippy.err"
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rust-check-${{ matrix.platform }}
+          path: ${{ runner.temp }}/rust-check
+          retention-days: 3
+          if-no-files-found: error

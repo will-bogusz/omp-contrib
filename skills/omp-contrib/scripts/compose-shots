@@ -1,0 +1,71 @@
+#!/bin/sh
+# Build labeled before/after composites for an OMP PR body from window captures.
+#
+#   compose-shots side  <before.png> <after.png> "<before label>" "<after label>" <out.png>
+#   compose-shots stack <before.png> <after.png> "<before label>" "<after label>" <out.png> [crop...]
+#
+# side:  full-window surfaces (model browser, `omp models` table). Joined left to
+#        right, then resized to 3200 px wide so GitHub renders both halves legibly.
+# stack: one row or panel. Each crop is a magick geometry (WxH+X+Y) applied to both
+#        inputs in order and appended under that input's label, so a list row and a
+#        detail footer from far apart in the window become one tight panel.
+#        With no crop the whole capture is used.
+#
+# Labels are dark caption bars in the terminal's background colour. State the claim
+# and its number in each ("main: 130 rows, one per effort tier").
+set -eu
+
+FONT=${COMPOSE_FONT:-/System/Library/Fonts/Supplemental/Arial Bold.ttf}
+BG='#1e1e24'
+FG='#e6e6e6'
+
+usage() {
+	sed -n '2,15p' "$0" >&2
+	exit 2
+}
+
+[ $# -ge 6 ] || usage
+mode=$1 before=$2 after=$3 lbefore=$4 lafter=$5 out=$6
+shift 6
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/compose-shots.XXXXXX")
+trap 'rm -rf "$tmp"' EXIT
+
+# label <in> <text> <out> <pointsize>: splice a caption bar above the image.
+label() {
+	magick "$1" -gravity North -background "$BG" -fill "$FG" -font "$FONT" -pointsize "$4" \
+		-splice 0x$(( $4 + 36 )) -annotate +0+$(( ($4 - 8) / 2 )) "$2" "$3"
+}
+
+# panel <in> <text> <out>: label, then append each crop region beneath it.
+panel() {
+	if [ $# -gt 3 ]; then
+		src=$1 text=$2 dest=$3
+		shift 3
+		i=0
+		for geom in "$@"; do
+			magick "$src" -crop "$geom" +repage "$tmp/crop-$i.png"
+			i=$((i + 1))
+		done
+		magick "$tmp"/crop-*.png -append "$tmp/joined.png"
+		rm -f "$tmp"/crop-*.png
+		label "$tmp/joined.png" "$text" "$dest" 44
+	else
+		label "$1" "$2" "$3" 44
+	fi
+}
+
+case $mode in
+side)
+	label "$before" "$lbefore" "$tmp/b.png" 44
+	label "$after" "$lafter" "$tmp/a.png" 44
+	magick "$tmp/b.png" "$tmp/a.png" +append -resize 3200x "$out"
+	;;
+stack)
+	panel "$before" "$lbefore" "$tmp/b.png" "$@"
+	panel "$after" "$lafter" "$tmp/a.png" "$@"
+	magick "$tmp/b.png" "$tmp/a.png" -append "$out"
+	;;
+*) usage ;;
+esac
+
+magick identify -format '%f %wx%h %b\n' "$out"

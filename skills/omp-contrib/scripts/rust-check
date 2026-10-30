@@ -1,0 +1,568 @@
+#!/usr/bin/env python3
+"""Run the Rust checks CI runs only after the merge, for the branch in the worktree you run it in, on
+this host's platform or on GitHub Actions on your fork, and record that they passed: precheck asks
+for one record per platform the branch's Rust builds differently on (FIX), and `pr-queue open`
+refuses without them.
+
+usage: rust-check [--windows] [--ci [--platform linux|macos|windows|all] [--timeout M]] [--base REF] [--manifest FILE] [--no-record] [--import]
+  --windows    check the Windows build (x86_64-pc-windows-msvc) here through cargo-xwin
+  --ci         run the checks on GitHub Actions on your fork instead of here (see CI below)
+  --platform   with --ci: the platforms to check; default: those the branch's Rust needs whose
+               placement (`build.<platform>` in the config) is "ci", else all it needs
+  --timeout M  with --ci: minutes to wait for the run before cancelling it (default 90)
+  --base REF   diff against REF instead of the branch's merge base with origin/main
+  --manifest   record in a local manifest file instead of the fork's omp-queue branch (tests)
+  --no-record  run the checks and record nothing
+  --import     record the `rust-check record:` lines of another host's run, read from stdin
+
+Why: fork PRs get no CI before the merge (every run waits for maintainer approval), and CI's Rust
+(clippy, rustfmt, `bazel test //crates/...`, the cross-target addon builds) runs on main only. So
+the maintainer's build was the first to compile #16202's Wayland input (E0618 from a bot-round push,
+bf9fd4bd6a) and to run clippy on #16140's macOS key reroute (ef7c45bd4b).
+
+It runs `cargo fmt --all -- --check --files-with-diff` and `cargo clippy --workspace <the vendored
+forks run-rs-task.ts excludes> --all-targets --no-deps --message-format=json` (`cargo xwin clippy
+--target x86_64-pc-windows-msvc` with --windows), and fails on a compile error anywhere, on a
+warning or lint whose primary span is on a line the branch adds, and on rustfmt changes to a file
+the branch changes. Lints on other lines are counted, not failed: `main` carries some under
+--all-targets (an `#[ignore]` without reason in pty.rs; dead code in oauth_callback on Windows),
+since CI's clippy skips test targets while the maintainer's runs them (ef7c45bd4b fixed test
+arithmetic). It refuses a worktree with uncommitted changes under the Rust paths (cargo checks the
+working tree while the record names HEAD) and fails closed when rustfmt or cargo cannot run.
+
+Where: each platform's placement is `build.<platform>` in the config (references/config.md):
+"local" runs it here (Windows through cargo-xwin, --windows), "ssh:<host>" in the PR's worktree on
+that host, "ci" with --ci, "none" leaves the platform unchecked (precheck NOTEs it). After a run it
+prints where the diff's other platforms go. Run it before `pr-queue add` and again before any push
+that changes a Rust line, a bot-round fix included. Over non-interactive ssh put cargo on PATH
+(`PATH=$HOME/.cargo/bin:$PATH`) and run it under nohup with a log. CARGO_TARGET_DIR is honoured;
+delete the target dir when done (workflow step 8).
+
+CI (--ci): workflow_dispatch only runs workflows on the fork's default branch, so rust-check pushes a
+temporary branch `omp-contrib-ci/<id>` to the fork: the PR head plus one commit that adds
+`.github/workflows/omp-contrib-rust-check.yml` (contrib/github/rust-check.yml, triggered on pushes
+to `omp-contrib-ci/**`) and removes the repository's other workflows on that branch only, so
+upstream's CI does not run there. The jobs upload cargo's raw output; rust-check judges it here
+against the branch's diff exactly as a local run does, records each passing platform for the PR head
+(host "ci", with the run URL), cancels a run still going at --timeout, and deletes the branch. It
+needs Actions enabled on the fork and a gh login with the `workflow` scope.
+
+A passing run records {platform: {sha, at, host[, run]}} under the branch's Rust diff id
+(omp_pr.rust_diff_id, a whitespace-exact patch id of the zero-context diff) in the queue
+manifest's `rust_checks`: a rebase or a CHANGELOG commit keeps the record, a change to any Rust
+line, whitespace included, needs a new run. Pushes go through gh's login when the host has no
+credential helper. A host that still cannot push to the fork prints the record as a
+`rust-check record: {...}` line and exits 1; pipe that run's output (its log) into
+`scripts/rust-check --import` on a host that can: `ssh <host> 'cat <scratch>/rc.log' | scripts/rust-check --import`.
+"""
+import argparse
+import datetime
+import json
+import os
+import re
+import secrets
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import omp_config  # noqa: E402
+from omp_pr import CHECKOUT, Diff, is_rust_path, run, rust_diff_id, rust_platforms  # noqa: E402
+from omp_queue import PUSH, GitError, Store, git, git_out  # noqa: E402
+
+# scripts/run-rs-task.ts VENDORED_FORK_EXCLUDES: the forks are not held to the workspace lint gates.
+EXCLUDES = ("brush-core", "brush-parser", "cfg_aliases", "napi")
+WINDOWS_TARGET = "x86_64-pc-windows-msvc"
+HARD_ERROR = re.compile(r"^E\d{4}$")
+RECORD_DAYS = 30  # records of a Rust diff no run has touched in this long are dropped
+# What cargo reads beyond committed sources; a change here uncommitted means the run checked
+# something HEAD does not hold.
+DIRTY_PATHS = ("crates", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "rustfmt.toml", ".cargo")
+RECORD_LINE = "rust-check record: "  # a record printed for --import when this host cannot push
+PLATFORMS = ("linux", "macos", "windows")
+
+# --- CI (--ci) ---
+CI_BRANCH = "omp-contrib-ci/"
+CI_WORKFLOW = ".github/workflows/omp-contrib-rust-check.yml"
+CI_TEMPLATE = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "..", "..", "contrib", "github",
+                           "rust-check.yml")
+CI_MATRIX = re.compile(r"^(\s*platform: )\[[^\]]*\](.*)$", re.M)  # the template's matrix line
+CI_HOST = "ci"  # the record's host for a run on GitHub Actions
+CI_START_WAIT = 180  # seconds for a pushed branch's run to appear before Actions is presumed off
+CI_POLL = 20
+
+
+def platform(windows):
+    if windows:
+        return "windows"
+    return {"linux": "linux", "darwin": "macos"}.get(sys.platform, sys.platform)
+
+
+def clippy_command(windows):
+    cargo = ["cargo", "xwin", "clippy", "--target", WINDOWS_TARGET] if windows else ["cargo", "clippy"]
+    return [*cargo, "--workspace", *(a for name in EXCLUDES for a in ("--exclude", name)), "--all-targets",
+            "--no-deps", "--message-format=json"]
+
+
+def slash(path):
+    """A path as cargo or rustfmt printed it on any OS, with `/` separators: Windows runners print `\\`,
+    and rustfmt there prints verbatim paths (`\\\\?\\D:\\a\\...`), whose `\\\\?\\` prefix goes."""
+    return path.replace("\\", "/").removeprefix("//?/")
+
+
+def diagnostics(stdout):
+    """[{level, code, message, path, start, end, rendered}] from cargo's JSON lines: each compiler
+    message with a primary span, once (a lint repeats for the lib and its test target)."""
+    seen, out = set(), []
+    for line in stdout.splitlines():
+        try:
+            item = json.loads(line)
+        except ValueError:
+            continue
+        msg = item.get("message") if item.get("reason") == "compiler-message" else None
+        span = next((s for s in (msg or {}).get("spans", []) if s.get("is_primary")), None)
+        if not span or msg["level"] not in ("error", "warning"):
+            continue
+        d = {"level": msg["level"], "code": (msg.get("code") or {}).get("code"), "message": msg["message"],
+             "path": slash(span["file_name"]), "start": span["line_start"], "end": span["line_end"],
+             "rendered": msg.get("rendered") or msg["message"]}
+        key = (d["path"], d["start"], d["code"], d["message"])
+        if key not in seen:
+            seen.add(key)
+            out.append(d)
+    return out
+
+
+def judge(diags, added):
+    """(failures, others): compile errors anywhere and every diagnostic on a line the branch adds
+    (`added`: {path: {line}}) fail; the rest is main's."""
+    failures, others = [], []
+    for d in diags:
+        hard = d["level"] == "error" and (d["code"] is None or HARD_ERROR.match(d["code"]))
+        ours = any(n in added.get(d["path"], ()) for n in range(d["start"], d["end"] + 1))
+        (failures if hard or ours else others).append(d)
+    return failures, others
+
+
+def unformatted(stdout, root, changed):
+    """Files of `changed` (repo-relative) that `cargo fmt -- --check --files-with-diff` listed, run in
+    `root` (this host's worktree or a runner's checkout, either separator)."""
+    prefix = slash(root).rstrip("/") + "/"
+    listed = set()
+    for p in (slash(p.strip()) for p in stdout.splitlines() if p.strip().endswith(".rs")):
+        listed.add(p[len(prefix):] if p.startswith(prefix) else os.path.relpath(p, root) if os.path.isabs(p) else p)
+    return sorted(listed & set(changed))
+
+
+def evaluate(name, root, added, fmt, clippy):
+    """Judge one platform's cargo output, wherever it ran. `fmt` and `clippy` are (returncode, stdout,
+    stderr). Returns (passed, lines to print, the one-line verdict)."""
+    lines = []
+    fmt_code, fmt_out, fmt_err = fmt
+    if fmt_code and not any(p.strip().endswith(".rs") for p in fmt_out.splitlines()):
+        # A diff exits 1 and lists files; an exit with none listed is rustfmt failing to run.
+        return False, [fmt_err.rstrip()[-3000:]], f"{name}: cargo fmt failed without listing a file (above); nothing recorded"
+    bad_fmt = unformatted(fmt_out, root, [p for p in added if p.endswith(".rs")])
+    clippy_code, clippy_out, clippy_err = clippy
+    failures, others = judge(diagnostics(clippy_out), added)
+    lines += [d["rendered"].rstrip() for d in failures]
+    lines += [f"rustfmt: {path} is not formatted: cargo fmt -- {path}" for path in bad_fmt]
+    if others:
+        lines.append(f"{len(others)} warning(s) on lines this branch does not add (main's), not counted")
+    if clippy_code and not failures and not any(d["level"] == "error" for d in others):
+        # cargo failed without a diagnostic we could place: a build script, a missing target.
+        lines.append(clippy_err.rstrip()[-3000:])
+        return False, lines, f"{name}: cargo clippy failed without a compiler diagnostic (above); nothing recorded"
+    if failures or bad_fmt:
+        return False, lines, (f"{name}: {len(failures)} diagnostic(s) on this branch's lines or compile errors, "
+                              f"{len(bad_fmt)} unformatted file(s); nothing recorded")
+    return True, lines, None
+
+
+def record(store, diff_id, name, sha, at=None, host=None, run_url=None):
+    at = at or now()
+    cutoff = (datetime.datetime.now(datetime.timezone.utc)
+              - datetime.timedelta(days=RECORD_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    row = {"sha": sha, "at": at, "host": host or this_host(), **({"run": run_url} if run_url else {})}
+
+    def apply(manifest, files):
+        checks = manifest.setdefault("rust_checks", {})
+        checks.setdefault(diff_id, {})[name] = row
+        for key in [k for k, v in checks.items() if max(r["at"] for r in v.values()) < cutoff]:
+            del checks[key]
+
+    where = f" on {host}" if host == CI_HOST else ""
+    store.update(apply, f"rust-check: {name} passed{where} at {sha[:10]}")
+
+
+def now():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def this_host():
+    return socket.gethostname().split(".")[0]
+
+
+def hand_over(diff_id, name, sha, why, host=None, run_url=None, exit=True):
+    """A record this host could not push (no credential for the fork, a locked keychain over ssh, gh
+    logged in as another account), printed as one RECORD_LINE for `rust-check --import` on a host
+    that can. Returns the reason instead of exiting when `exit` is False (a CI run's other platforms)."""
+    payload = json.dumps({"diff_id": diff_id, "platform": name, "sha": sha, "host": host or this_host(),
+                          "at": now(), **({"run": run_url} if run_url else {})})
+    print(f"{RECORD_LINE}{payload}")
+    why = (f"{name} passed, but this host cannot push the queue ({why}). Pipe this run's output into "
+           "`scripts/rust-check --import` on a host that can push to your fork to record it")
+    if exit:
+        sys.exit(why)
+    return why
+
+
+def import_records(text):
+    """`--import`: store every RECORD_LINE in `text` (a run's output, logs included) in this host's
+    oh-my-pi checkout. Returns how many."""
+    rows = [json.loads(line.split(RECORD_LINE, 1)[1]) for line in text.splitlines() if RECORD_LINE in line]
+    if not rows:
+        sys.exit(f"no `{RECORD_LINE.strip()}` line in the input: pipe in the output of a run that passed")
+    store = Store(CHECKOUT)
+    for r in rows:
+        record(store, r["diff_id"], r["platform"], r["sha"], at=r["at"], host=r["host"], run_url=r.get("run"))
+        print(f"recorded rust-check {r['platform']} from {r['host']} at {r['sha'][:10]} "
+              f"for Rust diff {r['diff_id'][:10]}")
+    return len(rows)
+
+
+def where(name, placement):
+    """How to run the check for `name` given its placement (`build.<name>`)."""
+    flag = " --windows" if name == "windows" else ""
+    if placement == "local":
+        return f"scripts/rust-check{flag} in the PR's worktree here"
+    if placement.startswith("ssh:"):
+        host = placement[4:]
+        return f"scripts/rust-check{flag} in the PR's worktree on {host} (`ssh {host}`)"
+    if placement == "ci":
+        return f"scripts/rust-check --ci --platform {name}"
+    return f"nothing: build.{name} is \"none\", so precheck NOTEs {name} as unchecked"
+
+
+def next_steps(needed, done, build):
+    """Lines naming where each platform the diff needs and no run has recorded goes."""
+    return [f"  {p} (build.{p} = {build.get(p) or 'none'}): {where(p, build.get(p) or 'none')}"
+            for p in PLATFORMS if p in needed and p not in done]
+
+
+# --- CI ---------------------------------------------------------------------------------------------
+
+def ci_workflow(platforms, template=None):
+    """The workflow text for a run of `platforms`: the template with its matrix line narrowed."""
+    with open(template or CI_TEMPLATE) as f:
+        text = f.read()
+    text, n = CI_MATRIX.subn(lambda m: f"{m.group(1)}[{', '.join(platforms)}]{m.group(2)}", text, count=1)
+    if n != 1:
+        raise ValueError(f"{template or CI_TEMPLATE} has no `platform: [...]` matrix line")
+    return text
+
+
+def ci_branch(sha, token=None):
+    return f"{CI_BRANCH}{sha[:12]}-{token or secrets.token_hex(3)}"
+
+
+def ci_commit(root, sha, workflow):
+    """A commit on top of `sha` whose only change is `.github/workflows/`: every workflow removed but
+    CI_WORKFLOW (so upstream's CI does not run on the temporary branch). Built in a temporary index:
+    the worktree and its index are untouched."""
+    with tempfile.TemporaryDirectory(prefix="rust-check-") as tmp:
+        env = {**os.environ, "GIT_INDEX_FILE": os.path.join(tmp, "index")}
+        git_out(root, "read-tree", sha, env=env)
+        git_out(root, "rm", "--cached", "-r", "-q", "--ignore-unmatch", "--", ".github/workflows", env=env)
+        blob = git_out(root, "hash-object", "-w", "--stdin", input=workflow)
+        git_out(root, "update-index", "--add", "--cacheinfo", f"100644,{blob},{CI_WORKFLOW}", env=env)
+        tree = git_out(root, "write-tree", env=env)
+    ident = {"GIT_AUTHOR_NAME": "omp-contrib rust-check", "GIT_AUTHOR_EMAIL": "rust-check@omp-contrib.invalid"}
+    ident |= {"GIT_COMMITTER_NAME": ident["GIT_AUTHOR_NAME"], "GIT_COMMITTER_EMAIL": ident["GIT_AUTHOR_EMAIL"]}
+    return git_out(root, "commit-tree", tree, "-p", sha, "-m", f"omp-contrib rust-check on CI for {sha}",
+                   env={**os.environ, **ident})
+
+
+def gh_api(path, method="GET"):
+    p = subprocess.run(["gh", "api", "-X", method, path], capture_output=True, text=True)
+    if p.returncode:
+        raise GitError(f"gh api {path}: {(p.stderr or p.stdout).strip()}")
+    return json.loads(p.stdout) if p.stdout.strip() else None
+
+
+def actions_refusal(fork, permissions):
+    """Why Actions cannot run our workflow on `fork` (from `actions/permissions`), with the one
+    command that allows it; None when it can. rust-check never changes the setting itself."""
+    if not permissions.get("enabled"):
+        return (f"GitHub Actions is disabled on {fork}. Enable it, then rerun:\n"
+                f"  gh api -X PUT repos/{fork}/actions/permissions -F enabled=true")
+    if permissions.get("allowed_actions") == "local_only":
+        return (f"{fork} allows only its own actions; the workflow uses actions/checkout and "
+                f"actions/upload-artifact. Allow GitHub's actions, then rerun:\n"
+                f"  gh api -X PUT repos/{fork}/actions/permissions -F enabled=true -f allowed_actions=all")
+    return None
+
+
+def job_platform(job):
+    m = re.search(r"rust-check (\w+)", job.get("name", ""))
+    return m.group(1) if m else None
+
+
+def job_failure(job, deadline_hit=False):
+    """None when a job ran to the end (its artifact holds cargo's output to judge); else why it gives no
+    verdict. The jobs' steps never fail on what cargo finds, so a failed job is a runner or setup
+    problem, not a check failure."""
+    status, conclusion = job.get("status"), job.get("conclusion")
+    if status != "completed":
+        if status in ("queued", "waiting", "pending", "requested"):
+            return ("no runner picked the job up before the deadline (queued); GitHub-hosted runners for "
+                    "this OS may be unavailable to the fork" if deadline_hit else "never started")
+        return "still running at the deadline: rerun with a longer --timeout"
+    if conclusion == "success":
+        return None
+    if conclusion == "timed_out":
+        return "the job hit its timeout-minutes (contrib/github/rust-check.yml)"
+    if conclusion == "cancelled" and not job.get("steps") and not job.get("runner_name"):
+        # GitHub gives up on a job no runner takes ("not acquired by Runner of type hosted even after
+        # multiple attempts"; macOS arm64 runners under capacity limits).
+        return ("no GitHub-hosted runner picked the job up (runner capacity); rerun later with "
+                f"--platform {job_platform(job) or '<platform>'}")
+    if conclusion == "cancelled":
+        return "the run was cancelled"
+    if conclusion == "failure":
+        step = next((s["name"] for s in job.get("steps", []) if s.get("conclusion") == "failure"), None)
+        return f"setup failed{f' at step {step!r}' if step else ''}, before cargo's verdict"
+    return f"the job ended {conclusion}"
+
+
+def read_artifact(directory):
+    """{fmt: (code, out, err), clippy: (...), head, root} from one platform's uploaded directory."""
+    def text(name):
+        try:
+            with open(os.path.join(directory, name), encoding="utf-8", errors="replace") as f:
+                return f.read()
+        except FileNotFoundError:
+            return None
+
+    def step(name):
+        code = text(f"{name}.code")
+        if code is None or not code.strip().lstrip("-").isdigit():
+            return None
+        return int(code.strip()), text(f"{name}.out") or "", text(f"{name}.err") or ""
+
+    return {"fmt": step("fmt"), "clippy": step("clippy"), "head": (text("head") or "").strip(),
+            "root": (text("root") or "").strip(), "toolchain": (text("toolchain") or "").strip()}
+
+
+def ci_verdict(name, artifact, sha, added):
+    """(passed, lines, verdict) for one platform's artifact: the same judgement as a local run, after
+    checking it checked the PR head (the temporary commit's parent)."""
+    if artifact["head"] != sha:
+        return False, [], f"{name}: the run checked {artifact['head'][:10] or 'an unknown commit'}, not {sha[:10]}; nothing recorded"
+    if not artifact["fmt"] or not artifact["clippy"]:
+        return False, [], f"{name}: the run uploaded no cargo exit code (a step died early); nothing recorded"
+    return evaluate(name, artifact["root"], added, artifact["fmt"], artifact["clippy"])
+
+
+def duration(start, end):
+    if not start or not end:
+        return "?"
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    secs = int((datetime.datetime.strptime(end, fmt) - datetime.datetime.strptime(start, fmt)).total_seconds())
+    return f"{secs // 60}m{secs % 60:02d}s"
+
+
+def find_run(fork, branch, commit, wait=CI_START_WAIT):
+    deadline = time.monotonic() + wait
+    while True:
+        runs = gh_api(f"repos/{fork}/actions/runs?branch={branch}&event=push&per_page=20")["workflow_runs"]
+        found = next((r for r in runs if r["head_sha"] == commit), None)
+        if found or time.monotonic() > deadline:
+            return found
+        time.sleep(5)
+
+
+def ci_main(args, ctx):
+    cfg = omp_config.load()
+    fork, remote = cfg.fork_repo, cfg.fork_remote
+    root, sha, diff_id, added = ctx["root"], ctx["sha"], ctx["diff_id"], ctx["added"]
+    if args.platform == "all":
+        platforms = list(PLATFORMS)
+    elif args.platform:
+        platforms = [args.platform]
+    else:
+        needed = ctx["needed"]
+        platforms = [p for p in PLATFORMS if p in needed and cfg.build.get(p) == "ci"] or [
+            p for p in PLATFORMS if p in needed]
+    refusal = actions_refusal(fork, gh_api(f"repos/{fork}/actions/permissions"))
+    if refusal:
+        sys.exit(refusal)
+    if run("git", "status", "--porcelain", "--untracked-files=all", "--", *DIRTY_PATHS, cwd=root).stdout.strip():
+        print(f"note: uncommitted Rust changes are not pushed; CI checks HEAD {sha[:10]} only")
+    branch = ci_branch(sha)
+    commit = ci_commit(root, sha, ci_workflow(platforms))
+    print(f"pushing {branch} to {remote} ({fork}): {sha[:10]} + the workflow commit {commit[:10]}", flush=True)
+    p = git(root, *PUSH, "-q", remote, f"{commit}:refs/heads/{branch}")
+    if p.returncode:
+        hint = ("\n  gh's token needs the `workflow` scope to push a workflow file: gh auth refresh -s workflow"
+                if "workflow" in p.stderr else "")
+        sys.exit(f"pushing {branch} to {remote} failed: {p.stderr.strip()}{hint}")
+    started, gh_run, jobs, deadline_hit = time.monotonic(), None, [], False
+    try:
+        gh_run = find_run(fork, branch, commit)
+        if not gh_run:
+            sys.exit(f"no workflow run started for {branch} within {CI_START_WAIT}s. GitHub holds workflows "
+                     f"on a fork until they are enabled once: open https://github.com/{fork}/actions and "
+                     "enable them, then rerun")
+        print(f"run {gh_run['html_url']} ({', '.join(platforms)}); waiting up to {args.timeout} min", flush=True)
+        deadline = started + args.timeout * 60
+        seen = {}
+        while True:
+            gh_run = gh_api(f"repos/{fork}/actions/runs/{gh_run['id']}")
+            jobs = gh_api(f"repos/{fork}/actions/runs/{gh_run['id']}/jobs?per_page=50")["jobs"]
+            for j in jobs:
+                state = j.get("conclusion") or j.get("status")
+                if seen.get(j["id"]) != state:
+                    seen[j["id"]] = state
+                    print(f"  {job_platform(j) or j['name']}: {state}", flush=True)
+            if gh_run["status"] == "completed":
+                break
+            if time.monotonic() > deadline:
+                deadline_hit = True
+                gh_api(f"repos/{fork}/actions/runs/{gh_run['id']}/cancel", method="POST")
+                break
+            time.sleep(CI_POLL)
+    finally:
+        if gh_run and gh_run.get("status") != "completed" and not deadline_hit:
+            subprocess.run(["gh", "api", "-X", "POST", f"repos/{fork}/actions/runs/{gh_run['id']}/cancel"],
+                           capture_output=True)
+        p = git(root, *PUSH, "-q", remote, "--delete", branch)
+        left = git(root, "ls-remote", remote, f"refs/heads/{branch}").stdout.strip()
+        print(f"deleted {branch} from {remote}" if not left else
+              f"warning: {branch} is still on {remote} ({p.stderr.strip()}): git push {remote} --delete {branch}")
+    return ci_collect(args, fork, gh_run, jobs, platforms, deadline_hit, ctx)
+
+
+def ci_collect(args, fork, gh_run, jobs, platforms, deadline_hit, ctx):
+    sha, diff_id, added = ctx["sha"], ctx["diff_id"], ctx["added"]
+    by_platform = {job_platform(j): j for j in jobs}
+    passed, failed = [], []
+    with tempfile.TemporaryDirectory(prefix="rust-check-ci-") as tmp:
+        for name in platforms:
+            job = by_platform.get(name)
+            why = job_failure(job, deadline_hit) if job else "no job for it in the run"
+            timing = f" in {duration(job.get('started_at'), job.get('completed_at'))}" if job else ""
+            if why:
+                failed.append(f"{name}: {why} ({(job or {}).get('html_url') or gh_run['html_url']})")
+                continue
+            target = os.path.join(tmp, name)
+            p = subprocess.run(["gh", "run", "download", str(gh_run["id"]), "-R", fork, "-n", f"rust-check-{name}",
+                                "-D", target], capture_output=True, text=True)
+            if p.returncode:
+                failed.append(f"{name}: downloading its artifact failed: {p.stderr.strip()}")
+                continue
+            artifact = read_artifact(target)
+            ok, lines, verdict = ci_verdict(name, artifact, sha, added)
+            print(f"--- {name} ({job.get('html_url')}, {artifact['toolchain'] or 'toolchain ?'}){timing}")
+            for line in lines:
+                print(line)
+            if not ok:
+                failed.append(verdict)
+                continue
+            print(f"{name}: clippy and rustfmt pass on this branch's Rust lines at {sha[:10]} (CI)")
+            passed.append(name)
+            if not args.no_record:
+                url = job.get("html_url") or gh_run["html_url"]
+                try:
+                    record(Store(ctx["root"], args.manifest), diff_id, name, sha, host=CI_HOST, run_url=url)
+                except GitError as e:
+                    failed.append(hand_over(diff_id, name, sha, e, host=CI_HOST, run_url=url, exit=False))
+                    continue
+                print(f"recorded rust-check {name} (CI) for Rust diff {diff_id[:10]}")
+    if failed:
+        sys.exit("\n".join(["not recorded:", *(f"  {f}" for f in failed)]))
+    return passed
+
+
+def prepare(args):
+    cwd = os.getcwd()
+    root = run("git", "rev-parse", "--show-toplevel", cwd=cwd).stdout.strip()
+    if not root:
+        sys.exit("not in a git worktree: run it in the PR's worktree")
+    sha = run("git", "rev-parse", "HEAD", cwd=root).stdout.strip()
+    base = run("git", "merge-base", args.base or "origin/main", "HEAD", cwd=root).stdout.strip()
+    if not base:
+        sys.exit(f"no merge base with {args.base or 'origin/main'}")
+    diff_id = rust_diff_id(base, "HEAD", cwd=root)
+    if not diff_id:
+        sys.exit("the branch changes no Rust: nothing to check")
+    diff = Diff(base, "HEAD", root)
+    added = {p: {n for n, _ in lines} for p, lines in diff.added.items() if is_rust_path(p)}
+    return {"root": root, "sha": sha, "base": base, "diff_id": diff_id, "added": added,
+            "needed": rust_platforms(diff, base, "HEAD", cwd=root)}
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(usage=__doc__.split("\n\n", 2)[1].removeprefix("usage: "))
+    parser.add_argument("--windows", action="store_true")
+    parser.add_argument("--ci", action="store_true")
+    parser.add_argument("--platform", choices=(*PLATFORMS, "all"))
+    parser.add_argument("--timeout", type=int, default=90)
+    parser.add_argument("--base")
+    parser.add_argument("--manifest")
+    parser.add_argument("--no-record", action="store_true")
+    parser.add_argument("--import", dest="import_", action="store_true")
+    args = parser.parse_args(argv)
+    if args.import_:
+        return import_records(sys.stdin.read())
+    if args.platform and not args.ci:
+        parser.error("--platform goes with --ci (a local run checks this host's platform, or Windows with --windows)")
+    if args.ci:
+        return ci_main(args, prepare(args))
+    cwd = os.getcwd()
+    root = run("git", "rev-parse", "--show-toplevel", cwd=cwd).stdout.strip()
+    if not root:
+        sys.exit("not in a git worktree: run it in the PR's worktree")
+    # Cargo builds the working tree and the record names HEAD: an uncommitted Rust edit would be
+    # compiled but not recorded, so a broken commit could pass on a fixed tree.
+    dirty = run("git", "status", "--porcelain", "--untracked-files=all", "--", *DIRTY_PATHS, cwd=root).stdout
+    if dirty.strip():
+        sys.exit("uncommitted changes under the Rust paths; commit or drop them first (the record names HEAD):\n"
+                 + dirty.rstrip())
+    ctx = prepare(args)
+    sha, diff_id, added = ctx["sha"], ctx["diff_id"], ctx["added"]
+    name = platform(args.windows)
+
+    fmt = subprocess.run(["cargo", "fmt", "--all", "--", "--check", "--files-with-diff"], cwd=root,
+                         capture_output=True, text=True)
+    if fmt.returncode and not any(p.strip().endswith(".rs") for p in fmt.stdout.splitlines()):
+        ok, lines, verdict = evaluate(name, root, added, (fmt.returncode, fmt.stdout, fmt.stderr), (0, "", ""))
+        print("\n".join(lines))
+        sys.exit(verdict)
+    print(f"$ {' '.join(clippy_command(args.windows))}", flush=True)
+    clippy = subprocess.run(clippy_command(args.windows), cwd=root, capture_output=True, text=True)
+    ok, lines, verdict = evaluate(name, root, added, (fmt.returncode, fmt.stdout, fmt.stderr),
+                                  (clippy.returncode, clippy.stdout, clippy.stderr))
+    for line in lines:
+        print(line)
+    if not ok:
+        sys.exit(verdict)
+    print(f"{name}: clippy and rustfmt pass on this branch's Rust lines at {sha[:10]}")
+    if not args.no_record:
+        if run("git", "rev-parse", "HEAD", cwd=root).stdout.strip() != sha or run(
+                "git", "status", "--porcelain", "--untracked-files=all", "--", *DIRTY_PATHS, cwd=root).stdout.strip():
+            sys.exit("HEAD or the Rust paths changed while the checks ran; nothing recorded: rerun")
+        try:
+            record(Store(root, args.manifest), diff_id, name, sha)
+        except GitError as e:
+            hand_over(diff_id, name, sha, e)
+        print(f"recorded rust-check {name} for Rust diff {diff_id[:10]}")
+    rest = next_steps(ctx["needed"], {name}, omp_config.load().build)
+    if rest:
+        print("this Rust diff also needs:\n" + "\n".join(rest))
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
