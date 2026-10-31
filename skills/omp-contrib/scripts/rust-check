@@ -61,7 +61,6 @@ import json
 import os
 import re
 import secrets
-import socket
 import subprocess
 import sys
 import tempfile
@@ -202,7 +201,8 @@ def now():
 
 
 def this_host():
-    return socket.gethostname().split(".")[0]
+    """This host's label in rust_checks records, which the fork's queue branch publishes."""
+    return omp_config.host_label()
 
 
 def hand_over(diff_id, name, sha, why, host=None, run_url=None, exit=True):

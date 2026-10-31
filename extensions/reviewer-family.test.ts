@@ -118,8 +118,8 @@ describe("chooseReviewer", () => {
 	});
 
 	test("ranks providers the user already runs before pricier ones only listed", () => {
-		// A Sol session whose @smol runs on Anthropic: the OpenRouter SKU costs more but was
-		// retired, and the Cursor login's plan refused its fallbacks.
+		// A session whose @smol runs on a working login: a provider the user isn't actually
+		// using can list models it can't serve, so those rank after the proven login.
 		const routed = model("openrouter", "anthropic/claude-opus-4.7-fast", "claude", 150);
 		const cursor = model("cursor", "claude-opus-4-7-fast", "claude", 150);
 		const result = chooseReviewer(

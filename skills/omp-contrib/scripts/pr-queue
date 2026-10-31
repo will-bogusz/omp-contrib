@@ -119,7 +119,6 @@ import json
 import os
 import re
 import shlex
-import socket
 import subprocess
 import sys
 import tempfile
@@ -293,7 +292,7 @@ def cmd_sync(args, repo, store, gh):
             continue
         entry = {**item.entry, "id": unique_id({"entries": manifest["entries"] + imports}, item.entry["branch"]),
                  "area": q.area(item), "priority": item.priority, "needs": q.inferred_needs(item),
-                 "worktree": trees.get(item.entry["branch"])}
+                 "worktree": omp_config.home_path(trees.get(item.entry["branch"]))}
         imports.append(entry)
         report.append(f"#{item.number} imported as {entry['id']} ({entry['area']}, {entry['priority'] or 'unranked'}"
                       + (f", needs {' '.join(entry['needs'])}" if entry["needs"] else "") + ")")
@@ -399,7 +398,7 @@ def rename_branch(args, repo, store):
         worktree = worktrees(repo).get(args.branch)
     else:
         git_out(repo, *PUSH, "-q", STORE_REMOTE, f"{tip}:refs/heads/{args.branch}")
-        wt = entry.get("worktree")
+        wt = omp_config.local_path(entry.get("worktree"))
         if wt and os.path.isdir(wt) and rev(wt, f"refs/heads/{old}"):
             git_out(wt, "branch", "-m", old, args.branch)
             git_out(wt, "branch", "-q", "--set-upstream-to", f"{STORE_REMOTE}/{args.branch}", args.branch)
@@ -441,7 +440,7 @@ def cmd_set(args, repo, store, gh):
                 entry["body"] = f"bodies/{new_id}.md"
                 files[entry["body"]] = rename["body"]
             if rename["worktree"]:
-                entry["worktree"], entry["host"] = rename["worktree"], socket.gethostname().split(".")[0]
+                entry["worktree"], entry["host"] = omp_config.home_path(rename["worktree"]), omp_config.host_label()
         if args.needs is not None:
             check_needs(m, args.needs)
             entry["needs"] = args.needs
@@ -541,7 +540,7 @@ def built_record(q, item, other, tree=None):
         if not found:
             raise Refused(f"{label} has no change past {MAIN} to record (or its branch is missing): fetch first")
     record = {"with": other.label, "code": code, "with_code": with_code, "tip": q.tip(item),
-              "with_tip": q.tip(other), "at": stamp(), "host": socket.gethostname().split(".")[0]}
+              "with_tip": q.tip(other), "at": stamp(), "host": omp_config.host_label()}
     return {**record, "tree": tree} if tree else record
 
 
@@ -981,7 +980,7 @@ def save_plan(store, manifest, result, at):
     QUEUE.md (omp_queue_view), when it says something the cached one does not or that one is an hour
     old; never over a plan started later (a live plan takes minutes). A host that cannot write the
     queue still gets its plan: the failure is a warning."""
-    record = omp_queue_view.plan_record(result, at, socket.gethostname().split(".")[0])
+    record = omp_queue_view.plan_record(result, at, omp_config.host_label())
     if not omp_queue_view.plan_due(manifest.get("plan"), record):
         return
 
@@ -1110,7 +1109,7 @@ def cmd_watch(args, repo, store, gh):
            "entries": {e["id"]: {"state": e["state"], "pr": e.get("pr")} for e in manifest["entries"]},
            "conflicts": conflicts, "merges": merges,
            "releases": {n: first_release(sha, cwd=repo) for n, sha in commits.items()},
-           "host": socket.gethostname().split(".")[0], "ready": [i.number for i in q.ready_items()]}
+           "host": omp_config.host_label(), "ready": [i.number for i in q.ready_items()]}
     try:
         found = gh.post_merge_open(candidates, cwd=repo) if candidates else {}
         cur["post_merge"] = {m["number"]: {**m, "findings": found.get(m["number"], [])} for m in candidates}
@@ -1263,7 +1262,7 @@ def lock_open(store, ident, lease):
             if now() - at < OPEN_LOCK:
                 raise Refused(f"another open is in progress: {lock['id']} on {lock['host']} since {lock['at']}. "
                               "One opener opens a round (queue.md, Opening): a worker leaves its entry to it")
-        m["opening"] = {"id": ident, "token": lease, "host": socket.gethostname().split(".")[0], "at": stamp()}
+        m["opening"] = {"id": ident, "token": lease, "host": omp_config.host_label(), "at": stamp()}
     fence = False
     store.update(take, f"lock open {ident}")
 

@@ -35,9 +35,8 @@ const PREFERRED_ROLES = ["@slow", "@plan", "@advisor", "@default"] as const;
 
 /**
  * Roles whose providers count as proven: a model the user configured there has served
- * requests on that login. A Sol session's reviewer once ranked to an OpenRouter Claude SKU
- * that OpenRouter had retired, with Cursor fallbacks a free plan refused; the Anthropic login
- * serving the session's `@smol` sat lower only because its price was lower.
+ * requests on that login. A provider the user isn't actually using can list models it can't
+ * serve, so a model only listed there must not outrank one a working login already serves.
  */
 const PROVEN_ROLES = [...PREFERRED_ROLES, "@smol", "@task", "@commit", "@tiny"] as const;
 

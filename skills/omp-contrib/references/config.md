@@ -55,6 +55,13 @@ supervised_opens = 3                  # PRs that stop before `pr-queue open` for
 [watch]
 enabled = false                       # a launchd/systemd timer runs `pr-queue watch` (contrib/)
 
+[queue]
+# How this host is named in everything the queue stores on your fork (queue.json, QUEUE.md, rust-check
+# and build records, the open lock, the watcher record). A public fork publishes it, so the raw
+# hostname never goes there. Default: "host-" + the first 6 hex digits of sha256(hostname), stable
+# per host. Worktree paths stored there write your home directory as `~`.
+host_label = ""
+
 # One table per wizard decision (setup.md): the choice and why, so doctor never re-asks a deliberate
 # choice and re-offers the ideal only when its reason no longer holds. Ids: github, build-hosts,
 # reviewer, behaviour-models, omp-settings, image-upload, chart-tools, autonomy, watcher, session-reader.

@@ -55,7 +55,7 @@ template: derive each body from these questions, never by copying an earlier PR'
 10. **Keep private context out.** Account deals, partner authorization, decompile or
     reverse-engineering provenance, "mirrors X exactly" wording, fork credits the user declined,
     and private motivation. Re-check these exclusions after every context compaction: excluded
-    context has come back after one and been posted (#8577's partner authorization).
+    context has come back after one and been posted (#8577).
 
 **Template and length.** Use OMP's headings in order: `## What`, `## Why`, `## Testing`, then the
 checklist. The four questions of `rule://omp-pr-authoring` fill them. What holds the claim and the
@@ -287,6 +287,6 @@ the scope was not.
 ## Worked example of the opposite: #8577 before its rewrite
 
 The Factory Droid body grew by string patches as features changed. It ended up describing
-removed features and needed a full re-derivation. It still carried a partner authorization that
-had been meant to come out, and it had no own-words sentence. Re-derive from the questions; never
+removed features and needed a full re-derivation. It still carried context the user had excluded
+from the body, and it had no own-words sentence. Re-derive from the questions; never
 patch.

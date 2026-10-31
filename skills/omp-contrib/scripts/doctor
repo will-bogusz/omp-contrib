@@ -84,6 +84,7 @@ SCHEMA = {
     "images": {"upload": str},
     "autonomy": {"open_p2": str, "supervised_opens": int},
     "watch": {"enabled": bool},
+    "queue": {"host_label": str},
 }
 ENUMS = {("images", "upload"): ("relay", "fork-links"), ("autonomy", "open_p2"): ("hold", "open")}
 DECISIONS = ("github", "build-hosts", "reviewer", "behaviour-models", "omp-settings", "image-upload",

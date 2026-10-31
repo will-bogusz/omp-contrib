@@ -1084,8 +1084,8 @@ class PostMergeFindingsTest(unittest.TestCase):
         self.assertIn("[post-merge: Codex P1 x1 open] -> fix as a follow-up off main", needs)
 
     def test_the_summary_starts_with_the_opening_pause(self):
-        # 2026-10-22: the user paused opening in one session's note; another session opened #16801/#16803.
-        pause = "me, 2026-10-22: no new PRs until the maintainer catches up"
+        # A pause relayed in one session's note; another session opened #101/#102 during it.
+        pause = "user, 2026-01-02: pause for maintainer round"
         out = io.StringIO()
         with mock.patch.object(PT, "merged_prs", return_value=[]), mock.patch("sys.stdout", out):
             PT.summarize([], 2, {}, {}, {"config": {"pause": pause}})

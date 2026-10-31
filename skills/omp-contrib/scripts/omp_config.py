@@ -12,6 +12,10 @@ API:
                           `key = …` under `[section]` is replaced with its trailing comment kept; a
                           missing key or section is added). Values: str, int, bool, list of str.
                           Drops load()'s cache.
+  host_label()            this host's name in anything stored or pushed: `queue.host_label`, else
+                          "host-<6 hex of sha256(hostname)>"
+  home_path(p), local_path(p)
+                          a path stored in the queue with $HOME as `~`, and back
   decrement_supervised(path=None)
                           autonomy.supervised_opens - 1 (not below 0) written back; returns the new value.
 
@@ -25,7 +29,7 @@ Config (every value resolved; derived ones looked up lazily on first access, the
     fork remote's URL, else "<fork_owner>/<upstream name>"), queue_branch, branch_prefix,
     checkout, worktrees, scratch_roots (list of expanded paths), build ({"linux", "macos", "windows"}),
     reviewer_model, behaviour_models (list), cold_read_model, image_upload, open_p2, supervised_opens
-    (int), watch_enabled (bool)
+    (int), watch_enabled (bool), host_label
 
 Derived defaults:
   github.fork_owner   `gh api user --jq .login`, cached in cache_dir("gh-login") for a week; "" when gh
@@ -37,8 +41,10 @@ Derived defaults:
   paths.worktrees     env OMP_PR_WORKTREES; else "<checkout>-wt"
   build.<os>          "local" for this machine's own OS, else "ci" (Windows: always "ci")
 """
+import hashlib
 import json
 import os
+import socket
 import re
 import subprocess
 import sys
@@ -68,6 +74,7 @@ DEFAULTS = {
     "autonomy.open_p2": "hold",
     "autonomy.supervised_opens": 3,
     "watch.enabled": False,
+    "queue.host_label": "",
 }
 ENV = {"paths.checkout": "OMP_REPO", "paths.worktrees": "OMP_PR_WORKTREES"}
 BUILD_VALUES = re.compile(r"^(local|ci|none|ssh:\S+)$")
@@ -241,6 +248,7 @@ class Config:
     open_p2 = property(lambda self: self.get("autonomy.open_p2"))
     supervised_opens = property(lambda self: int(self.get("autonomy.supervised_opens")))
     watch_enabled = property(lambda self: bool(self.get("watch.enabled")))
+    host_label = property(lambda self: self.get("queue.host_label"))
 
     @property
     def choices(self):
@@ -319,6 +327,33 @@ def set_value(section, key, value, path=None):
         f.write("\n".join(lines) + "\n")
     os.replace(tmp, path)
     _CACHE.pop(path, None)
+
+
+def host_label():
+    """How this host is named in anything the queue stores or pushes (the fork may be public):
+    `queue.host_label` when set, else "host-" and the first 6 hex digits of sha256(hostname), stable
+    per host and naming nothing. Compare hosts by this label, never by the raw hostname."""
+    label = load().host_label
+    if label:
+        return label
+    name = socket.gethostname().split(".")[0].lower()
+    return "host-" + hashlib.sha256(name.encode()).hexdigest()[:6]
+
+
+def home_path(path):
+    """`path` with the home directory written as `~`, for paths stored in the queue; None stays None."""
+    if not path:
+        return path
+    home = os.path.expanduser("~").rstrip("/\\")
+    full = os.path.abspath(path)
+    if full == home or full.startswith(home + os.sep):
+        return "~" + full[len(home):]
+    return path
+
+
+def local_path(path):
+    """A stored path back as this host's absolute path (the inverse of home_path)."""
+    return os.path.expanduser(path) if path else path
 
 
 def decrement_supervised(path=None):

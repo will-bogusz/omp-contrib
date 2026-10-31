@@ -360,14 +360,14 @@ class QueueTest(unittest.TestCase):
         self.assertEqual(self.plan()["c"]["action"], "open")
 
     def test_an_opening_pause_stops_every_open_until_unpaused(self):
-        # 2026-10-22: the user paused opening in one session's note; another session, which never saw it,
-        # opened #16801 and #16803 that afternoon. The pause lives in the queue every session reads.
+        # A pause relayed in one session's note reaches no other session, which then opens PRs (#101,
+        # #102) during it. The pause lives in the queue every session reads.
         self.sim.branch("octo-fork/r", line=9, text="R9")
         self.gh.add_pr(301, "octo-fork/r", "fix(a): r", rank="P0")
         self.sim.branch("octo-fork/q", line=5, text="Q5", entry="Fixed q")
         self.run_pq("add", "octo-fork/q", "--title", "fix(a): q", "--body", self.body, "--priority", "P1")
         self.assertEqual(self.plan()["q"]["action"], "open")
-        reason = "me, 2026-10-22: no new PRs until the maintainer catches up"
+        reason = "user, 2026-01-02: pause for maintainer round"
         code, out = self.run_pq("pause", reason)
         self.assertEqual(code, 0, out)
         plan = self.plan()
@@ -2154,7 +2154,7 @@ class StoredBodyTest(unittest.TestCase):
             self.assertEqual(self.precheck(number), "")
 
     def test_precheck_fixes_a_draft_or_closed_pr_while_opening_is_paused(self):
-        pause = "me, 2026-10-22: no new PRs until the maintainer catches up"
+        pause = "user, 2026-01-02: pause for maintainer round"
         with open(self.manifest) as f:
             manifest = json.load(f)
         manifest["config"]["pause"] = pause

@@ -129,6 +129,27 @@ class ForkTest(ConfigTest):
             self.assertEqual(len(calls), 2, "a week-old answer is asked again")
 
 
+class HostTest(ConfigTest):
+    def test_host_label_names_no_hostname_unless_configured(self):
+        self.load("")
+        with mock.patch("socket.gethostname", return_value="Wills-MacBook.local"):
+            label = omp_config.host_label()
+            self.assertRegex(label, r"^host-[0-9a-f]{6}$")
+            self.assertNotIn("will", label.lower())
+            self.assertEqual(omp_config.host_label(), label, "stable per host")
+        self.load('[queue]\nhost_label = "laptop"\n')
+        self.assertEqual(omp_config.host_label(), "laptop")
+
+    def test_stored_paths_write_home_as_tilde_and_read_back(self):
+        home = os.path.expanduser("~")
+        wt = os.path.join(home, "src", "oh-my-pi-wt", "x")
+        self.assertEqual(omp_config.home_path(wt), "~/src/oh-my-pi-wt/x")
+        self.assertEqual(omp_config.local_path(omp_config.home_path(wt)), wt)
+        self.assertEqual(omp_config.home_path("/srv/wt/x"), "/srv/wt/x")
+        self.assertEqual(omp_config.home_path(home + "-other/x"), home + "-other/x")
+        self.assertIsNone(omp_config.home_path(None))
+
+
 class WriteTest(ConfigTest):
     TEXT = ('# my config\n[github]\nfork_owner = "octo"   # me\n\n[autonomy]\nopen_p2 = "hold"\n'
             'supervised_opens = 2  # counts down\n\n[choices.image-upload]\nvalue = "relay"\n')

@@ -39,7 +39,7 @@ contributor's own runs and no public artifact shows it, the row gives the reason
 | Capability table even without numbers | #8590, #8337 |
 | Decisions, maintenance cost, non-goals, reading order | #8590 (non-goals) and what its body lacked (framing.md, *What it lacked*) |
 | Testing = exercised scenario + command + negative control | `CONTRIBUTING.md` "`bun check` passes by itself is not sufficient"; #13527, #11386 |
-| Private context out; re-check after compaction | #8577's body carried a partner authorization meant to be dropped; excluded context returns after a compaction because the summary keeps it |
+| Private context out; re-check after compaction | #8577's body carried context the user had excluded; excluded context returns after a compaction because the summary keeps it |
 | Template What/Why/Testing + checklist; under 3,000 chars | `.github/PULL_REQUEST_TEMPLATE.md`; `AGENTS.md` "Preserve the template sections"; #13527 (3,469 -> 2,792); corpus p50 1,997 chars |
 | Visuals where visual or measurable | 20 of 883 with images, clustered in fast UI merges (#8337, #9995); tables in #13063, #11740 |
 | Images via web upload, preserved on rewrite | `user-attachments` URLs in #8337; `gh --attach` needs write access to the repository |

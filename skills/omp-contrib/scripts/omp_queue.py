@@ -10,7 +10,6 @@ import datetime
 import json
 import os
 import re
-import socket
 import subprocess
 import tempfile
 
@@ -327,8 +326,8 @@ def empty_manifest():
 
 def opening_pause(manifest):
     """The queue-wide opening pause `pr-queue pause` sets ("WHO, DATE: REASON"), or None. While it is
-    set nothing opens or turns ready; open PRs carry on (bot fixes, rebases, pushes). 2026-10-22: a
-    pause relayed in one session's note reached no other, and #16801/#16803 opened during it."""
+    set nothing opens or turns ready; open PRs carry on (bot fixes, rebases, pushes). A pause relayed
+    in one session's note reaches no other session, which opens PRs during it."""
     return (manifest.get("config") or {}).get("pause") or None
 
 
@@ -455,8 +454,9 @@ def stored_body_message(number, entry):
 def new_entry(branch, **fields):
     entry = {"id": topic(branch), "branch": branch, "title": None, "area": None, "priority": None, "needs": [],
              "base": None, "body": None, "state": "queued", "pr": None, "closed_prs": [], "worktree": None,
-             "host": socket.gethostname().split(".")[0], "added": stamp(), "updated": stamp(), "note": ""}
+             "host": omp_config.host_label(), "added": stamp(), "updated": stamp(), "note": ""}
     entry.update({k: v for k, v in fields.items() if v is not None})
+    entry["worktree"] = omp_config.home_path(entry["worktree"])
     return entry
 
 
