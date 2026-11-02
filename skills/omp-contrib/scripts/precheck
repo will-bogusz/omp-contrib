@@ -41,6 +41,15 @@ any FIX line printed. Checks:
   - the same entries after a simulated merge of origin/main (FIX): merge=union leaves an entry
     under a release cut since the branch point, or repeats a `###` heading. The maintainer asks
     for this on every PR; rebase onto origin/main and move the line
+  - tests maintainers pared from our merged PRs (NOTE, code-style.md *Count tests by code path*):
+    `log-test`, a test spying on or mocking the repo logger (#16579, `c98d4561f0`); `prompt-test`,
+    an assertion that a `src/prompts/*.md` file's text (imported or read) appears in a description,
+    prompt or request, or a test case building a full `createAgentSession` whose only assertions are
+    `toContain`/`toMatch` on prompt or description text (#16918, `4b13432524`; a unit test of a
+    description builder's section in or out is fine); `tests`, test volume over the
+    change's: added test lines over 1.5x the added source lines by 20 or more, or more than 3 added
+    test cases (`it(`, `test(`, each `.each` row, Rust `#[test]`) per changed source file.
+    CHANGELOGs, docs, generated and lock files, fixtures and snapshots count as neither
   - test shapes maintainers rewrote (NOTE): full-string assertions, `test.each` rows (each must
     fail with the fix reverted), casts in mocks, and new tests beside credential code that falls
     back to env keys
@@ -192,6 +201,41 @@ SCRIPT_ASSERT = re.compile(r"\bexpect\(\s*(?:[\w$]*[Ss]cript[\w$]*(?:\[[^\]]*\])
                            r"toStartWith|toEndWith)\(")
 SOURCE_READ = re.compile(r"""(?:readFileSync|readFile|Bun\.file|include_str!)\s*\([^)]*?["'`][^"'`]*"""
                          r"""\.(?:ts|tsx|js|mjs|rs|py)["'`]""")
+# Tests maintainers pared from our merged PRs (code-style.md *Count tests by code path*). A spy on or
+# a mock of the repo logger pins debug-log wording (#16579, `c98d4561f0`). Prompt wording: on #16918
+# H4vC deleted the SDK test that built a whole `createAgentSession` to find a `computer.md` line in
+# its first request, and kept the unit test of the description builder's new branch, which checks a
+# section in or out (`4b13432524`). So the NOTE is for an assertion that a prompt file's text shows
+# up somewhere, and for a test that builds a full session to assert only on prompt text.
+COUNT_RULE = "code-style.md *Count tests by code path*"
+LOGGER_TEST = re.compile(r"\bspyOn\(\s*logger\s*,|\blogger\.(?:debug|info|warn|error)\s*(?:=[^=]|\.mock)"
+                         r"|\bexpect\(\s*logger\.(?:debug|info|warn|error)\s*\)")
+TEXT_MATCHER = re.compile(r"\s*\.(?:not\.)?(?:toContain|toMatch|toInclude|toStartWith|toEndWith)\(")
+PROMPT_NAME = re.compile(r"(?:description|prompt|instructions)s?$", re.I)
+PROMPT_FILE = re.compile(r"""["'`][^"'`]*\bprompts/[^"'`]*\.md["'`]""")
+# A name bound to a prompt file's text: `import guide from "../src/prompts/tools/computer.md"`,
+# `const guide = readFileSync(".../prompts/x.md", "utf8")`.
+PROMPT_BINDING = re.compile(r"""^\s*(?:import\s+([A-Za-z_$][\w$]*)\s+from|(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*="""
+                            r"""[^;]*?(?:readFileSync|readFile|Bun\.file))\s*[^;]*?["'`][^"'`]*\bprompts/[^"'`]*\.md["'`]""")
+FULL_SESSION = re.compile(r"\bcreateAgentSession\s*\(|\bnew\s+AgentSession\s*\(")
+# Added test cases: `it(`/`test(` (with `.only`, `.skip`, `.if(…)` and the like), each row of an
+# `it.each`/`test.each` table, Rust `#[test]`/`#[tokio::test]`, Python `def test_`.
+TEST_CASE = re.compile(r"^\s*(?:it|test)(?:\.(?:only|skip|todo|concurrent|serial|failing)|\.(?:if|skipIf|runIf)"
+                       r"\([^()]*\))*\s*\(|^\s*#\[(?:tokio::)?test\b|^\s*(?:async\s+)?def\s+test_")
+EACH_CASE = re.compile(r"^\s*(?:it|test)(?:\.\w+)*\.each\s*\(")
+# Test-volume thresholds: test lines over TEST_LINE_RATIO times the source lines and by at least
+# TEST_LINE_EXCESS lines (a 20-line regression test for a 5-line fix is the one test the rule
+# wants), or more than CASES_PER_FILE cases per changed source file. On our 63 merges 2026-10-22..
+# 11-02 this fires on 10 of the 13 PRs whose tests maintainers pared and 18 of the other 50; the
+# excess floor drops 5 small PRs and one pared PR (#17772, whose pared test pinned a cache-key
+# version, not volume). The two it misses (#16309, #17766) lost data-echo tests, not volume.
+TEST_LINE_RATIO = 1.5
+TEST_LINE_EXCESS = 20
+CASES_PER_FILE = 3
+# Neither tests nor source when counting: fixtures and snapshots, generated and lock files, docs.
+NOT_COUNTED = re.compile(r"(^|/)(fixtures?|__snapshots__|testdata)/|\.snap$|(^|/)CHANGELOG\.md$|(^|/)docs/"
+                         r"|(^|/)(models|rules)\.json$|(^|/)index\.d\.ts$|(^|/)native/index\.js$|(^|/)(bun\.lock|"
+                         r"Cargo\.lock|package-lock\.json)$")
 # A property in an interface or object type body; its hunk context names the type.
 FIELD_DECL = re.compile(r"^\s*(?:readonly\s+)?([A-Za-z_$][\w$]*)\??\s*:\s*[^=]+?[;,]?\s*$")
 FIELD_NAME = re.compile(r"^\s*(?:readonly\s+)?([A-Za-z_$][\w$]*)\??\s*:", re.M)
@@ -327,12 +371,18 @@ def check_timing(added, ref, cwd):
                 if not RS_CLOCK.search(code):
                     continue
                 if start is None:
-                    head = file_at(ref, path, cwd).splitlines()
-                    start = next((i + 2 for i, line in enumerate(head[:-1]) if line.strip() == "#[cfg(test)]"
-                                  and RS_TEST_MOD.match(head[i + 1])), 0) or -1
+                    start = rust_test_start(path, ref, cwd)
                 if 0 <= start <= n:
                     fix("timing", f"{path}:{n}", "wall-clock test: inject the clock or wait on the event, "
                         "never sleep or time a call")
+
+
+def rust_test_start(path, ref, cwd):
+    """The line Rust test code starts at in `path` at `ref`: the line after the `#[cfg(test)]` that
+    opens a test module, -1 when the file has none."""
+    head = file_at(ref, path, cwd).splitlines()
+    return next((i + 2 for i, line in enumerate(head[:-1]) if line.strip() == "#[cfg(test)]"
+                 and RS_TEST_MOD.match(head[i + 1])), 0) or -1
 
 
 def check_policy(added):
@@ -650,6 +700,162 @@ def check_text_tests(added):
                                                   "process or module) so the test fails when it misbehaves")
 
 
+def expect_subjects(code):
+    """[(subject, rest of the line)] for each `expect(subject)` in a line, read to its closing paren."""
+    found = []
+    for m in re.finditer(r"\bexpect\(", code):
+        depth, i = 1, m.end()
+        while i < len(code) and depth:
+            depth += {"(": 1, ")": -1}.get(code[i], 0)
+            i += 1
+        if not depth:
+            found.append((code[m.end():i - 1], code[i:]))
+    return found
+
+
+# Methods that reshape a text without naming it: `prompt.join("\n")` is still the prompt.
+TEXT_METHODS = {"join", "trim", "trimStart", "trimEnd", "toString", "toLowerCase", "toUpperCase", "slice",
+                "substring", "replace", "replaceAll", "normalize", "at"}
+
+
+def subject_name(subject):
+    """The last name an expect subject reads: `tool.description` -> description, `await
+    buildSystemPrompt(opts)` -> buildSystemPrompt, `tools.find(t => t.x)!.prompt` -> prompt,
+    `session.systemPrompt.join("\\n")` -> systemPrompt."""
+    s = subject.strip().rstrip("!?")
+    while s.endswith(")"):
+        depth, i = 0, len(s) - 1
+        while i >= 0:
+            depth += {")": 1, "(": -1}.get(s[i], 0)
+            if not depth:
+                break
+            i -= 1
+        s = s[:max(i, 0)].rstrip().rstrip("!?.")
+        m = re.search(r"\??\.\s*([A-Za-z_$][\w$]*)$", s)
+        if m and m.group(1) in TEXT_METHODS:
+            s = s[:m.start()].rstrip("!?")
+    names = re.findall(r"[A-Za-z_$][\w$]*", s)
+    return names[-1] if names else ""
+
+
+def case_blocks(text):
+    """[(first line, [lines])] of each test case in a test file's text: from its `it(`/`test(` line to
+    the next one (or the end)."""
+    lines = text.splitlines()
+    starts = [i for i, line in enumerate(lines) if TEST_CASE.match(line)]
+    return [(s + 1, lines[s:e]) for s, e in zip(starts, starts[1:] + [len(lines)])]
+
+
+def prompt_only_session(block):
+    """Whether a test case builds a full agent session and asserts only `toContain`/`toMatch` on
+    something named description, prompt or instructions."""
+    code = [code_part(line) for line in block]
+    if not any(FULL_SESSION.search(c) for c in code):
+        return False
+    asserts = [(s, rest) for c in code for s, rest in expect_subjects(c)]
+    return bool(asserts) and all(TEXT_MATCHER.match(rest) and PROMPT_NAME.search(subject_name(s)) for s, rest in asserts)
+
+
+def check_test_kinds(added, ref, cwd):
+    """Test lines of kinds maintainers deleted from our merged PRs while keeping the code: a spy on or
+    mock of the repo logger (debug-log wording, #16579's `spyOn(logger, "debug")`, `c98d4561f0`); an
+    assertion that a `src/prompts/` file's text appears in a description, prompt or request; and a
+    test case that builds a full `createAgentSession` only to find prompt text (#16918's SDK test,
+    `4b13432524`). A unit test of a description builder checking a section in or out is not one."""
+    for path, lines in sorted(added.items()):
+        if not is_test_path(path):
+            continue
+        whole = file_at(ref, path, cwd) if path.endswith(TS) else ""
+        bound = {g for line in whole.splitlines() if (m := PROMPT_BINDING.match(line)) for g in m.groups() if g}
+        for n, text in lines:
+            code = code_part(text)
+            if not code.strip():
+                continue
+            if LOGGER_TEST.search(code):
+                note("log-test", f"{path}:{n}", f"spies on or mocks the logger: log wording is no contract a user "
+                                                f"notices; assert what the code does ({COUNT_RULE})")
+            if any(TEXT_MATCHER.match(rest) for _, rest in expect_subjects(code)) and (
+                    PROMPT_FILE.search(text) or any(re.search(rf"(?<![\w$]){re.escape(b)}(?![\w$])", code) for b in bound)):
+                note("prompt-test", f"{path}:{n}", f"asserts a prompt file's text appears in a description, prompt or "
+                                                   f"request: that pins wording, not behaviour; drop it ({COUNT_RULE})")
+        new = {n for n, _ in lines}
+        for start, block in case_blocks(whole):
+            if start in new and prompt_only_session(block):
+                note("prompt-test", f"{path}:{start}", f"builds a full agent session only to find prompt or description "
+                                                       f"text: test the builder's branch in a unit test, or drop it "
+                                                       f"({COUNT_RULE})")
+
+
+def each_rows(texts):
+    """Rows of the `it.each([...])`/`test.each([...])` table opening at texts[0] (texts: it and the
+    added lines after it); 1 when the table is not an inline array."""
+    code = " ".join(code_part(t) for t in texts)
+    start = code.find("(", code.find(".each")) + 1
+    rest = code[start:].lstrip()
+    if not rest.startswith("["):
+        return 1
+    depth, commas, prev = 0, 0, ""
+    for ch in rest:
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+            if not depth:
+                break
+        elif ch == "," and depth == 1:
+            commas += 1
+        if not ch.isspace():
+            prev = ch
+    return commas if prev in ",[" else commas + 1
+
+
+def is_counted_source(path):
+    """Shipped source for the test-volume count: code, catalog KDL, and markdown under src/ (prompts)."""
+    return not is_test_path(path) and (path.endswith(CODE + (".kdl",)) or ("/src/" in path and path.endswith(".md")))
+
+
+def count_tests(diff, ref, cwd):
+    """(added test lines, added source lines, added test cases, changed source files), blank lines
+    left out, and fixtures, snapshots, generated files, lock files, CHANGELOGs and docs counted as
+    neither. A Rust file's inline test module (below its `#[cfg(test)] mod`) counts as tests."""
+    tests = source = cases = 0
+    files = {p for p in diff.removed_at if is_counted_source(p) and not NOT_COUNTED.search(p)}
+    for path, lines in diff.added.items():
+        if NOT_COUNTED.search(path) or not (path.endswith(CODE) or is_counted_source(path)):
+            continue
+        start = rust_test_start(path, ref, cwd) if path.endswith(".rs") and not is_test_path(path) else -1
+        for i, (n, text) in enumerate(lines):
+            if not text.strip():
+                continue
+            if is_test_path(path) or 0 < start <= n + 1:  # the `#[cfg(test)]` line above the module too
+                tests += 1
+                if EACH_CASE.match(text):
+                    run_end = next((j for j in range(i + 1, len(lines)) if lines[j][0] != n + j - i), len(lines))
+                    cases += each_rows([t for _, t in lines[i:min(run_end, i + 300)]])
+                elif TEST_CASE.match(text):
+                    cases += 1
+            else:
+                source += 1
+                files.add(path)
+    return tests, source, cases, len(files)
+
+
+def check_test_volume(diff, ref, cwd):
+    """More test than the change needs (thresholds above). H4vC pared same-path variants from 7 of
+    our PRs in three days (`642fce6b03` #17490, `3587ec7f14` #17510, `0fa4a8a570` #16309, #16552,
+    #16595, #17766, #17772); our ratio ran 1.0-3.6 test lines per source line, his 1.0."""
+    tests, source, cases, files = count_tests(diff, ref, cwd)
+    over = []
+    if source and tests - TEST_LINE_RATIO * source >= TEST_LINE_EXCESS:
+        over.append(f"{tests} test lines to {source} source lines (over {TEST_LINE_RATIO:g}x by "
+                    f"{tests - TEST_LINE_RATIO * source:.0f})")
+    if cases > CASES_PER_FILE * max(1, files):
+        over.append(f"{cases} test cases for {files} changed source file(s) (over {CASES_PER_FILE} each)")
+    if over:
+        note("tests", "; ".join(over), f"for each test, name the branch it reaches that no other test in the PR "
+                                       f"reaches; merge or delete the rest ({COUNT_RULE})")
+
+
 def check_consumers(diff, ref, cwd):
     """A field added to an interface or object type, against source files that name a third of
     that file's fields but not the new one: field-by-field readers, copiers and allowlists. The
@@ -929,6 +1135,8 @@ def main(argv):
     check_docs(added, removed, contexts, ref, cwd)
     check_removed_calls(diff)
     check_text_tests(added)
+    check_test_kinds(added, ref, cwd)
+    check_test_volume(diff, ref, cwd)
     check_consumers(diff, ref, cwd)
     check_prompt_values(added, ref, cwd)
     check_rust(diff, base, ref, cwd, queue_manifest(cwd))

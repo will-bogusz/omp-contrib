@@ -263,6 +263,109 @@ class PrecheckPrepTest(unittest.TestCase):
         self.assertNotIn(" init", out[0])
 
 
+class PrecheckTestCountTest(unittest.TestCase):
+    """code-style.md *Count tests by code path*: the tests maintainers pared from our merged PRs."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Repo(self.tmp.name)
+        self.base = self.repo.commit("init", {"packages/c/src/x.ts": "export const x = 1;\n"})
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def diff(self, files):
+        self.repo.commit("fix(c): change", files)
+        return PC.Diff(self.base, "HEAD", self.repo.dir)
+
+    def test_logger_spies_are_noted(self):
+        diff = self.diff({
+            "packages/c/test/t.test.ts": (
+                "const debugSpy = spyOn(logger, \"debug\");\n"                                      # 1 (#16579)
+                "logger.warn = mock(() => {});\n"                                                   # 2
+                "expect(logger.error).toHaveBeenCalled();\n"                                        # 3
+                "// spyOn(logger, \"debug\") is how not to do it\n"
+                "if (logger.warn === original) done();\n"),
+            "packages/c/src/x.ts": "export const x = 2;\nspyOn(logger, \"debug\");\n"})
+        out = notes(PC.check_test_kinds, diff.added, "HEAD", self.repo.dir)
+        self.assertEqual([o.split()[1:3] for o in out], [["log-test", f"packages/c/test/t.test.ts:{n}"]
+                                                         for n in (1, 2, 3)], out)
+        self.assertTrue(all("code-style.md *Count tests by code path*" in o for o in out), out)
+
+    # #16918's head: H4vC deleted the SDK test (a full session to find a computer.md line in its first
+    # request) and kept the description builder's unit test (`4b13432524`).
+    SDK_TEST = (
+        "import computerPrompt from \"../src/prompts/tools/computer.md\" with { type: \"text\" };\n"
+        "const guide = readFileSync(path.join(dir, \"../src/prompts/system/guide.md\"), \"utf8\");\n"
+        "it(\"sends the computer guide before the first call\", async () => {\n"                    # 3
+        "\tconst { session } = await createAgentSession({ settings });\n"
+        "\tawait session.prompt(\"first\");\n"
+        "\tconst description = mock.calls[0]?.context.tools?.find(tool => tool.name === \"eval\")?.description;\n"
+        "\texpect(description).toContain(\"<computer>\");\n"
+        "\texpect(description).toContain(computerPrompt.trim().split(\"\\n\", 1)[0]!);\n"         # 8
+        "\texpect(session.systemPrompt.join(\"\\n\")).not.toContain(guide);\n"                  # 9
+        "});\n"
+        "it(\"toggles the computer tool\", async () => {\n"
+        "\tconst { session } = await createAgentSession({ settings });\n"
+        "\texpect(session.getAllToolNames()).not.toContain(\"computer\");\n"
+        "\texpect(session.systemPrompt.join(\"\\n\")).toContain(\"# Computer Use\");\n"
+        "});\n")
+    UNIT_TEST = (
+        "it(\"inlines prelude docs into the description\", () => {\n"
+        "\tconst tool = new EvalTool(makeSession({ preludes: () => [prelude] }));\n"
+        "\texpect(tool.description).toContain(\"<fixture>\");\n"
+        "\texpect(tool.description).not.toContain(\"xd://eval/fixture\");\n"
+        "\texpect(computerPromptCount).toBe(1);\n"
+        "});\n")
+
+    def test_prompt_wording_tests_are_noted_and_a_builder_unit_test_is_not(self):
+        diff = self.diff({"packages/c/test/sdk-toggle.test.ts": self.SDK_TEST,
+                          "packages/c/test/eval-description.test.ts": self.UNIT_TEST})
+        out = notes(PC.check_test_kinds, diff.added, "HEAD", self.repo.dir)
+        self.assertEqual([o.split()[1:3] for o in out], [["prompt-test", f"packages/c/test/sdk-toggle.test.ts:{n}"]
+                                                         for n in (8, 9, 3)], out)
+        self.assertIn("asserts a prompt file's text appears", out[0])
+        self.assertIn("builds a full agent session only to find prompt or description text", out[2])
+
+    def test_more_test_lines_than_the_change_needs_are_noted_with_the_counts(self):
+        tests = "".join(f"\tit(\"case {i}\", () => {{\n\t\texpect(f({i})).toBe({i});\n\t}});\n" for i in range(4))
+        diff = self.diff({"packages/c/src/x.ts": "export const x = 2;\nexport const y = 3;\n",
+                          "packages/c/test/x.test.ts": "describe(\"x\", () => {\n" + tests + "});\n",
+                          "packages/c/test/fixtures/big.ts": "const a = 1;\n" * 200,
+                          "packages/c/CHANGELOG.md": "- Fixed x\n" * 50})
+        self.assertEqual(PC.count_tests(diff, "HEAD", self.repo.dir), (14, 2, 4, 1))
+        out = notes(PC.check_test_volume, diff, "HEAD", self.repo.dir)
+        self.assertEqual(len(out), 1, out)
+        self.assertIn("4 test cases for 1 changed source file(s) (over 3 each)", out[0])
+        self.assertIn("name the branch it reaches that no other test in the PR reaches", out[0])
+        self.assertNotIn("test lines to", out[0], "14 test lines over 2 source lines is under the 20-line floor")
+
+    def test_one_regression_test_is_fine_and_a_large_excess_is_not(self):
+        one = "it(\"keeps x\", () => {\n" + "\texpect(f()).toBe(1);\n" * 18 + "});\n"
+        diff = self.diff({"packages/c/src/x.ts": "export const x = 2;\n", "packages/c/test/x.test.ts": one})
+        self.assertEqual(notes(PC.check_test_volume, diff, "HEAD", self.repo.dir), [])
+        self.repo.commit("test(c): more", {"packages/c/test/x.test.ts": one + one})
+        out = notes(PC.check_test_volume, PC.Diff(self.base, "HEAD", self.repo.dir), "HEAD", self.repo.dir)
+        self.assertEqual([o.split()[1:7] for o in out], [["tests", "40", "test", "lines", "to", "1"]], out)
+        self.assertIn("(over 1.5x by 38)", out[0])
+
+    def test_each_rows_and_rust_tests_count_as_cases(self):
+        diff = self.diff({
+            "packages/c/src/x.ts": "export const x = 2;\n",
+            "packages/c/test/x.test.ts": ("it.each([\n\t[1, \"a\"],\n\t[2, \"b, c\"],\n\t[3, \"d\"],\n])(\"%d\", "
+                                          "n => {\n\texpect(n).toBeTruthy();\n});\n"
+                                          "test.each([1, 2])(\"%d\", n => expect(n).toBe(n));\n"
+                                          "it.each(CASES)(\"%s\", c => expect(c).toBeTruthy());\n"),
+            "crates/n/src/lib.rs": ("pub fn f() -> u8 {\n\t1\n}\n\n#[cfg(test)]\nmod tests {\n\t#[test]\n"
+                                    "\tfn one() {\n\t\tassert_eq!(super::f(), 1);\n\t}\n\t#[tokio::test]\n"
+                                    "\tasync fn two() {}\n}\n")})
+        tests, source, cases, files = PC.count_tests(diff, "HEAD", self.repo.dir)
+        self.assertEqual((cases, files), (3 + 2 + 1 + 2, 2))
+        self.assertEqual(source, 1 + 3, "the Rust file's lines above its test module are source")
+        out = notes(PC.check_test_volume, diff, "HEAD", self.repo.dir)
+        self.assertIn("8 test cases for 2 changed source file(s) (over 3 each)", out[0])
+
+
 class PrecheckBodyTest(unittest.TestCase):
     BODY = "## What\n\nI fixed it.\n\n{chart}\n\n## Why\n\n{prose}\n\n## Testing\n\nRan it.\n"
 
