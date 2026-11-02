@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { Model } from "@oh-my-pi/pi-ai";
 import type { ExtensionModelQuery } from "@oh-my-pi/pi-coding-agent";
-import { chooseReviewer, readConfiguredReviewers, recordRoute } from "./reviewer-family";
+import { chooseReviewer, recordRoute } from "./reviewer-family";
 
 function model(
 	provider: string,
@@ -44,19 +44,20 @@ function query(
 	return {
 		list: () => list,
 		current: () => current,
-		resolve: (spec) =>
-			roles[spec] ??
-			list.find((m) => spec === `${m.provider}/${m.id}` || spec === m.id),
+		resolve: (spec) => {
+			const base = spec.replace(/:(off|minimal|low|medium|high|xhigh|max)$/, "");
+			return roles[base] ?? list.find((m) => base === `${m.provider}/${m.id}` || base === m.id);
+		},
 		family: (m) => m.identity.class,
 	};
 }
 
-const reviewer = (patterns: string[] = []) => ({ agent: "reviewer", patterns });
+const reviewer = (patterns: string[] = [], modelRole?: string) => ({ agent: "reviewer", patterns, modelRole });
 
 describe("chooseReviewer", () => {
 	test("ignores other agents", () => {
 		expect(
-			chooseReviewer({ agent: "task", patterns: [] }, query(opus, [opus, gpt]), []),
+			chooseReviewer({ agent: "task", patterns: [] }, query(opus, [opus, gpt])),
 		).toBeUndefined();
 	});
 
@@ -64,7 +65,6 @@ describe("chooseReviewer", () => {
 		const result = chooseReviewer(
 			reviewer(["anthropic/claude-opus-5-5"]),
 			query(opus, [opus, haiku, gemini, gptLuna, astra, gptPro, gpt]),
-			[],
 		);
 		expect(result?.model).toEqual([
 			"openai-codex/gpt-6.1-sol",
@@ -78,7 +78,6 @@ describe("chooseReviewer", () => {
 		const result = chooseReviewer(
 			reviewer(["openai-codex/gpt-6.1-sol"]),
 			query(gpt, [gpt, gemini, kimi, haiku, mythos, opus]),
-			[],
 		);
 		expect(result?.model).toEqual([
 			"anthropic/claude-opus-5-5",
@@ -88,7 +87,7 @@ describe("chooseReviewer", () => {
 	});
 
 	test("another lab's session: Anthropic or OpenAI before the rest", () => {
-		const result = chooseReviewer(reviewer(), query(kimi, [kimi, gemini, gpt, opus]), []);
+		const result = chooseReviewer(reviewer(), query(kimi, [kimi, gemini, gpt, opus]));
 		expect(result?.model).toEqual([
 			"anthropic/claude-opus-5-5",
 			"openai-codex/gpt-6.1-sol",
@@ -100,7 +99,6 @@ describe("chooseReviewer", () => {
 		const result = chooseReviewer(
 			reviewer(["anthropic/claude-opus-5-5"]),
 			query(opus, [opus, haiku, gemini]),
-			[],
 		);
 		expect(result?.model).toEqual(["google/gemini-3-pro"]);
 	});
@@ -109,7 +107,6 @@ describe("chooseReviewer", () => {
 		const result = chooseReviewer(
 			reviewer(["anthropic/claude-opus-5-5"]),
 			query(opus, [opus, gpt, gptLuna, gemini], { "@plan": gemini, "@advisor": gptLuna }),
-			[],
 		);
 		expect(result?.model).toEqual([
 			"openai-codex/gpt-6-luna",
@@ -119,21 +116,31 @@ describe("chooseReviewer", () => {
 		expect(result?.note).toContain("@advisor");
 	});
 
-	test("models.reviewers: the first entry of another family, in the order written", () => {
-		const list = [opus, gpt, gemini];
-		expect(chooseReviewer(reviewer(), query(opus, list), ["google/gemini-3-pro", "openai-codex/gpt-6.1-sol"])?.model)
-			.toEqual(["google/gemini-3-pro", "openai-codex/gpt-6.1-sol"]);
-		const pair = ["openai-codex/gpt-6.1-sol", "anthropic/claude-opus-5-5"];
-		expect(chooseReviewer(reviewer(), query(opus, list), pair)?.model?.[0]).toBe("openai-codex/gpt-6.1-sol");
-		const gptSession = chooseReviewer(reviewer(), query(gpt, list), pair);
-		expect(gptSession?.model?.[0]).toBe("anthropic/claude-opus-5-5");
-		expect(gptSession?.note).toContain("(anthropic, models.reviewers)");
+	test("override pair: the first entry of another family, thinking suffix kept", () => {
+		const list = [opus, haiku, gpt, gemini];
+		const pair = ["openai-codex/gpt-6.1-sol:high", "anthropic/claude-opus-5-5:high"];
+		const claude = chooseReviewer(reviewer(pair), query(haiku, list));
+		expect(claude?.model?.[0]).toBe("openai-codex/gpt-6.1-sol:high");
+		expect(claude?.note).toContain("(openai, task.agentModelOverrides.reviewer)");
+		const gptSession = chooseReviewer(reviewer(pair), query(gpt, list));
+		expect(gptSession?.model?.[0]).toBe("anthropic/claude-opus-5-5:high");
 	});
 
-	test("unavailable models.reviewers entries fall through and say so", () => {
-		const result = chooseReviewer(reviewer(), query(opus, [opus, gpt]), ["nope/missing"]);
-		expect(result?.model).toEqual(["openai-codex/gpt-6.1-sol"]);
-		expect(result?.note).toContain('"nope/missing" not available');
+	test("patterns keep their written order over the lab preference", () => {
+		const result = chooseReviewer(
+			reviewer(["google/gemini-3-pro", "openai-codex/gpt-6.1-sol"]),
+			query(opus, [opus, gpt, gemini]),
+		);
+		expect(result?.model).toEqual(["google/gemini-3-pro", "openai-codex/gpt-6.1-sol"]);
+	});
+
+	test("@slow of another family is kept; unavailable patterns are skipped", () => {
+		const result = chooseReviewer(
+			reviewer(["nope/missing", "openai-codex/gpt-6.1-sol:medium"], "slow"),
+			query(opus, [opus, gpt]),
+		);
+		expect(result?.model).toEqual(["openai-codex/gpt-6.1-sol:medium"]);
+		expect(result?.note).toContain("@slow");
 	});
 
 	test("ranks providers the user already runs before pricier ones only listed", () => {
@@ -144,7 +151,6 @@ describe("chooseReviewer", () => {
 		const result = chooseReviewer(
 			reviewer(["openai-codex/gpt-6.1-sol"]),
 			query(gpt, [gpt, routed, cursor, opus, haiku], { "@smol": haiku }),
-			[],
 		);
 		expect(result?.model).toEqual([
 			"anthropic/claude-opus-5-5",
@@ -158,7 +164,7 @@ describe("chooseReviewer", () => {
 		const noTools = model("openai", "gpt-6-notools", "openai", 30, {
 			supportsTools: false,
 		});
-		const result = chooseReviewer(reviewer(), query(opus, [opus, image, noTools, gpt]), []);
+		const result = chooseReviewer(reviewer(), query(opus, [opus, image, noTools, gpt]));
 		expect(result?.model).toEqual(["openai-codex/gpt-6.1-sol"]);
 	});
 
@@ -166,48 +172,15 @@ describe("chooseReviewer", () => {
 		const result = chooseReviewer(
 			reviewer(["anthropic/claude-opus-5-5"]),
 			query(haiku, [opus, haiku]),
-			[],
 		);
 		expect(result?.model).toEqual(["anthropic/claude-opus-5-5"]);
 		expect(result?.note).toContain("same-family review");
 		expect(result?.note).toContain("Testing section");
 	});
 
-	test("same family only: a resolving models.reviewers entry wins over the spawn's models", () => {
-		const result = chooseReviewer(
-			reviewer(["anthropic/claude-haiku-5-5"]),
-			query(haiku, [opus, haiku]),
-			["openai-codex/gpt-6.1-sol", "anthropic/claude-opus-5-5"],
-		);
-		expect(result?.model).toEqual(["anthropic/claude-opus-5-5"]);
-		expect(result?.note).toContain("same-family review");
-		expect(result?.note).toContain('"openai-codex/gpt-6.1-sol" not available');
-	});
-
 	test("same family with empty patterns pins the session model", () => {
-		const result = chooseReviewer(reviewer(), query(haiku, [haiku]), []);
+		const result = chooseReviewer(reviewer(), query(haiku, [haiku]));
 		expect(result?.model).toEqual(["anthropic/claude-haiku-5-5"]);
-	});
-});
-
-describe("config", () => {
-	test("reads models.reviewers from $OMP_CONTRIB_CONFIG in order; empty or missing is []", async () => {
-		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "reviewer-family-"));
-		try {
-			const env = { OMP_CONTRIB_CONFIG: path.join(dir, "config.toml") };
-			expect(readConfiguredReviewers(env)).toEqual([]);
-			await Bun.write(env.OMP_CONTRIB_CONFIG, "[models]\nreviewers = []\n");
-			expect(readConfiguredReviewers(env)).toEqual([]);
-			await Bun.write(
-				env.OMP_CONTRIB_CONFIG,
-				'[models]\nreviewers = ["openai-codex/gpt-6.1-sol", " anthropic/claude-opus-5-5 ", ""]\n',
-			);
-			expect(readConfiguredReviewers(env)).toEqual(["openai-codex/gpt-6.1-sol", "anthropic/claude-opus-5-5"]);
-			await Bun.write(env.OMP_CONTRIB_CONFIG, "[models\n");
-			expect(() => readConfiguredReviewers(env)).toThrow();
-		} finally {
-			await fs.rm(dir, { recursive: true, force: true });
-		}
 	});
 });
 

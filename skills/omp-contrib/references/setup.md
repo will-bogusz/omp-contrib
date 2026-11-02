@@ -33,7 +33,7 @@ defaults.
    - **Never record a choice the user did not see and answer**, ideal ones included: a record
      is written only after its question was answered. An answer marked
      `(auto-selected after timeout)`, a cancelled question, or a record left out of the form
-     stays undecided (doctor keeps listing it); reviewer and autonomy are always asked, never
+     stays undecided (doctor keeps listing it); models and autonomy are always asked, never
      recorded as a default.
 3. Write each outcome with `scripts/doctor --set KEY VALUE` (e.g. `--set build.linux ci`) and
    `scripts/doctor --record <id> VALUE REASON` (`[choices.<id>]` with `value`, `reason`: the user's
@@ -47,8 +47,8 @@ defaults.
    command first. doctor never installs packages itself: its `fix` field is a proposal. After
    installing tools, rerun doctor before acting on rows probed without them (e.g. `gh` may already
    be logged in through `GH_TOKEN`). Never ask the user to paste a token into the chat. Safe local
-   repairs go through `scripts/doctor --fix <hook|fork|queue-branch|omp-settings>`, which prints
-   each step (`--dry-run` to preview).
+   repairs go through `scripts/doctor --fix <hook|fork|queue-branch|omp-settings|reviewer>`, which
+   prints each step (`--dry-run` to preview).
 5. Rerun `scripts/doctor` and resolve or explain every remaining `missing`.
 6. Finish with a dry-run first hunt (*Dry run* below).
 
@@ -109,42 +109,66 @@ the ideal itself costs something) · **Alternatives** (ranked, with cost) · **A
 - **Re-offer when.** doctor's `recommended` beats the recorded value (a new ssh host of that OS,
   cargo-xwin installed) and the choice did not say `reoffer = false`.
 
-### reviewer: who reviews the diff
+### models: who runs what
 
-- **Intent** (say it in these plain words). The model that wrote a fix cannot see its own blind
-  spots, and a model from the same lab tends to share them. So before roboomp reviews the PR
-  (once ever, on the head it first sees), one model from another lab reads the diff once,
-  against review-brief.md, and its findings are fixed first.
-- **Ideal.** `models.reviewers` = doctor's `recommended` list: the strongest OpenAI model the
-  user can use, then the strongest Anthropic one, e.g. `["openai-codex/gpt-6.1-sol",
-  "anthropic/claude-opus-5-5"]`. At spawn the reviewer-family extension takes the first entry
-  from another lab than the session's: a Claude session gets the OpenAI reviewer, a GPT session
-  the Anthropic one, a session on any other lab the first entry. It stays right when the user
-  switches driver models. Why these two labs: their frontier models are the strongest code
-  reviewers available on consumer subscriptions, and the whole flow was measured on Opus and Sol.
-- **Probe.** `models.labs` (per lab the user is logged in to, its best reviewer; resellers
-  marked), `models.reviewers` (current value, `recommended`, and `notes`: the reason, plus one
-  line per gap, e.g. "no OpenAI login: reviews of Anthropic sessions go to google/…; `/login`
-  ChatGPT Plus/Pro (Codex) adds GPT Sol").
+- **Intent** (say it in these plain words). Three kinds of model do the work, and the user
+  should know which runs where before anything goes out under their name. The model that wrote
+  a fix cannot see its own blind spots, and a model from the same lab tends to share them, so
+  before roboomp reviews the PR (once ever, on the head it first sees) one model from another
+  lab reads the diff once, against review-brief.md.
+- **Probe**, all with the user's real values: `models.driver` (the session `/contribute` runs in:
+  their `@default`, or the last-used model when unset), `models.subagents` (omp's task model
+  assignment: `task` → `@task`, `scout` → `@smol`, `reviewer` → `task.agentModelOverrides.reviewer`
+  else `@slow`, each with what it is set to here), `models.labs` (per lab the user is logged in
+  to, its best reviewer; resellers marked), `models.reviewer` (the current override or `@slow`,
+  `recommended`, and `notes`: the reason, the cost, that it is global, the exact `apply:` line,
+  plus one line per missing lab, e.g. "no OpenAI login: reviews of Anthropic sessions go to
+  google/…; `/login` ChatGPT Plus/Pro (Codex) adds GPT Sol").
+- **Who runs what** (state it before the question, from the probe):
+  - **Driver**: the model of the session `/contribute` runs in. Measured: Claude Opus 5.5 and
+    GPT-6.1 Sol finish the flow; smaller models are held to its steps by the plugin's gates but
+    judge less well (diagnosis, scope, evidence). `/model` switches a session.
+  - **Subagents**: omp's own assignment, unchanged by this plugin: `task` workers run `@task`,
+    `scout` runs `@smol`, the `reviewer` runs `task.agentModelOverrides.reviewer`, else `@slow`.
+  - **Reviewer**: the plugin's reviewer-family extension takes the first of the reviewer's
+    models from another lab than the session's, keeping its thinking level; when none is (no
+    override, `@slow` on the session's own lab) it picks the other of Anthropic and OpenAI.
+- **Ideal.** `task.agentModelOverrides.reviewer` = doctor's `recommended` value: the strongest
+  OpenAI model the user can use, then the strongest Anthropic one, at high thinking, e.g.
+  `"openai-codex/gpt-6.1-sol:high, anthropic/claude-opus-5-5:high"`. A Claude session gets the
+  OpenAI reviewer, a GPT session the Anthropic one, a session on any other lab the first entry;
+  it stays right when the user switches driver models. Why these two labs: their frontier models
+  are the strongest code reviewers available on consumer subscriptions, and the whole flow was
+  measured on Opus and Sol.
 - **Cost.** One review per PR, never repeated. The last measured reviewer run (on Sol) came to
-  about $1–2 at list price; on a subscription login it spends quota, not money.
-- **Alternatives**, best first: the recommended list → empty (the extension ranks at spawn with
-  the same Anthropic/OpenAI preference; costs: the user never sees which model reviews) → models
-  the user names (another lab they trust, a cheaper tier; costs: unmeasured with this flow) →
-  one lab only (every review of that lab's sessions is same-family and the PR's Testing section
-  says so; name the `/login` that adds the missing lab, as a fix, not a requirement). A lab
-  reached only through a reseller works but may serve the model differently; doctor's `notes`
-  say so.
-- **Ask.** Always, even when the recommendation is obvious. In the question: the intent above,
-  the labs doctor found with each one's best model (`models.labs`), and how to change it later
-  (`/contribute setup` and pick reviewer, or the same `--set`). In the recommended option's
-  description: which model reviews which sessions, why those two labs, the cost. The
-  alternatives with their costs; when a lab is missing, what that means for this user's sessions
-  and the login that adds it (`notes`). Write the answer with
-  `scripts/doctor --set models.reviewers '<json list>'` (nothing for "empty") and
-  `scripts/doctor --record reviewer '<the list, or "unset">' '<their reason>'`.
+  about $1–2 at list price; on a subscription login it spends quota, not money. The override is
+  omp's own setting: it changes omp's reviewer agent in all the user's sessions, not only
+  contributions. Say so.
+- **Alternatives**, best first: the recommended override → keep current assignments (no
+  override: the reviewer runs `@slow`; say what that is here and what it means, e.g. "`@slow` is
+  Sol, so Claude sessions get Sol and GPT sessions get the extension's pick of Anthropic"; if
+  `@slow` is unset or on one lab, that lab's sessions get the fallback pick; nothing in omp
+  changes) → custom (the user names selectors, `provider/id[:thinking]` or `@role`, applied the
+  same way; or sets roles themselves in omp's `/models`). One lab only: every review of that
+  lab's sessions is same-family and the PR's Testing section says so; name the `/login` that adds
+  the missing lab, as a fix, not a requirement.
+- **Ask.** Always, even when the recommendation is obvious, as its own question (not merged with
+  behaviour-models). In the question, with the real names: the intent above; the driver by model
+  name: the model this wizard session runs on, which is your own model (e.g. "you are driving with
+  Sonnet 5.5"), never "your last-used model" or "@default"; add `models.driver`'s `@default` only
+  when it differs; and the measured note (Opus 5.5 and Sol finish the flow; smaller models are
+  held to the steps but judge less well); each subagent's assignment; the labs found; that the
+  override is global; and how to change it later (`/contribute setup` and pick models, or omp's
+  `/models`). In the recommended option's description: which model reviews which sessions, why
+  those two labs (strongest code reviewers on consumer subscriptions, the pair the flow was
+  measured on), the cost. Each other option with what it means and costs. Before applying, show the exact
+  `omp config set` line (doctor's `apply:` note; for custom, `scripts/doctor --fix reviewer
+  --value '<selectors>' --dry-run` prints it) and apply only on approval:
+  `scripts/doctor --fix reviewer [--value '<selectors>']`. Nothing is written to omp's config
+  for "keep current". Record with `scripts/doctor --record models '<the override, or "keep
+  current">' '<their reason>'`.
 - **Re-offer when.** doctor marks `reoffer` (the recommendation now covers Anthropic or OpenAI and
-  the choice did not), or an entry stops resolving (`models.reviewers` degraded with a `fix`).
+  the choice did not), or an entry stops resolving (`models.reviewer` degraded with a `fix`).
 
 ### behaviour-models: the pair for prompt and tool-text changes
 
@@ -155,14 +179,15 @@ the ideal itself costs something) · **Alternatives** (ranked, with cost) · **A
 - **Ideal.** Leave `models.behaviour` empty: doctor derives the pair per lab as the cheapest
   priced reasoning model with ≥128k context on the lab's own provider, Anthropic and OpenAI first
   (most omp users drive with them, so a change is checked where it lands most), e.g. Haiku + GPT
-  Luna; it follows the catalog as models change.
+  Luna; it follows the catalog as models change. Explicit entries are omp selectors like the
+  reviewer's (`provider/id[:thinking]`, `@role`).
 - **Probe.** `models.behaviour` (the pair and, in `notes`, why), `models.labs`.
 - **Cost.** Only PRs that change agent-facing text: one sample set per model on `main` and on the
   branch, cheap tier, on subscription quota.
 - **Alternatives.** The derived pair → two explicit selectors (costs: goes stale as catalogs
   move) → one lab only (the run uses one model and the PR says so; name the login that adds a
   second lab).
-- **Ask.** Always, and it may share a form with reviewer: the intent, the derived pair by name,
+- **Ask.** Always, and it may share a form with models: the intent, the derived pair by name,
   why cheap models of those two labs, the cost, the alternatives. Record with
   `scripts/doctor --record behaviour-models derived '<their reason>'` (or `--set models.behaviour
   a,b` for an explicit pair).

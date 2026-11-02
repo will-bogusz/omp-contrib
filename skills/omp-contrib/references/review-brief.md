@@ -1,9 +1,9 @@
 # Reviewer brief: the independent "what did `main` do" review
 
 Part of the `omp-contrib` skill. Workflow step 3 spawns omp's bundled `reviewer` agent with this
-file as its brief (pinned to `@slow`; the plugin's reviewer-family extension moves it to the first
-`models.reviewers` entry from another lab than the session's, else to the other of Anthropic and
-OpenAI). The task adds the PR, the worktree and the worker's
+file as its brief (its models: omp's `task.agentModelOverrides.reviewer`, else `@slow`; the
+plugin's reviewer-family extension takes the first from another lab than the session's, else the
+other of Anthropic and OpenAI). The task adds the PR, the worktree and the worker's
 report. Read `skill://omp-contrib` for the repo's conventions; the brief below is what the
 reviewer acts on.
 

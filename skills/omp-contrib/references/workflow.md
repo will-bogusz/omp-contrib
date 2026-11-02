@@ -7,7 +7,8 @@ in `backticks` (`paths.worktrees`, `github.branch_prefix`, `build.linux`, …) a
 Two omp settings this workflow needs, both set up by the wizard ([setup.md](setup.md)):
 `task.maxRecursionDepth` of at least 3, so a worker under a lead can spawn its own reviewer, and a
 reviewer of another model family than the session's (the plugin's reviewer-family extension:
-the first `models.reviewers` entry from another lab, else the other of Anthropic and OpenAI).
+the first entry of omp's `task.agentModelOverrides.reviewer`, else of `@slow`, from another lab;
+else the other of Anthropic and OpenAI).
 
 Each step below that the fix chain gates is recorded in `../scripts/contrib` (SKILL.md, *Fixing
 something omp did wrong*); `contrib next` names the step left and its command, and `pr-queue add`
@@ -65,9 +66,10 @@ refuses a branch until the steps before it are done.
     run, with a cheaper class only as a pilot. A benchmark that measures both splits in two:
     #14249's read->edit fidelity needs Opus, its cache and signed-thinking cost does not.
   - **Then one independent "what did `main` do" review: one round per PR, total.** The worker
-    spawns omp's bundled `reviewer` agent itself (it is pinned to `@slow`; the reviewer-family
-    extension moves it to the first `models.reviewers` entry from another lab than the session's,
-    else to the other of Anthropic and OpenAI; with `task.maxRecursionDepth` at
+    spawns omp's bundled `reviewer` agent itself (its models are omp's
+    `task.agentModelOverrides.reviewer`, else `@slow`; the reviewer-family extension takes the
+    first from another lab than the session's, else the other of Anthropic and OpenAI; with
+    `task.maxRecursionDepth` at
     3 a worker under a lead can; never relay it through the lead; a plain `task` carrying the brief is
     refused by the plugin's flow-nudge extension) with
     [review-brief.md](review-brief.md) as its brief, not "is the fix sound":

@@ -2,7 +2,7 @@
 """Check this machine against what the omp-contrib flow needs, and repair the safe local parts.
 
 usage: doctor [--json] [--probe-hosts] [--area AREA ...]
-       doctor --fix AREA [--dry-run]
+       doctor --fix AREA [--value SELECTORS] [--dry-run]
        doctor [--set KEY VALUE ...] [--record DECISION VALUE REASON [--no-reoffer]]
        doctor --record-validated [--ref REF]
   --json          one JSON object: {configured, config_path, checks: [{area, id, status, detail, fix?,
@@ -19,10 +19,13 @@ usage: doctor [--json] [--probe-hosts] [--area AREA ...]
                     fork          `gh repo fork` the upstream (no clone) and add the fork remote
                     queue-branch  create the queue branch on the fork with an empty manifest
                     omp-settings  `omp config set` the three settings below that are short
+                    reviewer      set omp's `task.agentModelOverrides.reviewer` (all sessions' reviewer) to
+                                  doctor's recommended cross-lab pair, or to --value: comma-separated omp
+                                  selectors (`provider/id[:thinking]`, `@role`); other agents' entries kept
                   nothing here installs system packages: the agent proposes those to the user
   --dry-run       with --fix: print the steps, run none
   --set KEY VALUE write one config key (e.g. `--set build.linux ci`, `--set watch.enabled false`,
-                  `--set models.reviewers a/x,b/y`); repeatable
+                  `--set models.behaviour a/x,b/y`); repeatable
   --record DECISION VALUE REASON
                   write [choices.DECISION] with value, reason and today's date; with --no-reoffer the
                   choice holds regardless (doctor never re-offers the ideal)
@@ -81,15 +84,16 @@ SCHEMA = {
                "queue_branch": str, "branch_prefix": str},
     "paths": {"checkout": str, "worktrees": str, "scratch_roots": list},
     "build": {"linux": str, "macos": str, "windows": str},
-    "models": {"reviewers": list, "behaviour": list, "cold_read": str},
+    "models": {"behaviour": list, "cold_read": str},
     "images": {"upload": str},
     "autonomy": {"open_p2": str, "supervised_opens": int},
     "watch": {"enabled": bool},
     "queue": {"host_label": str},
 }
 ENUMS = {("images", "upload"): ("relay", "fork-links"), ("autonomy", "open_p2"): ("hold", "open")}
-DECISIONS = ("github", "build-hosts", "reviewer", "behaviour-models", "omp-settings", "image-upload",
+DECISIONS = ("github", "build-hosts", "models", "behaviour-models", "omp-settings", "image-upload",
              "chart-tools", "autonomy", "watcher", "session-reader")
+REVIEWER_AGENT = "reviewer"
 CHOICE_KEYS = {"value": None, "reason": str, "at": str, "reoffer": bool}
 
 
@@ -143,6 +147,8 @@ def validate_config(data):
                 errors.append(f"{where}: must be 0 or more")
             elif section == "models" and key == "behaviour" and len(value) not in (0, 2):
                 errors.append(f"{where}: two models (of different families), or empty for the derived pair")
+            elif section == "models" and any(v and not omp_config.SELECTOR.match(v) for v in (value if isinstance(value, list) else [value])):
+                errors.append(f"{where}: {value!r}: each entry one omp selector, `provider/id[:thinking]` or `@role[:thinking]`")
     return errors
 
 
@@ -321,7 +327,7 @@ def reviewer_ranking(fam, models):
 
 
 def reviewer_plan(models):
-    """What the wizard offers for `models.reviewers`: per lab its best reviewer (`labs`: {family: {"best",
+    """What the wizard offers for omp's `task.agentModelOverrides.reviewer`: per lab its best reviewer (`labs`: {family: {"best",
     "own"}}), the recommended ordered list (`recommended`: OpenAI then Anthropic; a missing one replaced by
     the best other lab), and one line per gap in that pairing (`missing`)."""
     labs = {}
@@ -363,6 +369,21 @@ def behaviour_pair(models):
     return [p[3] for p in picks[:2]] if len(picks) >= 2 else []
 
 
+def selector_available(selector, ids, roles):
+    """Whether an omp selector names an available model: `@role` through `roles` (an unset role counts: omp
+    falls back to its built-in pick), `provider/id` with its thinking suffix dropped."""
+    base = omp_config.expand_role(selector, roles)
+    return base.startswith("@") or base in ids or any(i.endswith("/" + base) for i in ids)
+
+
+def override_line(overrides, value):
+    """The `omp config set` line that sets the reviewer's model override to `value`, keeping the other agents'
+    entries (omp sets the record whole; `task.agentModelOverrides.reviewer` alone is not a settable key)."""
+    merged = {**overrides, REVIEWER_AGENT: value}
+    return f"omp config set task.agentModelOverrides '{json.dumps(merged, separators=(',', ':'))}'"
+
+
+
 # ---------------------------------------------------------------------------------------------------
 # recorded choices (pure)
 
@@ -381,6 +402,15 @@ def choice_reoffer(choice, ideal, ideal_available):
 
 # ---------------------------------------------------------------------------------------------------
 # probes
+
+def omp_get(key):
+    """`omp config get KEY` as JSON (the merged layers this cwd sees); None when omp cannot answer."""
+    code, out, err = run("omp", "config", "get", key, "--json", timeout=5)
+    try:
+        return json.loads(out).get("value") if code == 0 else None
+    except json.JSONDecodeError:
+        return None
+
 
 def run(*args, cwd=None, timeout=10, env=None):
     """(returncode, stdout, stderr); (None, "", reason) when the command is missing or hangs."""
@@ -655,16 +685,9 @@ class Doctor:
             self.add("omp", "omp", "missing", "omp is not on PATH", "install omp (https://github.com/can1357/oh-my-pi)")
             return
 
-        def get(key):
-            code, out, err = run("omp", "config", "get", key, "--json", timeout=5)
-            try:
-                return json.loads(out).get("value") if code == 0 else None
-            except json.JSONDecodeError:
-                return None
-
         keys = ["task.maxRecursionDepth", "task.agentSoftRequestBudget", "task.softRequestBudget", "task.isolation.enabled"]
         with concurrent.futures.ThreadPoolExecutor(4) as pool:
-            values = dict(zip(keys, pool.map(get, keys)))
+            values = dict(zip(keys, pool.map(omp_get, keys)))
         depth = values["task.maxRecursionDepth"]
         budgets = values["task.agentSoftRequestBudget"] or {}
         reviewer_budget = budgets.get("reviewer", values["task.softRequestBudget"] if values["task.softRequestBudget"] is not None else 200)
@@ -689,23 +712,35 @@ class Doctor:
     def models(self):
         if not shutil.which("omp"):
             return
-        code, out, err = run("omp", "models", "--json", timeout=15)
+        with concurrent.futures.ThreadPoolExecutor(3) as pool:
+            listing = pool.submit(run, "omp", "models", "--json", timeout=15)
+            roles_job = pool.submit(omp_config.model_roles)
+            overrides_job = pool.submit(omp_get, "task.agentModelOverrides")
+            code, out, err = listing.result()
+            roles, overrides = roles_job.result(), overrides_job.result() or {}
         try:
             models = json.loads(out)["models"] if code == 0 else []
         except (json.JSONDecodeError, KeyError):
             models = []
         fams = families(models)
         self.facts["families"] = {f: len(ms) for f, ms in sorted(fams.items())}
+        self.facts["model_roles"], self.facts["agent_model_overrides"] = roles, overrides
         if not models:
             self.add("models", "models.available", "missing", "omp lists no usable models: no provider is logged in",
                      "omp then /login (or set a provider API key)")
             return
         self.add("models", "models.available", "ok", f"{len(models)} models; families: {', '.join(sorted(fams)) or 'none recognised'}")
-        self.reviewers(models)
+        self.who_runs_what(models, roles, overrides)
         cfg = self.cfg
+        ids = {_selector(m) for m in models}
+        self.model_ids = ids  # for --fix reviewer; too long for the report
         pair = cfg.behaviour_models or behaviour_pair(models)
         self.facts["behaviour_pair"] = pair
-        if len(pair) == 2 and len({model_family(p) for p in pair}) == 2:
+        gone = [s for s in pair if not selector_available(s, ids, roles)]
+        if gone:
+            self.add("models", "models.behaviour", "degraded", f"models.behaviour = {' + '.join(pair)}; not available: {', '.join(gone)}",
+                     "pick two available models (`omp models`), or empty models.behaviour for the derived pair", decision="behaviour-models")
+        elif len(pair) == 2 and len({model_family(omp_config.expand_role(p, roles)) for p in pair}) == 2:
             self.add("models", "models.behaviour", "ok", ("models.behaviour = " if cfg.behaviour_models else "derived pair: ") + " + ".join(pair),
                      decision="behaviour-models", notes=[] if cfg.behaviour_models else [
                          "derived: per lab the cheapest priced reasoning model with >= 128k context on the lab's own provider, "
@@ -716,12 +751,16 @@ class Doctor:
                      "no pair of different families for behaviour runs of prompt changes: precheck's behaviour NOTE runs one model",
                      "log in to a second provider family, or set models.behaviour", decision="behaviour-models")
 
-    def reviewers(self, models):
-        """`models.reviewers` against the inventory: the best reviewer per lab, the recommended list, and what
-        the Anthropic/OpenAI pairing is missing (setup.md, reviewer record)."""
-        cfg, plan = self.cfg, reviewer_plan(models)
+    def who_runs_what(self, models, roles, overrides):
+        """Which model runs each part of the flow on this machine (setup.md, models record): the driver, the
+        subagents by omp's task model assignment, and the reviewer against the lab inventory and recommendation."""
+        plan = reviewer_plan(models)
         labs, rec = plan["labs"], plan["recommended"]
-        self.facts["reviewers"] = {**plan, "current": cfg.reviewers}
+        ids = {_selector(m) for m in models}
+        role = lambda name: (roles.get(name) or "").strip() if isinstance(roles.get(name), str) else ", ".join(roles.get(name) or [])
+        shown_role = lambda name: f"@{name} = {role(name)}" if role(name) else f"@{name} unset (omp's built-in pick; `/models` shows it)"
+        lab_of = lambda sel: LABS.get(model_family(omp_config.expand_role(sel, roles)) or "", "unknown lab")
+
         lab_order = sorted(labs, key=lambda f: (f not in PRIORITY_FAMILIES, FAMILY_ORDER.index(f) if f in FAMILY_ORDER else 99))
         # Other labs only through a reseller are counted, not named: they are the last fallback.
         shown = [f for f in lab_order if f in PRIORITY_FAMILIES or labs[f]["own"]]
@@ -729,41 +768,63 @@ class Doctor:
         self.add("models", "models.labs", "ok" if labs else "degraded", "best reviewer per lab: " + "; ".join(
             f"{LABS.get(f, f)} {labs[f]['best']}" + ("" if labs[f]["own"] else " (reseller)") for f in shown)
             + (f"; {rest} more lab(s) through resellers only" if rest else "") if labs
-            else "no model of a known lab", decision="reviewer")
-        ids = {_selector(m) for m in models}
-        available = lambda spec: spec.startswith("@") or spec.split(":")[0] in ids or any(i.endswith("/" + spec.split(":")[0]) for i in ids)
+            else "no model of a known lab", decision="models")
+
+        driver = role("default")
+        self.add("models", "models.driver", "ok",
+                 f"the session /contribute runs in: @default = {driver} ({lab_of(driver)})" if driver
+                 else "the session /contribute runs in: @default unset, so omp starts with your last-used model", decision="models",
+                 notes=["measured: Claude Opus 5.5 and GPT-6.1 Sol finish the flow; smaller models are held to its steps by the "
+                        "plugin's gates but judge less well (diagnosis, scope, evidence); `/model` switches a session"])
+
+        override = overrides.get(REVIEWER_AGENT)
+        override = ", ".join(override) if isinstance(override, list) else (override or "").strip()
+        reviewer = (f"reviewer → task.agentModelOverrides.reviewer = {override}" if override
+                    else f"reviewer → {shown_role('slow')} (no override)")
+        self.add("models", "models.subagents", "ok", f"task → {shown_role('task')}; scout → {shown_role('smol')}; {reviewer}",
+                 decision="models", notes=["omp's task model assignment: task.agentModelOverrides.<agent>, else the agent's "
+                                           "own role (task: @task, scout: @smol, reviewer: @slow), else the session's model"])
+
+        value = ", ".join(f"{s}:high" for s in rec)
+        line = override_line(overrides, value) if rec else None
         both = all(f in labs for f in PRIORITY_FAMILIES)
-        why = ("Claude sessions are reviewed by the OpenAI entry, GPT sessions by the Anthropic one, any other lab's by "
-               "the first; the strongest code reviewers on consumer subscriptions, and the pair the flow was measured on "
-               "(Opus, Sol)" if both else "each session is reviewed by the first entry from another lab than its own")
-        notes = [f"recommended models.reviewers = {json.dumps(rec)}: {why}"] + plan["missing"] if rec else plan["missing"]
-        current_fams = {model_family(s) for s in cfg.reviewers} - {None}
+        why = ("a Claude session gets the OpenAI entry, a GPT session the Anthropic one, any other lab's the first: the "
+               "strongest code reviewers on consumer subscriptions, and the pair the flow was measured on (Opus, Sol)"
+               if both else "each session gets the first entry from another lab than its own")
+        notes = ([f"recommended task.agentModelOverrides.reviewer = \"{value}\": {why}",
+                  "cost: one review per PR, never repeated; the last measured run on Sol came to about $1-2 at list price, "
+                  "subscription quota on a login",
+                  "omp's reviewer agent is global: the override applies to every session's reviewer, not only contributions",
+                  f"apply: {line}"] if rec else []) + plan["missing"]
+        entries = [e.strip() for e in override.split(",") if e.strip()]
+        current_fams = {model_family(omp_config.expand_role(e, roles)) for e in entries} - {None}
         login = "; ".join(LOGIN[f] for f in PRIORITY_FAMILIES if f not in labs) or "log in to a second lab (omp /login)"
-        set_rec = f"scripts/doctor --set models.reviewers '{json.dumps(rec)}'"
-        if cfg.reviewers:
-            gone = [s for s in cfg.reviewers if not available(s)]
-            detail = f"models.reviewers = {json.dumps(cfg.reviewers)}"
+        if entries:
+            gone = [e for e in entries if not selector_available(e, ids, roles)]
+            detail = f"override = \"{override}\""
             if gone:
-                status, fix, detail = "degraded", set_rec, detail + f"; not available: {', '.join(gone)}"
-            elif len(current_fams) >= 2:
-                status, fix = "ok", None
-            elif len(labs) >= 2:
-                status, fix, detail = "degraded", set_rec, detail + ": one lab only, so its own sessions get a same-family review"
+                status, fix, detail = "degraded", "scripts/doctor --fix reviewer", detail + f"; not available: {', '.join(gone)}"
+            elif len(current_fams) >= 2 or len(labs) < 2:
+                status, fix = ("ok", None) if len(current_fams) >= 2 else ("degraded", login)
             else:
-                status, fix = "degraded", login
-        elif len(labs) >= 2:
-            status, fix = "ok", None
-            detail = "unset: the reviewer-family extension ranks at spawn (the other of Anthropic and OpenAI first)"
+                status, fix, detail = "degraded", "scripts/doctor --fix reviewer", detail + ": one lab only, so its own sessions get a same-family review"
         else:
-            status, fix = "degraded", login
-            detail = f"one lab available ({', '.join(labs) or 'none'}): every review is same-family; the PR's Testing section says so"
+            slow = role("slow")
+            detail = (f"no override: the reviewer runs @slow = {slow} ({lab_of(slow)}); the reviewer-family extension moves it "
+                      "only for a session of that same lab" if slow else
+                      "no override: the reviewer runs omp's built-in @slow; the reviewer-family extension moves it only for a "
+                      "session of that same lab")
+            status, fix = ("ok", None) if len(labs) >= 2 else ("degraded", login)
+            if len(labs) < 2:
+                detail = f"one lab available ({', '.join(labs) or 'none'}): every review is same-family; the PR's Testing section says so"
         # Re-offer once the recommendation gains Anthropic or OpenAI over what the recorded choice covers.
-        choice = self.choice("reviewer")
-        basis = current_fams if cfg.reviewers else {model_family(t) for t in re.findall(r"[\w.:/-]+", str((choice or {}).get("value", "")))} - {None}
+        choice = self.choice("models")
+        basis = current_fams if entries else {model_family(t) for t in re.findall(r"[\w.:/-]+", str((choice or {}).get("value", "")))} - {None}
         gained = ({model_family(s) for s in rec} - basis) & set(PRIORITY_FAMILIES)
         reoffer = bool(choice and choice.get("reoffer", True) is not False and gained)
-        self.add("models", "models.reviewers", status, detail, fix, decision="reviewer", notes=notes,
-                 recommended=f"models.reviewers = {json.dumps(rec)}", **({"reoffer": True} if reoffer else {}))
+        self.facts["reviewer"] = {**plan, "override": override, "recommended_value": value, "apply": line}
+        self.add("models", "models.reviewer", status, detail, fix, decision="models", notes=notes,
+                 recommended=f"task.agentModelOverrides.reviewer = \"{value}\"", **({"reoffer": True} if reoffer else {}))
 
     def browser(self):
         cfg = self.cfg
@@ -1055,7 +1116,7 @@ def step(desc, *cmd, dry, cwd=None):
     return p.returncode == 0
 
 
-def fix(area, dry):
+def fix(area, dry, value=None):
     cfg = omp_config.load()
     checkout = cfg.checkout
     if area == "hook":
@@ -1093,7 +1154,25 @@ def fix(area, dry):
         if ok and not any(c["status"] == "degraded" for c in d.checks):
             print("-> nothing to change")
         return ok
-    print(f"unknown --fix area {area!r} (hook, fork, queue-branch, omp-settings)", file=sys.stderr)
+    if area == "reviewer":
+        d = Doctor()
+        d.models()
+        facts = d.facts.get("reviewer")
+        if not facts:
+            print("omp lists no models: log in to a provider first (omp, then /login)", file=sys.stderr)
+            return False
+        value = (value or facts["recommended_value"]).strip()
+        roles = d.facts.get("model_roles") or {}
+        ids = getattr(d, "model_ids", set())
+        entries = [e.strip() for e in value.split(",") if e.strip()]
+        bad = [e for e in entries if not omp_config.SELECTOR.match(e) or not selector_available(e, ids, roles)]
+        if not entries or bad:
+            print(f"not available or not an omp selector: {', '.join(bad) or '(empty)'}; see `omp models`", file=sys.stderr)
+            return False
+        merged = {**(d.facts.get("agent_model_overrides") or {}), REVIEWER_AGENT: ", ".join(entries)}
+        return step(f"set omp's reviewer models for every session to \"{merged[REVIEWER_AGENT]}\" (global omp setting)",
+                    "omp", "config", "set", "task.agentModelOverrides", json.dumps(merged, separators=(",", ":")), dry=dry)
+    print(f"unknown --fix area {area!r} (hook, fork, queue-branch, omp-settings, reviewer)", file=sys.stderr)
     return False
 
 
@@ -1200,6 +1279,7 @@ def main(argv=None):
     ap.add_argument("--probe-hosts", action="store_true")
     ap.add_argument("--area", nargs="+")
     ap.add_argument("--fix")
+    ap.add_argument("--value")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--record-validated", action="store_true")
     ap.add_argument("--set", nargs=2, action="append", default=[], metavar=("KEY", "VALUE"))
@@ -1211,7 +1291,7 @@ def main(argv=None):
         record_validated(args.ref)
         return 0
     if args.fix:
-        return 0 if fix(args.fix, args.dry_run) else 1
+        return 0 if fix(args.fix, args.dry_run, args.value) else 1
     if args.set or args.record:
         return 0 if write_config(args.set, args.record, args.no_reoffer) else 1
     report = Doctor(probe_hosts=args.probe_hosts).run(args.area)

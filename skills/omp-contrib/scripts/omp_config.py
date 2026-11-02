@@ -28,7 +28,7 @@ Config (every value resolved; derived ones looked up lazily on first access, the
     upstream_repo, maintainers (tuple), fork_owner, fork_remote, fork_repo ("owner/name" of the fork: the
     fork remote's URL, else "<fork_owner>/<upstream name>"), queue_branch, branch_prefix,
     checkout, worktrees, scratch_roots (list of expanded paths), build ({"linux", "macos", "windows"}),
-    reviewers (list), behaviour_models (list), cold_read_model, image_upload, open_p2, supervised_opens
+    behaviour_models (list of omp selectors), cold_read_model, image_upload, open_p2, supervised_opens
     (int), watch_enabled (bool), host_label
 
 Derived defaults:
@@ -67,7 +67,6 @@ DEFAULTS = {
     "build.linux": "",
     "build.macos": "",
     "build.windows": "",
-    "models.reviewers": [],
     "models.behaviour": [],
     "models.cold_read": "",
     "images.upload": "relay",
@@ -78,6 +77,46 @@ DEFAULTS = {
 }
 ENV = {"paths.checkout": "OMP_REPO", "paths.worktrees": "OMP_PR_WORKTREES"}
 BUILD_VALUES = re.compile(r"^(local|ci|none|ssh:\S+)$")
+# One omp model selector (docs/models.md): `provider/id[:thinking]` or a role alias `@role[:thinking]`.
+SELECTOR = re.compile(r"^(@[\w-]+(:\w+)?|[^\s,@/:][^\s,]*/[^\s,]+)$")
+THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
+
+
+def strip_thinking(selector):
+    """The selector without its thinking suffix (`anthropic/claude-haiku-5-5:low` → `anthropic/claude-haiku-5-5`)."""
+    base, _, level = selector.rpartition(":")
+    return base if base and level in THINKING_LEVELS else selector
+
+
+_roles = None
+
+
+def model_roles():
+    """omp's configured `modelRoles` ({role: selector list}), read once; {} when omp cannot answer."""
+    global _roles
+    if _roles is None:
+        r = _run("omp", "config", "get", "modelRoles", "--json")
+        try:
+            _roles = (json.loads(r.stdout).get("value") or {}) if r and r.returncode == 0 else {}
+        except json.JSONDecodeError:
+            _roles = {}
+    return _roles
+
+
+def expand_role(selector, roles=None):
+    """A `@role` selector's first configured model (thinking suffix dropped), following role-to-role
+    references; the selector itself when it is not a role or the role is unset (omp then uses its built-in pick)."""
+    roles = model_roles() if roles is None else roles
+    seen = set()
+    while selector.startswith("@") and strip_thinking(selector)[1:] not in seen:
+        role = strip_thinking(selector)[1:]
+        seen.add(role)
+        value = roles.get(role)
+        first = (value if isinstance(value, str) else ",".join(value or [])).split(",")[0].strip()
+        if not first:
+            break
+        selector = first
+    return strip_thinking(selector)
 
 
 def _windows():
@@ -241,7 +280,6 @@ class Config:
     worktrees = property(lambda self: self.get("paths.worktrees"))
     scratch_roots = property(lambda self: self.get("paths.scratch_roots"))
     build = property(lambda self: {p: self.get(f"build.{p}") for p in ("linux", "macos", "windows")})
-    reviewers = property(lambda self: list(self.get("models.reviewers")))
     behaviour_models = property(lambda self: list(self.get("models.behaviour")))
     cold_read_model = property(lambda self: self.get("models.cold_read"))
     image_upload = property(lambda self: self.get("images.upload"))

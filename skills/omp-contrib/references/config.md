@@ -41,11 +41,9 @@ macos   = ""                          # default: "local" on macOS, else "ci"
 windows = ""                          # default: "ci"
 
 [models]
-# Reviewers in order: at spawn the reviewer-family extension takes the first that resolves to an available model of
-# another family than the session's. Typical: the strongest OpenAI then the strongest Anthropic model you can use,
-# e.g. ["openai-codex/gpt-6.1-sol", "anthropic/claude-opus-5-5"] (doctor recommends the list from your logins).
-# Empty or no match: the extension ranks the available models itself, the other of Anthropic and OpenAI first.
-reviewers  = []
+# Values are omp selectors, as in omp's modelRoles: `provider/id[:thinking]` or `@role[:thinking]`.
+# The reviewer's models are not here: they live in omp's own config, `task.agentModelOverrides.reviewer`
+# (setup.md, models record; `scripts/doctor --fix reviewer`).
 behaviour  = []                       # two models of different families for behaviour runs of prompt changes; default: derived by doctor
 cold_read  = ""                       # model for charts/cold-read.py; default: omp's @smol role
 
@@ -68,7 +66,7 @@ host_label = ""
 
 # One table per wizard decision (setup.md): the choice and why, so doctor never re-asks a deliberate
 # choice and re-offers the ideal only when its reason no longer holds. Ids: github, build-hosts,
-# reviewer, behaviour-models, omp-settings, image-upload, chart-tools, autonomy, watcher, session-reader.
+# models, behaviour-models, omp-settings, image-upload, chart-tools, autonomy, watcher, session-reader.
 [choices.image-upload]
 value   = "relay"
 reason  = "relay connected, Chrome signed in to github.com"

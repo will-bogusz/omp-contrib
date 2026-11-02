@@ -26,8 +26,7 @@ class ValidateConfigTest(unittest.TestCase):
                            "queue_branch": "omp-queue"},
                 "paths": {"checkout": "~/src/oh-my-pi", "scratch_roots": []},
                 "build": {"linux": "ssh:box", "macos": "local", "windows": "ci"},
-                "models": {"reviewers": ["openai-codex/gpt-6.1-sol", "anthropic/claude-opus-5-5"],
-                           "behaviour": ["a/claude-haiku-5-5", "b/gpt-6-luna"]},
+                "models": {"behaviour": ["anthropic/claude-haiku-5-5:low", "@smol"], "cold_read": "@smol:low"},
                 "images": {"upload": "relay"}, "autonomy": {"open_p2": "hold", "supervised_opens": 3},
                 "watch": {"enabled": False},
                 "choices": {"image-upload": {"value": "relay", "reason": "relay connected", "at": "2026-10-30"}}}
@@ -35,12 +34,12 @@ class ValidateConfigTest(unittest.TestCase):
 
     def test_reports_each_problem(self):
         data = {"build": {"linux": "buildbox", "freebsd": "local"}, "images": {"upload": "imgur"},
-                "autonomy": {"supervised_opens": True, "open_p2": "maybe"}, "models": {"behaviour": ["one"], "reviewers": "x/y"},
+                "autonomy": {"supervised_opens": True, "open_p2": "maybe"}, "models": {"behaviour": ["one"], "cold_read": "a/b, c/d"},
                 "extra": {}, "choices": {"image-upload": {"value": "fork-links"}, "nonsense": {"value": 1, "reason": "x"}}}
         errors = "\n".join(D.validate_config(data))
         for needle in ("build.linux: 'buildbox' is not local", "build.freebsd: unknown key", "images.upload: 'imgur'",
                        "autonomy.supervised_opens: expected an integer", "autonomy.open_p2: 'maybe'", "models.behaviour: two models",
-                       "models.reviewers: expected list",
+                       "models.cold_read: 'a/b, c/d': each entry one omp selector",
                        "[extra]: unknown section", "[choices.image-upload]: no `reason`", "[choices.nonsense]: unknown decision"):
             self.assertIn(needle, errors)
 
@@ -249,29 +248,59 @@ class ModelsTest(unittest.TestCase):
         self.assertEqual(plan["recommended"][0], "openrouter/openai/gpt-6.1-sol")
         self.assertIn("OpenAI only through a reseller", plan["missing"][0])
 
-    def test_reviewers_row_flags_a_one_lab_list_and_reoffers_a_new_lab(self):
-        text = ('[models]\nreviewers = ["anthropic/claude-opus-5-5", "google/gemini-3.8-flash"]\n'
-                '[choices.reviewer]\nvalue = "anthropic/claude-opus-5-5, google/gemini-3.8-flash"\nreason = "no ChatGPT"\n')
+    def test_selector_helpers_follow_omp_syntax(self):
+        roles = {"smol": "anthropic/claude-haiku-5-5:low", "slow": "@smol", "loop": "@loop"}
+        self.assertEqual(omp_config.strip_thinking("openai-codex/gpt-6.1-sol:high"), "openai-codex/gpt-6.1-sol")
+        self.assertEqual(omp_config.strip_thinking("openrouter/x/y:free"), "openrouter/x/y:free")
+        self.assertEqual(omp_config.expand_role("@slow:high", roles), "anthropic/claude-haiku-5-5")
+        self.assertEqual(omp_config.expand_role("@loop", roles), "@loop")
+        ids = {"anthropic/claude-haiku-5-5", "openai-codex/gpt-6.1-sol"}
+        self.assertTrue(D.selector_available("openai-codex/gpt-6.1-sol:high", ids, roles))
+        self.assertTrue(D.selector_available("@slow", ids, roles))
+        self.assertTrue(D.selector_available("@task", ids, roles))  # unset: omp's built-in pick
+        self.assertFalse(D.selector_available("gone/model:high", ids, roles))
+        self.assertEqual(D.override_line({"task": "@smol"}, "a/b:high, c/d"),
+                         'omp config set task.agentModelOverrides \'{"task":"@smol","reviewer":"a/b:high, c/d"}\'')
+
+    def who(self, roles, overrides, text="", models=None):
         with tempfile.TemporaryDirectory() as tmp:
             path = contrib_env.write_config(os.path.join(tmp, "c.toml"), text)
             with mock.patch.dict(os.environ, {"OMP_CONTRIB_CONFIG": path}):
                 omp_config.load(reload=True)
                 doctor = D.Doctor()
-                doctor.reviewers(self.models())
-                contrib_env.write_config(path, text.replace("google/gemini-3.8-flash", "gone/model", 1))
-                omp_config.load(reload=True)
-                gone = D.Doctor()
-                gone.reviewers(self.models())
+                doctor.who_runs_what(self.models() if models is None else models, roles, overrides)
         omp_config.load(reload=True)
-        row = next(c for c in doctor.checks if c["id"] == "models.reviewers")
-        self.assertEqual(row["status"], "ok")
-        self.assertTrue(row["reoffer"])
-        self.assertEqual(row["recommended"], 'models.reviewers = ["openai-codex/gpt-6.1-sol", "anthropic/claude-opus-5-5"]')
-        self.assertIn("Claude sessions are reviewed by the OpenAI entry", row["notes"][0])
-        row = next(c for c in gone.checks if c["id"] == "models.reviewers")
-        self.assertEqual(row["status"], "degraded")
-        self.assertIn("not available: gone/model", row["detail"])
-        self.assertIn("--set models.reviewers", row["fix"])
+        return {c["id"]: c for c in doctor.checks}
+
+    def test_who_runs_what_names_driver_subagents_and_the_recommended_override(self):
+        rows = self.who({"default": "anthropic/claude-opus-5-5:high", "smol": "anthropic/claude-haiku-5-5:low",
+                         "slow": "openai-codex/gpt-6.1-sol:high"}, {})
+        self.assertIn("@default = anthropic/claude-opus-5-5:high (Anthropic)", rows["models.driver"]["detail"])
+        self.assertIn("task → @task unset", rows["models.subagents"]["detail"])
+        self.assertIn("scout → @smol = anthropic/claude-haiku-5-5:low", rows["models.subagents"]["detail"])
+        self.assertIn("reviewer → @slow = openai-codex/gpt-6.1-sol:high (no override)", rows["models.subagents"]["detail"])
+        reviewer = rows["models.reviewer"]
+        self.assertEqual(reviewer["status"], "ok")
+        self.assertIn("@slow = openai-codex/gpt-6.1-sol:high (OpenAI)", reviewer["detail"])
+        self.assertEqual(reviewer["recommended"],
+                         'task.agentModelOverrides.reviewer = "openai-codex/gpt-6.1-sol:high, anthropic/claude-opus-5-5:high"')
+        self.assertTrue(any("every session's reviewer" in n for n in reviewer["notes"]))
+        self.assertTrue(any(n.startswith("apply: omp config set task.agentModelOverrides '{\"reviewer\":") for n in reviewer["notes"]))
+
+    def test_reviewer_override_checked_against_the_inventory(self):
+        one_lab = self.who({}, {"reviewer": "anthropic/claude-opus-5-5:high, @smol"})["models.reviewer"]
+        self.assertEqual(one_lab["status"], "degraded")
+        self.assertIn("one lab only", one_lab["detail"])
+        self.assertEqual(one_lab["fix"], "scripts/doctor --fix reviewer")
+        gone = self.who({}, {"reviewer": "gone/model:high, anthropic/claude-opus-5-5"})["models.reviewer"]
+        self.assertIn("not available: gone/model:high", gone["detail"])
+        pair = self.who({}, {"reviewer": "openai-codex/gpt-6.1-sol:high, anthropic/claude-opus-5-5:high"})["models.reviewer"]
+        self.assertEqual(pair["status"], "ok")
+
+    def test_reoffer_when_the_recommendation_gains_a_lab(self):
+        text = '[choices.models]\nvalue = "anthropic/claude-opus-5-5, google/gemini-3.8-flash"\nreason = "no ChatGPT"\n'
+        rows = self.who({}, {"reviewer": "anthropic/claude-opus-5-5:high, google/gemini-3.8-flash"}, text)
+        self.assertTrue(rows["models.reviewer"]["reoffer"])
 
 
 class ChoiceTest(unittest.TestCase):

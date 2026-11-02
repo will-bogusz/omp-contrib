@@ -59,9 +59,9 @@ This file routes: open the reference for the phase you are in. Each rule's sourc
 - Before the PR opens, one independent reviewer works through
   [references/review-brief.md](references/review-brief.md) (what `main` did on every path the diff
   touches), stamped with `scripts/review-stamp`. The reviewer is omp's bundled `reviewer` agent
-  (pinned to `@slow`); the plugin's reviewer-family extension moves it to the first
-  `models.reviewers` entry from another lab than the session's, else to the other of Anthropic
-  and OpenAI (other labs only as fallback). After it returns, read its
+  (its models: omp's `task.agentModelOverrides.reviewer`, else `@slow`); the plugin's
+  reviewer-family extension takes the first of them from another lab than the session's, else
+  the other of Anthropic and OpenAI (other labs only as fallback). After it returns, read its
   routing line in `~/.cache/omp-contrib/reviewer-routes.jsonl` (workflow.md step 3): same family →
   the PR's Testing section says the review was same-family. One round per PR, total: its fixes,
   bot fixes and change-request fixes are not reviewed again, so never spawn a second reviewer to

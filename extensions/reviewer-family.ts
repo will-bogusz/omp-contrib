@@ -3,23 +3,28 @@
  * family than the session's, so a PR is never reviewed only by the lineage that
  * wrote it.
  *
+ * The reviewer's models live in omp's own config: `task.agentModelOverrides.reviewer`
+ * (comma-separated selectors and `@role` aliases, e.g. "openai-codex/gpt-6.1-sol:high,
+ * anthropic/claude-opus-5-5:high"), else the agent's `@slow`. omp expands either into the
+ * event's `patterns`, thinking suffixes kept; on its own it would take the first available.
+ *
  * On `before_subagent_spawn` for `reviewer`, in order:
- *   1. `models.reviewers` from the omp-contrib config file: the first entry that
- *      resolves to an available model of another family than the session's.
- *   2. Otherwise the candidates below, Anthropic/OpenAI cross first (`labRank`): a
+ *   1. The first spawn pattern of another family than the session's, as written (its
+ *      thinking suffix kept). With the override above, a Claude session gets the OpenAI
+ *      entry and a GPT session the Anthropic one.
+ *   2. When no pattern is of another family (no override, and `@slow` is the session's
+ *      own family): the candidates below, Anthropic/OpenAI cross first (`labRank`): a
  *      Claude session gets an OpenAI model, a GPT session an Anthropic one, any other
  *      session either; other labs only after them. Within a rank, in source order:
- *      a. the spawn's own patterns (the reviewer's `@slow` role chain);
- *      b. the user's configured roles (`@slow`, `@plan`, `@advisor`, `@default`);
- *      c. every model in `ctx.models.list()`, served by a provider the user already
+ *      a. the user's configured roles (`@slow`, `@plan`, `@advisor`, `@default`);
+ *      b. every model in `ctx.models.list()`, served by a provider the user already
  *         runs a model on (the session's, or one a configured role resolves to) before
  *         any other: `list()` holds every model a login can name, including ones that
  *         login's plan cannot serve or an aggregator has retired; then the lab's own
  *         provider before a reseller, `pro` serving variants last, the strongest tier
  *         (`TIERS`), then `strength`.
- * When no other family is available the spawn keeps its models (the first resolving
- * `models.reviewers` entry, else its own patterns) and carries a same-family note; the
- * PR's Testing section must say so. The hook never blocks.
+ * When no other family is available the spawn keeps its patterns and carries a
+ * same-family note; the PR's Testing section must say so. The hook never blocks.
  */
 import type { Model } from "@oh-my-pi/pi-ai";
 import type {
@@ -30,8 +35,8 @@ import type {
 } from "@oh-my-pi/pi-coding-agent";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
-// The plugin's one config reader (path rules: skills/omp-contrib/references/config.md).
-import { cacheDir, get, loadConfig } from "../skills/omp-contrib/charts/lib/config.mjs";
+// The plugin's cache location (path rules: skills/omp-contrib/references/config.md).
+import { cacheDir } from "../skills/omp-contrib/charts/lib/config.mjs";
 
 const REVIEWER_AGENT = "reviewer";
 
@@ -69,18 +74,6 @@ const TIERS: Record<string, readonly [readonly string[], readonly string[]]> = {
 	anthropic: [["opus", "sonnet"], ["haiku"]],
 	openai: [["sol", "terra"], ["luna", "mini", "nano"]],
 };
-
-/** `models.reviewers` from the omp-contrib config, in order; [] when unset. Throws on a malformed file. */
-export function readConfiguredReviewers(
-	env: Record<string, string | undefined> = process.env,
-): string[] {
-	const value: unknown = get(loadConfig(env), "models.reviewers", undefined);
-	if (!Array.isArray(value)) return [];
-	return value
-		.filter((entry): entry is string => typeof entry === "string")
-		.map((entry) => entry.trim())
-		.filter(Boolean);
-}
 
 function selector(model: Model): string {
 	return `${model.provider}/${model.id}`;
@@ -147,29 +140,23 @@ export function strength(a: Model, b: Model): number {
 
 /** Pure routing decision; exported for tests. */
 export function chooseReviewer(
-	event: Pick<BeforeSubagentSpawnEvent, "agent" | "patterns">,
+	event: Pick<BeforeSubagentSpawnEvent, "agent" | "patterns" | "modelRole">,
 	models: ExtensionModelQuery,
-	configured: readonly string[],
 ): BeforeSubagentSpawnEventResult | undefined {
 	if (event.agent !== REVIEWER_AGENT) return undefined;
 
 	const parent = models.current();
-	if (!parent) {
-		// No session model to compare against: honour the list as written.
-		const first = configured.find((spec) => models.resolve(spec));
-		return first ? { model: first, note: `reviewer: ${first} (models.reviewers)` } : undefined;
-	}
+	if (!parent) return undefined;
 	const parentFamily = models.family(parent);
 	const parentLab = lab(parent);
 	// A reviewer must be a chat model that can drive the agent's tools.
-	const usable = (model: Model | undefined): model is Model =>
+	const otherFamily = (model: Model | undefined): model is Model =>
 		model !== undefined &&
 		(model.kind ?? "chat") === "chat" &&
-		model.supportsTools !== false;
-	const otherFamily = (model: Model | undefined): model is Model =>
-		usable(model) && models.family(model) !== parentFamily;
+		model.supportsTools !== false &&
+		models.family(model) !== parentFamily;
 
-	// Ordered candidates: models.reviewers as written, then the ranked automatic picks.
+	// Ordered candidates: the spawn's patterns as written, then the ranked fallback picks.
 	const picks: Array<{ spec: string; model: Model; source: string }> = [];
 	const seen = new Set<string>();
 	const add = (spec: string, model: Model, source: string): void => {
@@ -179,23 +166,15 @@ export function chooseReviewer(
 		picks.push({ spec, model, source });
 	};
 
-	const unavailable: string[] = [];
-	let sameFamilyConfigured: string | undefined;
-	for (const spec of configured) {
-		const model = models.resolve(spec);
-		if (!usable(model)) unavailable.push(spec);
-		else if (otherFamily(model)) add(spec, model, "models.reviewers");
-		else sameFamilyConfigured ??= spec;
-	}
-	const configNote = unavailable.length
-		? ` (models.reviewers: ${unavailable.map((s) => `"${s}"`).join(", ")} not available)`
-		: "";
-
-	const auto: Array<{ spec: string; model: Model; source: string }> = [];
+	// The override's (or `@slow`'s) order is the user's: no lab re-ranking here, and the
+	// pattern string is passed back untouched so its thinking suffix survives.
+	const patternSource = event.modelRole ? `@${event.modelRole}` : "task.agentModelOverrides.reviewer";
 	for (const pattern of event.patterns) {
 		const model = models.resolve(pattern);
-		if (otherFamily(model)) auto.push({ spec: pattern, model, source: "agent model" });
+		if (otherFamily(model)) add(pattern, model, patternSource);
 	}
+
+	const auto: Array<{ spec: string; model: Model; source: string }> = [];
 	for (const role of PREFERRED_ROLES) {
 		const model = models.resolve(role);
 		if (otherFamily(model)) auto.push({ spec: selector(model), model, source: role });
@@ -226,14 +205,9 @@ export function chooseReviewer(
 
 	const [first, ...rest] = picks;
 	if (!first) {
-		const keep = sameFamilyConfigured
-			? [sameFamilyConfigured]
-			: event.patterns.length > 0
-				? event.patterns
-				: [selector(parent)];
 		return {
-			model: keep,
-			note: `same-family review: no available model outside the session's family (${parentFamily})${configNote}; say so in the PR's Testing section`,
+			model: event.patterns.length > 0 ? event.patterns : [selector(parent)],
+			note: `same-family review: no available model outside the session's family (${parentFamily}); say so in the PR's Testing section`,
 		};
 	}
 	return {
@@ -241,7 +215,7 @@ export function chooseReviewer(
 			first.spec,
 			...rest.slice(0, FALLBACK_DEPTH).map((pick) => pick.spec),
 		],
-		note: `cross-family reviewer: ${selector(first.model)} (${models.family(first.model)}, ${first.source}) vs session ${parentFamily}${configNote}`,
+		note: `cross-family reviewer: ${first.spec} (${models.family(first.model)}, ${first.source}) vs session ${parentFamily}`,
 	};
 }
 
@@ -264,16 +238,7 @@ export function recordRoute(
 export default function reviewerFamily(pi: ExtensionAPI): void {
 	pi.on("before_subagent_spawn", (event, ctx) => {
 		if (event.agent !== REVIEWER_AGENT) return undefined;
-		let configured: string[] = [];
-		try {
-			configured = readConfiguredReviewers();
-		} catch (error) {
-			// A malformed config must not block the review; doctor reports the parse error.
-			pi.logger.warn("reviewer-family: could not read omp-contrib config", {
-				error: String(error),
-			});
-		}
-		const result = chooseReviewer(event, ctx.models, configured);
+		const result = chooseReviewer(event, ctx.models);
 		// The note shows in the task UI only; the routes file is what the session can read back.
 		if (result) {
 			const current = ctx.models.current();

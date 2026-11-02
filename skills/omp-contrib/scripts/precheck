@@ -441,8 +441,9 @@ FAMILIES = {"Anthropic": re.compile(r"\b(haiku|sonnet|opus|claude)\b", re.I),
 
 def model_pattern(model):
     """A model id (`anthropic/claude-haiku-4-5`, `gpt-5.1-codex`) as Testing would name it: its last
-    path segment, case-insensitive."""
-    return re.compile(r"(?<![\w.-])" + re.escape(model.rsplit("/", 1)[-1]) + r"(?![\w.-])", re.I)
+    path segment, case-insensitive; a thinking suffix (`:low`) is not part of the name."""
+    name = omp_config.strip_thinking(model).rsplit("/", 1)[-1]
+    return re.compile(r"(?<![\w.-])" + re.escape(name) + r"(?![\w.-])", re.I)
 
 
 def check_behavior_eval(added, body):
@@ -456,7 +457,8 @@ def check_behavior_eval(added, body):
     testing = ""
     if body and "## Testing" in body:
         testing = re.split(r"\n(?:## |---)", body.split("## Testing", 1)[1], maxsplit=1)[0]
-    models = omp_config.load().behaviour_models
+    # `@role` entries name the model that role runs (omp's modelRoles); Testing names models, not roles.
+    models = [omp_config.expand_role(m) if m.startswith("@") else m for m in omp_config.load().behaviour_models]
     if models:
         missing = [m for m in models if not model_pattern(m).search(testing)]
         runs = " and ".join(models)
