@@ -51,13 +51,17 @@ This file routes: open the reference for the phase you are in. Each rule's sourc
 - **Supervised start.** While `autonomy.supervised_opens` is above zero, each PR stops before
   `pr-queue open` for the user's explicit OK on its body, a diff summary and its own-words
   sentence; each supervised open counts it down. After that, opening is autonomous.
-- **The own-words sentence is the user's.** Ask the user for it on every PR and put it first
-  under `## What`; never write a substitute (upstream `AGENTS.md`). No body carries private context.
+- **The own-words sentence is the user's.** Ask for it once, at intake, while the user is there
+  (*Fixing something omp did wrong*), record it with `contrib record own-words`, and put it first
+  under `## What` verbatim; never write, suggest or edit a substitute (upstream `AGENTS.md`).
+  precheck FIXes a body whose first paragraph there is not a recorded sentence. No body carries
+  private context.
 - Before the PR opens, one independent reviewer works through
   [references/review-brief.md](references/review-brief.md) (what `main` did on every path the diff
   touches), stamped with `scripts/review-stamp`. The reviewer is omp's bundled `reviewer` agent
-  (pinned to `@slow`); the plugin's reviewer-family extension moves it to another model family
-  when `@slow` is the session's own (or `models.reviewer` is set). After it returns, read its
+  (pinned to `@slow`); the plugin's reviewer-family extension moves it to the first
+  `models.reviewers` entry from another lab than the session's, else to the other of Anthropic
+  and OpenAI (other labs only as fallback). After it returns, read its
   routing line in `~/.cache/omp-contrib/reviewer-routes.jsonl` (workflow.md step 3): same family →
   the PR's Testing section says the review was same-family. One round per PR, total: its fixes,
   bot fixes and change-request fixes are not reviewed again, so never spawn a second reviewer to
@@ -81,21 +85,33 @@ This file routes: open the reference for the phase you are in. Each rule's sourc
 
 ## Fixing something omp did wrong
 
-One chain, whether the ask came as `/contribute` or as a plain "can you fix it upstream?", run
-in order (each step's reference is under *Phases*):
+One chain, whether the ask came as `/contribute` or as a plain "can you fix it upstream?". The
+steps live in `scripts/contrib`: after each one run `contrib next`, which names the one step left,
+its command, and who acts (`agent`, `user`, `wait`, `done`, `stopped`). Do the agent's steps
+without asking; stop for the user's. `pr-queue add` refuses until the chain before it is done.
+When the user asks to stop or pause, run `contrib pause "<their reason>"` (not `contrib stop`, which
+ends the contribution).
 
-1. Duplicate scan, before reading code for a fix. A merged fix, an open PR, expected behaviour or
-   code outside omp ends the chain: report it with the evidence.
+0. `contrib start "<what omp got wrong>"`, then ask the user, once: *"In a sentence, in your words:
+   what should change, and why does it matter to you? It goes first in the PR, verbatim."* Keep
+   working; record the reply as written (`contrib record own-words "…"`). Only a sentence they
+   wrote as that answer counts (one given up front, after "in my words:", is fine); their report
+   of the bug is not it, so ask.
+1. Duplicate scan, before reading code for a fix (`contrib record dup-scan`). A merged fix, an
+   open PR, expected behaviour or code outside omp ends the chain: `contrib stop <reason>
+   --evidence …`, and report it.
 2. Worktree `<paths.worktrees>/<topic>` on `<github.branch_prefix><topic>` from `origin/main`
    (workflow step 2); never edit the user's checkout.
-3. Reproduce on `origin/main`, fix, show it passing, commit.
-4. One `reviewer` with review-brief.md as its brief; `review-stamp` its verdict; fix its findings.
-5. Body (framing.md), `precheck`, `pr-queue add`.
-6. Ask the user for the own-words sentence; stop before `pr-queue open` while supervised opens
-   remain.
+3. Reproduce on `origin/main`, fix with a test that fails without it, commit;
+   `contrib record repro --before "<test command>"` runs it both ways.
+4. One `reviewer` with review-brief.md as its brief; `review-stamp` its verdict; fix its findings;
+   `precheck` on the code (it needs nothing from the user).
+5. `contrib body` (the body file, opening with the user's sentence), the rest per framing.md,
+   `precheck --body <file>`, `pr-queue add`.
+6. Stop before `pr-queue open` while supervised opens remain: the user OKs the body.
 
-Where pushing is not allowed, the chain still runs to `pr-queue --manifest <file> add … --no-push`:
-only the push and `open` wait.
+Where pushing is not allowed, the chain still runs to `pr-queue --manifest <file> add … --no-push`
+(`contrib start --manifest <file>` puts it in `next`'s command): only the push and `open` wait.
 
 ## Phases
 
@@ -116,7 +132,8 @@ only the push and `open` wait.
 - **Pre-submit checklist**: before marking ready. [references/checklist.md](references/checklist.md)
 
 Curated PRs and issues to learn from: [references/examples.md](references/examples.md).
-Scripts (paths relative to this skill's directory): `scripts/doctor` (config, tools, hosts and
+Scripts (paths relative to this skill's directory): `scripts/contrib` (the fix chain's step
+records: `start`, `record`, `body`, `stop`, `next`, `status`), `scripts/doctor` (config, tools, hosts and
 upstream-document drift; `--json` for `/contribute`), `scripts/pr-trace` (start every status scan
 with `--summary --open --fetch`; after a push, `--wait-codex N` waits out Codex's pass; waiting on
 PRs for anything, `--wait-change N... --state FILE` returns on the first merge, push, person's

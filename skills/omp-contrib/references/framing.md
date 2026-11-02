@@ -197,14 +197,24 @@ agent transcript, or checklist alone does not satisfy this requirement." Upstrea
 own words explaining what changed and why, as required by `CONTRIBUTING.md`. If it is missing, ask
 the contributor; NEVER generate a substitute. Preserve that sentence during edits."
 
-So the agent never writes this line. For every PR, ask the user for it (through `ask`, with the
-What table and headline sentence already drafted so they can react to the change, not reconstruct
-it), and put their words first under `## What`, unedited apart from a typo they approve.
+So the agent never writes this line. It is asked for once, at intake, while the user is there
+(`/contribute`'s *Fix intake*, or with a hunt pick): "In a sentence, in your words: what should
+change, and why does it matter to you? It goes first in the PR, verbatim." The reply is recorded as
+written (`../scripts/contrib record own-words "…"`), and at body time `contrib body` writes the
+body file with it as the first paragraph under `## What`. Users are rarely there when the PR is
+written, so the question is not left to then.
 
-- A body without the user's sentence does not open: the queue entry waits for it. Never ship a
-  placeholder or a drafted stand-in (#8577's final body had none).
+- Verbatim: never drafted, suggested or edited by the agent beyond trimming whitespace. precheck
+  FIXes a body whose first paragraph under `## What` is not exactly a recorded sentence, and
+  `pr-queue add` refuses it.
+- A body without the user's sentence does not queue or open: `contrib next` names the step as the
+  user's and the agent stops for it. Never ship a placeholder or a drafted stand-in (#8577's final
+  body had none).
 - Don't propose wording for them to accept; a sentence the agent wrote and the user approved is
   still generated. Asking what they would tell a maintainer about the change is fine.
+- If the fix's scope changed materially from what the sentence says, the supervised OK (or, past
+  it, a message to the user) shows the sentence back for them to keep or rewrite; a rewrite is
+  recorded the same way.
 - Preserve the sentence through every body edit and rewrite.
 - No claims in the rest of the body about what the user personally ran beyond what the Testing
   section shows.

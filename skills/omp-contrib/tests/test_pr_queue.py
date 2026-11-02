@@ -28,6 +28,7 @@ os.environ.update(GIT_CONFIG_GLOBAL=GITCONFIG, GIT_CONFIG_NOSYSTEM="1")
 
 import omp_config  # noqa: E402
 import omp_pr  # noqa: E402
+import omp_flow  # noqa: E402
 import omp_queue  # noqa: E402
 import omp_watch  # noqa: E402
 
@@ -46,6 +47,32 @@ loader.exec_module(RC)
 
 CHANGELOG = "# Changelog\n\n## [Unreleased]\n\n## [1.0.0] - 2026-10-01\n\n### Fixed\n\n- Old fix\n"
 BODY = ("## What\n\nI fixed the thing users hit.\n\n## Why\n\nIt broke.\n\n## Testing\n\nRan it; it works.\n")
+
+
+def read(path):
+    with open(path) as f:
+        return f.read()
+
+
+def satisfy_flow(repo, branch, body_file=None):
+    """Record what `pr-queue add`'s gate asks of a local branch (omp_flow.gate): duplicate scan, a repro
+    (none), the own-words sentence the body opens with, a review stamp and a precheck pass at its tip."""
+    body = read(body_file) if body_file else None
+    tip = omp_flow.rev(repo, f"refs/heads/{branch}")
+    if not tip:
+        return
+    rec = omp_flow.by_branch(repo, branch) or omp_flow.start(repo, f"fixture {branch}", branch=branch)[0]
+    if not rec.get("dup_scan"):
+        rec = omp_flow.record_dup_scan(repo, rec, ["fixture"], "", "none")
+    if not rec.get("repro"):
+        rec = omp_flow.record_no_repro(repo, rec, "fixture")
+    omp_flow.record_own_words(repo, rec, omp_flow.what_paragraph(body) if body else "I fixed it.")
+    if not omp_pr.last_review(branch, repo) or omp_pr.last_review(branch, repo)[0] != tip:
+        log = omp_pr.review_log(branch, repo)
+        os.makedirs(os.path.dirname(log), exist_ok=True)
+        with open(log, "a") as f:
+            f.write(f"{tip}\tready\t2026-10-30T00:00:00Z\tfixture\n")
+    omp_flow.note_precheck(repo, branch, tip, True, body, body_file)
 
 
 def tearDownModule():
@@ -256,6 +283,12 @@ class QueueTest(unittest.TestCase):
             f.write(BODY)
 
     def run_pq(self, *argv, repo=None):
+        """pr-queue in-process. An `add` first records the contribution steps its gate asks for: the
+        tests here exercise the queue, tests/test_contrib.py the gate."""
+        if "add" in argv:
+            i = argv.index("add")
+            body = argv[argv.index("--body") + 1] if "--body" in argv else None
+            satisfy_flow(repo or self.sim.work, argv[i + 1], body)
         out, err = io.StringIO(), io.StringIO()
         code = 0
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):

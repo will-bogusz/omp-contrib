@@ -6,12 +6,17 @@ in `backticks` (`paths.worktrees`, `github.branch_prefix`, `build.linux`, …) a
 
 Two omp settings this workflow needs, both set up by the wizard ([setup.md](setup.md)):
 `task.maxRecursionDepth` of at least 3, so a worker under a lead can spawn its own reviewer, and a
-reviewer of another model family than the session's (the plugin's reviewer-family extension, or
-`models.reviewer`).
+reviewer of another model family than the session's (the plugin's reviewer-family extension:
+the first `models.reviewers` entry from another lab, else the other of Anthropic and OpenAI).
+
+Each step below that the fix chain gates is recorded in `../scripts/contrib` (SKILL.md, *Fixing
+something omp did wrong*); `contrib next` names the step left and its command, and `pr-queue add`
+refuses a branch until the steps before it are done.
 
 1. **Check the ground.** Run the duplicate scan (*First: scan for duplicates*) again right before
    branching, then sort the matching issues into ones this PR resolves and ones it only relates
-   to (see *Linking issues*).
+   to (see *Linking issues*). Record it: `contrib record dup-scan --queries … --checked "#N,…"
+   --verdict none|related:#N|duplicate:#N` (a duplicate ends the contribution).
 2. **Branch.** Worktree `<paths.worktrees>/<topic>` on `<github.branch_prefix><topic>` from
    `origin/main`, then in it `bun install --frozen-lockfile --ignore-scripts` and
    `bun run prepare`; never link the main checkout's (`paths.checkout`) `node_modules`. A linked
@@ -38,7 +43,11 @@ reviewer of another model family than the session's (the plugin's reviewer-famil
    workers once wrote there and had to recover their changes from a saved patch).
 3. **Self-review.** CONTRIBUTING wants the contributor to review every changed file and exercise
    the behavior before submitting. Do that review in full: read the whole diff and run the changed
-   path live, from the worktree's own install (step 2).
+   path live, from the worktree's own install (step 2). Record the repro once the fix is
+   committed: `contrib record repro --before "<test command>"` runs it with the branch's source
+   changes reverted (it must fail) and at HEAD (it must pass), and undoes the revert; `--none
+   "<why>"` for a docs or prompt-only change, `--unverified "<why>" --before-output F
+   --after-output F` for one no command reproduces (a TUI frame, a provider's reply).
    For a transport, exercise every
    transport that turn can take, including one ending in a server error: #11613's HTTP/1 path
    hung on end-stream errors because every live check was a successful turn, and the
@@ -57,9 +66,10 @@ reviewer of another model family than the session's (the plugin's reviewer-famil
     #14249's read->edit fidelity needs Opus, its cache and signed-thinking cost does not.
   - **Then one independent "what did `main` do" review: one round per PR, total.** The worker
     spawns omp's bundled `reviewer` agent itself (it is pinned to `@slow`; the reviewer-family
-    extension overrides that only when `@slow` is the session's own family, or `models.reviewer`
-    is set; with `task.maxRecursionDepth` at
-    3 a worker under a lead can; never relay it through the lead) with
+    extension moves it to the first `models.reviewers` entry from another lab than the session's,
+    else to the other of Anthropic and OpenAI; with `task.maxRecursionDepth` at
+    3 a worker under a lead can; never relay it through the lead; a plain `task` carrying the brief is
+    refused by the plugin's flow-nudge extension) with
     [review-brief.md](review-brief.md) as its brief, not "is the fix sound":
     callers and neighbouring paths of everything the diff touches and what `main` does on each,
     persisted entries across rewind and branching, per-call scans, model policy outside KDL,
@@ -68,6 +78,9 @@ reviewer of another model family than the session's (the plugin's reviewer-famil
     then fix or answer each finding, giving each behaviour fix a test that fails with the fix
     reverted, and move on: **the fixes are not reviewed again**, and nothing after this step
     spawns another reviewer. roboomp reviews the PR next, and the bots (step 7) catch what is left.
+    A `needs-changes` verdict with nothing committed after it holds the queue until the fixes are
+    committed, or `contrib record review-answered --evidence "<why>"` says why each finding needs
+    no code change.
     A scope or design dispute with the reviewer goes to the parent with both positions. Why one
     round: a gated review loop ran a median of 3 rounds per PR (max 15), 41 of 124 after ready,
     and 13 agents ran out of budget in 5 hours; round 1 gave the most findings per round (1.84
@@ -83,11 +96,13 @@ reviewer of another model family than the session's (the plugin's reviewer-famil
     line at all (the extension did not run), means the review still counts and the PR's Testing
     section says the independent review was same-family.
 4. **Write the body, then queue it.** Derive the body from [framing.md](framing.md), read whole:
-   its rules, *Visuals* and the own-words sentence. **Ask the user for the own-words sentence**
-   (framing.md, *The own-words sentence*): upstream's `AGENTS.md` says never to generate a
-   substitute, so the agent never writes it. A worker that cannot ask the user (a subagent) gets
-   the sentence in its prompt, or leaves the template's placeholder line for the session that
-   talks to the user to fill before `pr-queue open`; precheck refuses a body without it.
+   its rules, *Visuals* and the own-words sentence. The own-words sentence was asked for at intake
+   and recorded (framing.md, *The own-words sentence*): `contrib body` writes the body file with it
+   as the first paragraph under `## What`; keep it verbatim. Upstream's `AGENTS.md` says never to
+   generate a substitute, so the agent never writes it; when none is recorded, `contrib next`
+   names it as the user's step: ask and stop. A worker that cannot ask the user (a subagent) gets
+   the sentence in its prompt, verbatim, and records it. Run `../scripts/precheck --body <file>`
+   in the worktree: it records its pass at the branch tip, which `add` requires.
    As you write each idea, ask whether a figure
    would show it better than the table or paragraph you are about to write (*Visuals* says which
    ideas a figure carries and which read at once as text). If one would, make it now, in this

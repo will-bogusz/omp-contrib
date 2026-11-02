@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""Track one contribution's steps and name the next one (the fix chain in SKILL.md).
+
+usage: contrib [--cwd DIR] [--id ID] COMMAND ...
+  start "SUBJECT" [--topic T] [--branch B] [--manifest FILE]
+                 begin a contribution: SUBJECT is what omp got wrong, in a sentence. Its branch is
+                 <branch_prefix><topic> (topic from the subject unless given; --branch adopts an
+                 existing one); --manifest FILE marks a dry run queued in a local manifest
+  record dup-scan --queries Q [Q ...] --checked "#N,#M" --verdict none|related:#N|duplicate:#N
+                 the duplicate scan (references/duplicates.md); duplicate:#N ends the contribution
+  record repro --before CMD [--after CMD] [--timeout S]
+                 run CMD with the branch's source changes reverted (tests kept): it must fail; then
+                 CMD (or --after) at HEAD: it must pass. Run in the worktree, everything committed
+  record repro --none "WHY"
+                 no repro applies (a docs or prompt-only change)
+  record repro --unverified "WHY" --before-output FILE --after-output FILE
+                 a repro that cannot run as a command (a TUI or a provider's behaviour): what you
+                 observed on origin/main and at HEAD, recorded as unverified
+  record own-words "SENTENCE"
+                 the user's own-words sentence, verbatim as they wrote it; never one you wrote
+  record review-answered --evidence "WHY"
+                 the review asked for changes and each must-fix needs no code change: why
+  body           write the PR body file with the own-words sentence under ## What (kept if it
+                 exists) and print its path
+  stop REASON --evidence "..."
+                 end the contribution for what you found: duplicate | not-a-bug | not-omp |
+                 user-declined | other. Never for waiting on the user (`next` names them when it is
+                 their turn) or for a pause (`pause`)
+  pause ["REASON"]
+                 the user asked to stop or pause for now: `next` hands the step to them (nothing is
+                 ended) until a later `start`, `record`, `body` or `resume`
+  resume         lift a pause
+  next [--json] [--manifest FILE]
+                 the single next required step: why, the exact command, and who acts
+                 (agent | user | wait | done | stopped | none)
+  status [--json] [--all]
+                 what is recorded and derived (worktree, commits, review stamp, precheck, queue)
+
+Records are local, never pushed: <git common dir>/omp-contrib/. The contribution acted on is --id,
+else the one on the current worktree's branch, else the active one (the last `start`). `pr-queue
+add` refuses until `next` reaches the queue step.
+"""
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import omp_flow  # noqa: E402
+
+
+def need(rec):
+    if not rec:
+        sys.exit("no contribution in progress here: contrib start \"<what omp got wrong>\" first")
+    return rec
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(prog="contrib", usage=__doc__.split("\n\n", 2)[1].removeprefix("usage: "))
+    parser.add_argument("--cwd", default=os.getcwd())
+    parser.add_argument("--id")
+    sub = parser.add_subparsers(dest="command", required=True)
+    p = sub.add_parser("start")
+    p.add_argument("subject")
+    p.add_argument("--topic")
+    p.add_argument("--branch")
+    p.add_argument("--manifest")
+    p = sub.add_parser("record")
+    kinds = p.add_subparsers(dest="kind", required=True)
+    k = kinds.add_parser("dup-scan")
+    k.add_argument("--queries", nargs="+", required=True)
+    k.add_argument("--checked", default="")
+    k.add_argument("--verdict", required=True)
+    k = kinds.add_parser("repro")
+    k.add_argument("--before")
+    k.add_argument("--after")
+    k.add_argument("--timeout", type=int, default=900)
+    k.add_argument("--none", dest="none_why")
+    k.add_argument("--unverified")
+    k.add_argument("--before-output")
+    k.add_argument("--after-output")
+    k = kinds.add_parser("own-words")
+    k.add_argument("sentence")
+    k = kinds.add_parser("review-answered")
+    k.add_argument("--evidence", required=True)
+    sub.add_parser("body")
+    p = sub.add_parser("pause")
+    p.add_argument("reason", nargs="?", default="")
+    sub.add_parser("resume")
+    p = sub.add_parser("stop")
+    p.add_argument("reason", choices=omp_flow.STOP_REASONS)
+    p.add_argument("--evidence", required=True)
+    p = sub.add_parser("next")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--manifest")
+    p = sub.add_parser("status")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--all", action="store_true")
+    args = parser.parse_args(argv)
+    cwd = os.path.abspath(os.path.expanduser(args.cwd))
+
+    if args.command == "start":
+        repo = omp_flow.clone_of(cwd)
+        here = omp_flow.current_branch(cwd)
+        branch = args.branch or (here if here.startswith(omp_flow.prefix()) and here and not args.topic
+                                 and not omp_flow.by_branch(repo, here) else None)
+        rec, new = omp_flow.start(repo, args.subject, args.topic, branch, args.manifest)
+        print(f"{'started' if new else 'resumed'} {rec['id']} on {rec['branch']}")
+        if not rec["own_words"]:
+            print(f"Ask the user now, once, and keep working while they answer:\n  \"{omp_flow.OWN_WORDS_QUESTION}\"\n"
+                  "Record the reply verbatim: contrib record own-words \"<their sentence>\". If they already answered "
+                  "that question (e.g. after \"in my words:\"), record that sentence as written; their description of "
+                  "the bug is not an answer.")
+        print(omp_flow.render(omp_flow.next_step(repo, rec)))
+        return
+
+    repo, rec = omp_flow.resolve(cwd, args.id)
+    if args.command == "next":
+        nxt = omp_flow.next_step(repo, rec, args.manifest)
+        print(json.dumps(nxt, indent=1) if args.json else omp_flow.render(nxt))
+        return
+    if args.command == "status":
+        recs = omp_flow.load_all(repo) if args.all else [need(rec)]
+        if args.json:
+            print(json.dumps([{**r, "next": omp_flow.next_step(repo, r)} for r in recs], indent=1))
+        else:
+            print("\n\n".join(omp_flow.status(repo, r) + "\n" + omp_flow.render(omp_flow.next_step(repo, r))
+                              for r in recs) or "no contributions recorded")
+        return
+    rec = need(rec)
+    if args.command == "stop":
+        omp_flow.stop(repo, rec, args.reason, args.evidence)
+        print(f"{rec['id']}: stopped ({args.reason})")
+        return
+    if args.command == "pause":
+        omp_flow.pause(repo, rec, args.reason)
+        print(f"{rec['id']}: paused; `next` waits for the user until a later record or `contrib resume`")
+        return
+    omp_flow.resume(repo, rec)
+    if args.command == "resume":
+        print(f"{rec['id']}: resumed")
+        print(omp_flow.render(omp_flow.next_step(repo, rec)))
+        return
+    if args.command == "body":
+        path = omp_flow.body_path(repo, rec)
+        if not rec["own_words"]:
+            sys.exit("no own-words sentence recorded yet: ask the user for it (contrib next)")
+        if not os.path.exists(path):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                f.write(f"## What\n\n{rec['own_words'][-1]['text']}\n\n\n## Why\n\n\n## Testing\n\n")
+            print(f"wrote {path}: the first paragraph under ## What is the user's sentence; keep it verbatim and write "
+                  "the rest into this file (references/framing.md), then precheck --body it")
+        else:
+            print(f"{path} exists: edit it in place (the ## What first paragraph stays the user's sentence)")
+        return
+    kind = args.kind
+    if kind == "dup-scan":
+        omp_flow.record_dup_scan(repo, rec, args.queries, args.checked, args.verdict)
+    elif kind == "own-words":
+        omp_flow.record_own_words(repo, rec, args.sentence)
+    elif kind == "review-answered":
+        omp_flow.record_review_answered(repo, rec, args.evidence)
+    elif kind == "repro":
+        if args.none_why is not None:
+            omp_flow.record_no_repro(repo, rec, args.none_why)
+        elif args.unverified is not None:
+            omp_flow.record_repro_unverified(repo, rec, args.unverified, args.before_output, args.after_output)
+        elif args.before:
+            omp_flow.record_repro(repo, rec, args.before, args.after, args.timeout)
+        else:
+            sys.exit("record repro needs --before CMD, --none \"WHY\" or --unverified \"WHY\"")
+    print(f"{rec['id']}: recorded {kind}")
+    print(omp_flow.render(omp_flow.next_step(repo, omp_flow.resolve(cwd, rec["id"])[1])))
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

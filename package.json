@@ -7,6 +7,6 @@
 	"keywords": ["omp-plugin"],
 	"omp": {
 		"name": "omp-contrib",
-		"extensions": ["./extensions/reviewer-family.ts", "./extensions/checkout-guard.ts"]
+		"extensions": ["./extensions/reviewer-family.ts", "./extensions/checkout-guard.ts", "./extensions/flow-nudge.ts"]
 	}
 }

@@ -40,7 +40,11 @@ The subject is either a session transcript or a description.
 - A `.jsonl` path: read it with `read` and jq filters, not whole. Start with the user's prompts (`?q=select(.type=="message" and .message.role=="user") | .message.content[0].text&raw=true`), then failing tool calls (`?q=select(.message.role=="toolResult" and .message.isError) | {toolName: .message.toolName, text: .message.content[0].text[0:400]}`), then the assistant turns around the moment things went wrong. The `omp` version is in each line's `runtime.version`.
 - A description: ask for the session only if a reproduction needs it; otherwise find the code path from the description.
 
-Then state in two sentences what omp did, what it should have done, and the evidence, and run the skill's *Fixing something omp did wrong* chain from its first step, the duplicate scan, before reading code for a fix. If the subject turns out to be expected behaviour, a duplicate of an open PR or issue, or not omp's code, say so with the evidence and stop.
+Then state in two sentences what omp did, what it should have done, and the evidence, and start the skill's *Fixing something omp did wrong* chain:
+
+1. `skill://omp-contrib/scripts/contrib start "<what omp got wrong, in a sentence>"`.
+2. Ask the user one question, once, now while they are here (a plain message, not the `ask` tool, so you keep working while they answer): "In a sentence, in your words: what should change, and why does it matter to you? It goes first in the PR, verbatim." When the reply comes, record it exactly as written: `contrib record own-words "<their sentence>"`. If the arguments already carry their answer to that question (for example after "in my words:"), record that sentence instead of asking; their description of the bug is not it. Never write, suggest or polish one for them.
+3. Continue with the duplicate scan, before reading code for a fix, and after each step run `contrib next`: it names the next step, its command, and whether it is yours (do it), the user's (ask and stop), or nobody's yet. If the subject turns out to be expected behaviour, a duplicate of an open PR or issue, or not omp's code, end it with `contrib stop <not-a-bug|duplicate|not-omp> --evidence "…"` and say so with the evidence.
 
 ## Hunt
 
@@ -50,7 +54,7 @@ Find what went wrong in the user's own recent sessions, so they can pick what to
 2. Scan each with jq filters, not full reads. Signals: tool results with `isError`; the same tool retried with small changes; user turns that correct the agent ("no", "that's wrong", "you didn't", "stop"); aborted or timed-out calls; writes to `xd://report_issue`. For more than ~15 sessions, split the scan across a few `scout` subagents, each given a list of files and these signals.
 3. Group hits by likely cause in omp (a tool, a prompt, a provider, the TUI), not by session. Drop what is the user's environment, a model's ordinary mistake no omp change would prevent, or third-party code.
 4. For each group, check `origin/main` and open PRs/issues for an existing fix (the skill's duplicate scan, read-only).
-5. Present the three strongest: what goes wrong, how often and in which sessions, the evidence lines, the likely area, and whether it looks like a fix (P0/P1) or a change of a deliberate default (P2 by design). Let the user pick one; it goes to *Fix intake*.
+5. Present the three strongest: what goes wrong, how often and in which sessions, the evidence lines, the likely area, and whether it looks like a fix (P0/P1) or a change of a deliberate default (P2 by design). Let the user pick one. In the same message ask the own-words question for the pick ("In a sentence, in your words: what should change, and why does it matter to you? It goes first in the PR, verbatim."); the pick goes to *Fix intake*, where their answer is recorded as written.
 
 ## Limits
 

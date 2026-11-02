@@ -7,8 +7,13 @@ usage: pr-queue [--repo DIR] [--manifest FILE] COMMAND ...
             mark closed PRs closed; warns on a queued entry whose branch merged main or a need since
             its base (see add)
   add BRANCH --title T [--area A] [--priority P0-P3] [--needs X ...] [--body FILE] [--base SHA]
-            [--p2-decision TEXT]
+            [--p2-decision TEXT] [--no-repro "WHY"]
             record a final branch as queued and push it to your fork (the remote `github.fork_remote`).
+            Refused, with `contrib next`'s step as the reason, until the branch's contribution has
+            its duplicate scan (no duplicate), a repro (or --no-repro WHY for a docs or prompt-only
+            change, recorded), one review stamped on its commits, the user's own-words sentence, and
+            precheck passed at the tip with this body, whose ## What opens with that sentence; a
+            dry run (--manifest) obeys the same gates.
             X is an entry id or #N. --base is
             the commit its own commits sit on (default: inferred from the commits other entries own).
             Warns when merge commits sit between base and tip: plan and advance then take only its
@@ -127,6 +132,7 @@ import uuid
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from omp_pr import CHECKOUT, ME, REPO, changelog_drift, first_release, review_log  # noqa: E402
 import omp_config  # noqa: E402
+import omp_flow  # noqa: E402
 from omp_queue import (  # noqa: E402
     MAIN, PUSH, RANKS, STATES, STORE_BRANCH, STORE_REMOTE, WORKTREES, GitError, GitHub, Queue, Store, awaiting_user,
     entry_hold, find_entry, git, git_out, is_ancestor, merge_order_lines, new_entry, now, opening_pause, pause_line,
@@ -341,6 +347,11 @@ def cmd_add(args, repo, store, gh):
     if args.p2_decision is not None and not args.p2_decision.strip():
         raise Refused("--p2-decision takes the one decision the change asks the maintainer for")
     body = read_file(args.body) if args.body else None
+    if local:
+        flow_gate(repo, branch, body, args)
+    else:
+        print(f"note: {branch} is only on {STORE_REMOTE}, so its contribution records (contrib) live on the host "
+              "that made it; the step gates were checked there", file=sys.stderr)
     if local and not args.no_push and local != fork:
         push(repo, branch, fork)
     entry = new_entry(branch, id=ident, title=args.title, priority=args.priority, needs=needs,
@@ -367,6 +378,7 @@ def cmd_add(args, repo, store, gh):
         if body:
             files[entry["body"]] = body
     store.update(apply, f"add {ident}")
+    omp_flow.note_queued(repo, branch, ident, args.manifest)
     own = len(q.own(item))
     print(f"queued {ident}: {own} own commit(s) on {entry['base'][:10]}, area {entry['area']}"
           + (f", needs {' '.join(needs)}" if needs else ""))
@@ -375,6 +387,21 @@ def cmd_add(args, repo, store, gh):
     note = merge_note(repo, ident, entry["base"], q.tip(item))
     if note:
         print(note, file=sys.stderr)
+
+
+def flow_gate(repo, branch, body, args):
+    """The fix chain before the queue (SKILL.md, `contrib next`): a duplicate scan with no duplicate, a
+    recorded repro (or --no-repro for a docs or prompt-only change), one review stamped on the branch,
+    the user's own-words sentence, and precheck passed at the tip with this body. Haiku 5.5 skipped the
+    review, precheck and the queue itself in the 2026-10-30 cross-model check; the dry run obeys the
+    same gates."""
+    if args.no_repro is not None:
+        rec = omp_flow.by_branch(repo, branch)
+        if rec and not rec.get("repro"):
+            omp_flow.record_no_repro(repo, rec, args.no_repro)
+    problem = omp_flow.gate(repo, branch, body, args.manifest)
+    if problem:
+        raise Refused(f"pr-queue add: refused, {problem}")
 
 
 def rename_branch(args, repo, store):
@@ -405,6 +432,7 @@ def rename_branch(args, repo, store):
     reviews = review_log(old, repo)
     if os.path.exists(reviews):
         os.replace(reviews, review_log(args.branch, repo))
+    omp_flow.rename_branch(repo, old, args.branch)
     return {"old": old, "body": store.read(entry["body"]) if entry.get("body") else None, "worktree": worktree}
 
 
@@ -1540,6 +1568,7 @@ def main(argv, github=None):
     p.add_argument("--base")
     p.add_argument("--id")
     p.add_argument("--p2-decision")
+    p.add_argument("--no-repro")
     p.add_argument("--no-push", action="store_true")
     p = command("set")
     p.add_argument("key")

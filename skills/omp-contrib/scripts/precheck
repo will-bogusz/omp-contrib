@@ -77,8 +77,11 @@ any FIX line printed. Checks:
   - commit messages naming a PR as `#N`, `owner/repo#N` or a PR URL (NOTE): each push of a new SHA
     lands a reference on that PR's timeline; `quiet-refs` rewrites them after the next rebase the
     PR needs anyway, never in a push of its own
-  - body (with N or --body): What/Why/Testing headings, a first-person own-words line opening
-    `## What`, under 3,000 characters outside tables, <details>, images and the checklist, no @-mention of
+  - body (with N or --body): What/Why/Testing headings, each with text, the own-words line opening `## What`
+    (FIX unless that first paragraph is exactly a sentence recorded with `contrib record own-words`
+    for this branch, whitespace aside: the user's words, never a substitute; a branch with no
+    contribution record on this host gets the first-person check instead), under 3,000 characters
+    outside tables, <details>, images and the checklist, no @-mention of
     Codex, roboomp or a maintainer, and no merge-order line (`Builds on #N` for an open PR of ours,
     `merge #N first`, `Merge after`, `Overlaps #N`; FIX: shaping.md, Open-PR rule)
   - queue (with N, FIX): a closed PR whose change `pr-queue` holds queued reopens with the stored
@@ -94,6 +97,10 @@ any FIX line printed. Checks:
     maintainer regenerates at merge, and for each crate or package this branch changes that an open
     ready PR of ours changes too (crates/<name>, packages/<name>): git merges the two cleanly, yet
     the pair can fail to build (#15761 + #15762, E0507), so build and test the merged tree
+
+A run without N on a local branch records its result for that branch (sha, pass or FIX, the body
+checked), which `contrib next` and `pr-queue add` read: the queue takes a branch only once precheck
+passed at its tip with the body it queues.
 """
 import argparse
 import os
@@ -104,6 +111,7 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import omp_config  # noqa: E402
+import omp_flow  # noqa: E402
 from omp_pr import CHECKOUT, CODE, MAINTAINERS, ME, REPO, TS, Diff, blamed_commits, changelog_drift, gh_json, last_review, run  # noqa: E402
 from omp_pr import is_test_path, package_of, rust_checks, rust_diff_id, rust_platforms  # noqa: E402
 from omp_queue import (STORE_REMOTE, GitError, GitHub, Queue, Store, merge_order_lines, opening_pause, pause_line,  # noqa: E402
@@ -771,13 +779,21 @@ def prose_length(body):
     return len(re.sub(r"\n\s*\n(\s*\n)+", "\n\n", prose))
 
 
-def check_body(body, ours=()):
-    """Body checks; `ours` is the numbers of our open PRs, for the "Builds on #N" merge-order check."""
+def check_body(body, ours=(), own_words=None):
+    """Body checks; `ours` is the numbers of our open PRs, for the "Builds on #N" merge-order check;
+    `own_words` the sentences `contrib record own-words` holds for the branch (None: no record)."""
     for heading in ("## What", "## Why", "## Testing"):
         if heading not in body:
             fix("body", heading, "heading missing")
-    what = body.split("## What", 1)[-1].strip().split("\n\n", 1)[0] if "## What" in body else ""
-    if not re.search(r"\b(I|I'm|I've|I'd|[Mm]y|[Mm]e|[Ww]e|[Oo]ur)\b", what):
+        elif not re.sub(r"<!--.*?-->", "", body.split(heading, 1)[1].split("\n## ", 1)[0], flags=re.S).strip():
+            fix("body", heading, "section is empty")
+    what = omp_flow.what_paragraph(body)
+    if own_words is not None:
+        if not omp_flow.own_words_match(body, own_words):
+            fix("own-words", "## What", "the first paragraph is not the user's recorded own-words sentence: put it "
+                                        "there verbatim (`contrib body`), never a substitute"
+                                        + ("" if own_words else "; none is recorded yet: ask the user (contrib next)"))
+    elif not re.search(r"\b(I|I'm|I've|I'd|[Mm]y|[Mm]e|[Ww]e|[Oo]ur)\b", what):
         fix("body", "## What", "first paragraph has no first-person own-words sentence")
     prose = prose_length(body)
     if prose > BODY_LIMIT:
@@ -933,10 +949,13 @@ def main(argv):
     ours = set() if args.no_siblings else check_siblings(ref, number, cwd, branch)
     body = pr["body"] if pr else (open(args.body).read() if args.body else None)
     if body is not None:
-        check_body(body or "", ours - {number})
+        check_body(body or "", ours - {number}, None if pr else omp_flow.own_words_for(cwd, branch))
     check_behavior_eval(added, body)
     if pr:
         check_links(pr)
+    elif branch and run("git", "show-ref", "-q", "--verify", f"refs/heads/{branch}", cwd=cwd).returncode == 0:
+        omp_flow.note_precheck(cwd, branch, run("git", "rev-parse", ref, cwd=cwd).stdout.strip(), not findings, body,
+                               args.body)
     sys.exit(1 if findings else 0)
 
 

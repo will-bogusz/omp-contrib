@@ -94,6 +94,7 @@ export function blockReason(checkout: string, cfg: unknown): string {
 		"Next: run skill://omp-contrib/scripts/doctor --json, then the duplicate scan (skill://omp-contrib/references/duplicates.md), then",
 		`  git -C ${checkout} worktree add ${worktrees}/<topic> -b ${prefix}<topic> origin/main`,
 		"and make the edit there, with absolute paths into the worktree (workflow.md step 2).",
+		"skill://omp-contrib/scripts/contrib next names the contribution's next step and its command.",
 	].join("\n");
 }
 

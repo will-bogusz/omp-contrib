@@ -55,7 +55,14 @@ carries no stored body and no host path.
   <github.branch_prefix><topic> --title '<type(scope): …>' --body <file> [--needs <id|#N> …]
   [--priority Pn] [--p2-decision "<decision>"]`. Every final branch goes in, whether or not it can open
   today. Work that builds on unmerged work is branched from that work's branch and names it in
-  `--needs`; `add` records the branch point as `base`.
+  `--needs`; `add` records the branch point as `base`. `add` refuses a local branch, printing
+  `contrib next`'s step as the reason, until its contribution (`../scripts/contrib`) has a
+  duplicate scan with no duplicate, a repro (`--no-repro "<why>"` records none for a docs or
+  prompt-only change), one review stamped on its commits (a `needs-changes` one followed by a
+  commit or `contrib record review-answered`), the user's own-words sentence, and a precheck pass
+  at the tip with the body it queues, whose first paragraph under `## What` is that sentence. A
+  dry run (`--manifest`) obeys the same gates. A branch only on the fork was made on another host,
+  where its records live: `add` notes that and takes it.
 - **Starting PR work, and after each merge round** (`pr-trace --summary` lists the merges):
   `pr-queue sync`, `pr-queue advance`, `pr-queue plan`.
   Queue git calls disable rerere: CHANGELOGs are rebuilt from our commits, not old conflict
