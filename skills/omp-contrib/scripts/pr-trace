@@ -63,7 +63,14 @@ decline, fixes pushed, round budget spent, or a maintainer pushing to the PR; wo
 files whose findings span three rounds (reconsider the approach), and on a handed-off PR (its
 queue note says it is with the maintainer, or a maintainer reviewed or commented) the hand-off items: the
 budget no longer applies, and each deferred Codex reply (`Not fixed yet`, `Left for review`) and
-each comment of ours with hand-off wording is listed to fix and edit,
+each comment of ours with hand-off wording is listed to fix and edit; on a ready PR not handed off
+whose Codex rounds have settled (last pass clean, every finding answered, or the budget spent with
+every finding answered, and no pass running or due), each deferred `Not fixed yet` reply as a
+`final-push` item (flag `final push xN`, under "Needs us"): fix them all in one final push, then
+edit each reply in place to `Fixed in <sha>: …`. Once per PR: an edited `Fixed in` reply of ours
+marks the push made (`final push made <sha>`), after which Codex's pass on it follows the
+past-budget rules and any new deferral stays a `pre-hand-off` item. A PR whose queue entry is on
+hold (`pr-queue set --hold`) gets no final push (`held`),
 Codex threads we answered but have not resolved (resolve, with the thread id), roboomp review-body notes that no inline thread
 answers (maintainer questions, trade-offs, untested paths: settle each), the questions we asked
 a maintainer in the PR thread and whether one has replied since, whether the branch really
@@ -243,7 +250,7 @@ REVIEW_QUERY = """query($n:Int!){repository(owner:"%s",name:"%s"){pullRequest(nu
   reactions(first:50){nodes{content createdAt user{login}}}
   reviews(first:100){nodes{id url submittedAt body author{login} commit{oid}}}
   reviewThreads(first:100){nodes{id isResolved
-    comments(first:50){nodes{author{login} body url path line pullRequestReview{id}}}}}}}}""" % tuple(REPO.split("/"))
+    comments(first:50){nodes{author{login} body url path line lastEditedAt pullRequestReview{id}}}}}}}}""" % tuple(REPO.split("/"))
 
 
 def review_data(number):
@@ -667,7 +674,7 @@ def stamp(at):
     return datetime.datetime.fromisoformat(at.replace("Z", "+00:00"))
 
 
-def codex_settle(pr, pull, handed=False):
+def codex_settle(pr, pull, handed=False, spent=False):
     """Where Codex's review of the PR stands (workflow step 7), from its
     latest completed pass on any head. None when Codex has completed no pass; else "maintainer"
     when a maintainer wrote the head commit (he is working the PR); "clean" when that pass found
@@ -677,7 +684,8 @@ def codex_settle(pr, pull, handed=False):
     reply, else "settled" (every finding answered: fixed, or declined as design-level). A pass is a
     Codex review (a round: Codex reviews only to post findings), a 👍 reaction (Codex re-adds it on
     each clean pass, so its time is the latest clean pass), or a `Completed` summary row on a commit
-    no Codex review covers (a clean pass)."""
+    no Codex review covers (a clean pass). `spent`: the final push of the deferred fixes is made
+    (final_push), so the budget counts as spent whatever the rounds."""
     reviews = [r for r in pull["reviews"]["nodes"] if bot(r) == CODEX and r.get("submittedAt")]
     passes = [(stamp(r["submittedAt"]), (r.get("commit") or {}).get("oid") or "", True) for r in reviews]
     passes += [(stamp(x["createdAt"]), "", False) for x in pull["reactions"]["nodes"]
@@ -697,7 +705,7 @@ def codex_settle(pr, pull, handed=False):
         return "clean"
     if not (sha and pr["headRefOid"].startswith(sha)):
         return "pushed"
-    if len(reviews) >= CODEX_ROUND_BUDGET and not handed:
+    if (len(reviews) >= CODEX_ROUND_BUDGET or spent) and not handed:
         return "budget"
     waiting, p2, _ = review_threads(pull, pr)
     return "fix" if p2 or any(w.startswith(CODEX + " ") for w in waiting) else "settled"
@@ -721,17 +729,25 @@ def codex_repeats(pull):
     return sorted((p, len(r)) for p, r in rounds.items() if len(r) >= CODEX_REPEAT_ROUNDS and last in r)
 
 
-def codex_own_regressions(pr, pull, cwd=CHECKOUT):
+def codex_own_regressions(pr, pull, cwd=CHECKOUT, final_at=None):
     """URLs of the open Codex P2 threads, past the round budget, that sit on head lines our latest
     push wrote: `git blame` dates the line's commit after Codex's previous review (author dates
     survive a rebase). Those still get one fix push if cheap, once: only while the PR has exactly
     CODEX_ROUND_BUDGET rounds, so the pass after that push ends it (workflow step 7; #15418's
-    always-sent close, 2026-10-14)."""
+    always-sent close, 2026-10-14). After the final push of the deferred fixes (`final_at`, its
+    commit time) the same holds for the one Codex review after it: lines written since the review
+    before that push."""
     reviews = sorted((r for r in pull["reviews"]["nodes"] if bot(r) == CODEX and r.get("submittedAt")),
                      key=lambda r: r["submittedAt"])
-    if len(reviews) != CODEX_ROUND_BUDGET:
+    if final_at:
+        before = [r for r in reviews if stamp(r["submittedAt"]) <= final_at]
+        if len(reviews) - len(before) != 1:
+            return []
+        since = stamp(before[-1]["submittedAt"]) if before else final_at
+    elif len(reviews) != CODEX_ROUND_BUDGET:
         return []
-    since = stamp(reviews[-2]["submittedAt"])
+    else:
+        since = stamp(reviews[-2]["submittedAt"])
     found = []
     for t in pull["reviewThreads"]["nodes"]:
         first = (t["opener"]["nodes"] or [{}])[0]
@@ -788,6 +804,46 @@ def handoff_items(pr, pull):
 
 HANDOFF_SHOWN = {"deferred": "deferred Codex finding: fix it with a test (or decline or disprove it), then edit the reply",
                  "wording": "our comment leaves work to the maintainer: edit those sentences"}
+
+
+# Once a ready PR's Codex rounds settle, the fixes our `Not fixed yet` replies deferred go out in one
+# final push, not at hand-off: the maintainer merges most PRs within hours without a word, so the
+# hand-off never comes and he makes them himself (#17492, `e6eba3dc43`). Once per PR.
+# The final push is recognised by its trace on GitHub: a reply of ours in a Codex thread that reads
+# `Fixed in <sha>` and was edited (GraphQL `lastEditedAt`). We post a fix's reply fresh as `Fixed
+# in`, so an edited one is a deferral rewritten in place, which is what the final push does to each.
+# A deferral newer than the head would also mark it, but only until the next push, and only when
+# that push left a deferral behind; the edit stays on GitHub for good and needs no extra query.
+FIXED_REPLY = re.compile(r"^\s*Fixed in ([0-9a-f]{7,40})\b", re.I)
+FINAL_SHOWN = ("deferred Codex finding: fix it in the final push (a test where the fix changes user-visible "
+               "behaviour), then edit this reply in place to `Fixed in <sha>: …`")
+
+
+def final_push(pr, pull):
+    """(sha, commit time) of the final push of the deferred fixes once made, else None: the newest
+    `Fixed in <sha>` reply of ours in a Codex thread that was edited after posting. The time is that
+    commit's on the PR, else the edit's."""
+    edited = [(c["lastEditedAt"], FIXED_REPLY.match(c.get("body") or "").group(1))
+              for t in pull["reviewThreads"]["nodes"] if bot((t["opener"]["nodes"] or [{}])[0]) == CODEX
+              for c in (t.get("all") or {}).get("nodes") or []
+              if bot(c) == ME and c.get("lastEditedAt") and FIXED_REPLY.match(c.get("body") or "")]
+    if not edited:
+        return None
+    at, sha = max(edited)
+    commit = next((c for c in pr.get("commits") or [] if (c.get("oid") or "").startswith(sha)), None)
+    return sha, stamp(commit["committedDate"] if commit and commit.get("committedDate") else at)
+
+
+def final_push_due(pr, pull, settle, codex, waiting, p2, handed="", held="", final=None):
+    """The deferred replies (`Not fixed yet`) of a ready PR whose Codex rounds have settled, as
+    [("deferred", url)]: its last pass is clean, or every finding is answered, or the budget is spent
+    with every finding answered, and no pass runs or is due. Empty once the final push is made
+    (`final`), on a handed-off PR (every finding is ours there anyway), a held one, a draft, or a
+    head the maintainer pushed."""
+    if (pr.get("isDraft") or handed or held or final or codex in ("running", "due")
+            or settle not in ("clean", "settled", "budget") or p2 or any(w.startswith(CODEX + " ") for w in waiting)):
+        return []
+    return [(kind, url) for kind, url in handoff_items(pr, pull) if kind == "deferred"]
 
 
 def maintainer_asks(pr):
@@ -994,7 +1050,7 @@ RESOLVE_THREAD = "gh api graphql -f query='mutation{resolveReviewThread(input:{t
 
 def next_step(pr, rank, waiting, merge, deps, asks, requests, drift, notes, review="none", to_resolve=(),
               notes_unanswered=False, rule=(), codex=None, settle=None, p2=(), repeats=(), regressions=(),
-              handoff=(), shipped=(), pair_gone=()):
+              handoff=(), shipped=(), pair_gone=(), final=()):
     if pr["isDraft"]:
         pending = [f"#{n}" for n, state, _ in deps if state != "merged"]
         if pending:
@@ -1032,6 +1088,10 @@ def next_step(pr, rank, waiting, merge, deps, asks, requests, drift, notes, revi
         deferred = " and the deferred ones under hand-off" if any(k == "deferred" for k, _ in handoff) else ""
         return (f"{rethink}fix every cheap Codex finding above{deferred} in one push, P2s included; decline only one "
                 "whose fix needs a design change, in one line naming that change, and resolve it (Workflow step 7)")
+    if final:
+        return (f"Codex rounds settled: make the final push of the {len(final)} deferred fix(es) above, each with a "
+                "test where the fix changes user-visible behaviour, all in one push; then edit each `Not fixed yet` "
+                "reply in place to `Fixed in <sha>: <what changed>.` (Workflow step 7, Final push; once per PR)")
     if handoff:
         return ("handed off, so every Codex finding is ours: fix each deferred one above with a test that fails "
                 "without it (or decline or disprove it in our words) in one push, then edit its reply to `Fixed in "
@@ -1103,6 +1163,11 @@ def queue_notes(manifest):
     return {e["pr"]: e.get("note") or "" for e in manifest.get("entries", []) if e.get("pr")}
 
 
+def queue_holds(manifest):
+    """{PR number: its queue entry's `hold` reason (`pr-queue set --hold`)} for each held entry with a PR."""
+    return {e["pr"]: e["hold"] for e in manifest.get("entries", []) if e.get("pr") and e.get("hold")}
+
+
 def queue_pairs(manifest):
     """{PR number: [(other number, role, other's manifest state)]} for each pair `pr-queue open` opened
     over a P2 (shaping.md, Open-PR rule 3): the P2's entry lists the opener in `rebases_after`. Role
@@ -1116,7 +1181,7 @@ def queue_pairs(manifest):
     return pairs
 
 
-def trace(number, trees, prs, rules, note=""):
+def trace(number, trees, prs, rules, note="", held=""):
     pr = gh_json("pr", "view", str(number), "-R", REPO, "--json",
                  "number,title,state,isDraft,labels,createdAt,url,headRefName,headRefOid,body,commits,"
                  "comments,reviews")
@@ -1134,26 +1199,36 @@ def trace(number, trees, prs, rules, note=""):
 
     waiting, merge, drift, asks, requests, notes = [], "n/a", [], maintainer_asks(pr), [], []
     notes_unanswered, p2, codex, settle, repeats, regressions = False, [], None, None, [], []
-    review, to_resolve, rule, handoff, shipped = ("n/a", ""), [], rules.get(number, []), [], []
+    review, to_resolve, rule, handoff, shipped, final = ("n/a", ""), [], rules.get(number, []), [], [], []
     for at, ask_url, reply in asks:
         print(f"  asked    {at} {ask_url}: {'answered by ' + reply if reply else 'no maintainer reply yet'}")
     if pr["state"] == "OPEN":
         pull = review_data(number)
         handed = handoff_reason(pr, note=note)
-        (waiting, p2, to_resolve), settle = review_threads(pull, pr), codex_settle(pr, pull, bool(handed))
+        made = final_push(pr, pull)
+        (waiting, p2, to_resolve) = review_threads(pull, pr)
+        settle = codex_settle(pr, pull, bool(handed), spent=bool(made))
         codex, repeats = codex_head(pr, pull), codex_repeats(pull)
         handoff = handoff_items(pr, pull) if handed else []
+        final = final_push_due(pr, pull, settle, codex, waiting, p2, handed, held, made)
         if handed:
             print(f"  handed   to the maintainer ({handed}): every Codex finding is ours (Workflow step 7)")
+        if held:
+            print(f"  held     {held}: no final push while it is on hold")
         for kind, item_url in handoff:
             print(f"  hand-off {HANDOFF_SHOWN[kind]}: {item_url}")
+        for _, item_url in final:
+            print(f"  final push {FINAL_SHOWN}: {item_url}")
+        if made:
+            print(f"  final push made ({made[0][:10]}): past-budget rules apply to Codex's pass on it; a new "
+                  "`Not fixed yet` stays a pre-hand-off item")
         if codex:
             print(f"  codex    {CODEX_FLAG[codex]}")
         if settle:
             print(f"  codex    {CODEX_SETTLE[settle]}")
         for path, n in repeats:
             print(f"  codex    findings in {path} over {n} rounds: reconsider the approach (Workflow step 7)")
-        regressions = codex_own_regressions(pr, pull) if settle == "budget" else []
+        regressions = codex_own_regressions(pr, pull, final_at=made and made[1]) if settle == "budget" else []
         for thread_url in regressions:
             print(f"  codex    past the budget, on a line our latest push wrote: fix it if cheap, one push: {thread_url}")
         requests = maintainer_requests(pr)
@@ -1214,7 +1289,7 @@ def trace(number, trees, prs, rules, note=""):
     if rest:
         print(f"  also in     {rest} more sessions with fewer mentions (PR lists, passing references)")
     if pr["state"] == "OPEN":
-        print(f"  next     {next_step(pr, rank, waiting, merge, deps, asks, requests, drift, notes, review[0], to_resolve, notes_unanswered, rule, codex, settle, p2, repeats, regressions, handoff, shipped)}")
+        print(f"  next     {next_step(pr, rank, waiting, merge, deps, asks, requests, drift, notes, review[0], to_resolve, notes_unanswered, rule, codex, settle, p2, repeats, regressions, handoff, shipped, final=final)}")
 
 
 # Next steps that wait on someone else; GitHub's CHANGELOG-only conflict rides with our next needed
@@ -1223,10 +1298,11 @@ PASSIVE_STEPS = ("nothing", "waiting", "needs a maintainer decision", "draft: re
                  "GitHub's CHANGELOG-only conflict rides")
 
 
-def summary_row(number, prs, rules, note="", named=False, pairs=()):
+def summary_row(number, prs, rules, note="", named=False, pairs=(), held=""):
     """One open PR as data: rank, age, flags, whether it needs us, and the next step. `named`: given
     after --summary; a named PR not yet handed off lists its `pre-hand-off` items without lifting
-    the budget or needing us (workflow step 7, At hand-off). `pairs`: its `queue_pairs` entries."""
+    the budget or needing us (workflow step 7, At hand-off). `pairs`: its `queue_pairs` entries.
+    `held`: why its queue entry is on hold (queue_holds); a held PR gets no final push."""
     pr = gh_json("pr", "view", str(number), "-R", REPO, "--json",
                  "number,title,state,isDraft,labels,createdAt,headRefName,headRefOid,body,commits,comments,"
                  "reviews,url")
@@ -1238,22 +1314,25 @@ def summary_row(number, prs, rules, note="", named=False, pairs=()):
     deps = dependencies(pr) if pr["isDraft"] else []
     pull, requests, notes = review_data(number), maintainer_requests(pr), roboomp_notes(pr)
     handed = handoff_reason(pr, note)
-    (waiting, p2, to_resolve), settle = review_threads(pull, pr), codex_settle(pr, pull, bool(handed))
-    items = handoff_items(pr, pull) if handed or named else []
+    made = final_push(pr, pull)
+    (waiting, p2, to_resolve) = review_threads(pull, pr)
+    settle = codex_settle(pr, pull, bool(handed), spent=bool(made))
+    codex = codex_head(pr, pull)
+    final = final_push_due(pr, pull, settle, codex, waiting, p2, handed, held, made)
+    items = final or (handoff_items(pr, pull) if handed or named else [])
     handoff = items if handed else []
     repeats = codex_repeats(pull)
-    codex = codex_head(pr, pull)
     merge, drift = conflict(branch)
     rule = rules.get(number, [])
     review = review_state(branch)
     notes_unanswered = roboomp_notes_unanswered(pr)
-    regressions = codex_own_regressions(pr, pull) if settle == "budget" else []
+    regressions = codex_own_regressions(pr, pull, final_at=made and made[1]) if settle == "budget" else []
     shipped = shipped_regressions(pr)
     pair_gone = [(n, "merged" if state == "merged" else "closed" if state == "closed" else "not open")
                  for n, _, state in pairs if n not in prs]
     step = next_step(pr, rank, waiting, merge, deps, maintainer_asks(pr), requests, drift, notes, review[0],
                      to_resolve, notes_unanswered, rule, codex, settle, p2, repeats, regressions, handoff, shipped,
-                     pair_gone)
+                     pair_gone, final)
     others = [w for w in waiting if not w.startswith(CODEX + " ")]
     codex_open = [] if settle == "maintainer" else [w for w in waiting if w.startswith(CODEX + " ")] + list(p2)
     flags = [f"CHANGES x{len(requests)}"] if requests else []
@@ -1263,7 +1342,10 @@ def summary_row(number, prs, rules, note="", named=False, pairs=()):
     flags += [CODEX_SHORT[settle]] if settle else []
     flags += [f"Codex rethink {path.rsplit('/', 1)[-1]} ({n} rounds)" for path, n in repeats] if codex_open else []
     flags += [f"Codex own regression x{len(regressions)}"] if regressions else []
-    flags += [f"hand-off x{len(handoff)}"] if handoff else [f"pre-hand-off x{len(items)}"] if items else []
+    flags += ([f"hand-off x{len(handoff)}"] if handoff else [f"final push x{len(final)}"] if final
+              else [f"pre-hand-off x{len(items)}"] if items else [])
+    flags += [f"final push made {made[0][:10]}"] if made else []
+    flags += ["held"] if held else []
     flags += [f"rebases after #{n} merges" if role == "after" else f"opened over P2 #{n}"
               for n, role, _ in pairs if n in prs]
     flags += [f"resolve Codex x{len(to_resolve)}"] if to_resolve else []
@@ -1276,9 +1358,10 @@ def summary_row(number, prs, rules, note="", named=False, pairs=()):
     created = datetime.datetime.fromisoformat(pr["createdAt"].replace("Z", "+00:00"))
     return {**row, "draft": pr["isDraft"], "rank": rank.removeprefix("review:"),
             "created": pr["createdAt"], "age_days": (datetime.datetime.now(datetime.timezone.utc) - created).days,
-            "codex": settle, "handed": handed, "handoff": [{"kind": k, "url": u} for k, u in items],
+            "codex": settle, "handed": handed, "final": bool(final),
+            "handoff": [{"kind": k, "url": u} for k, u in items],
             "flags": flags, "next": re.split(r"[:;]", step, maxsplit=1)[0], "next_full": step,
-            "needs_us": bool(requests or others or codex_open or to_resolve or handoff)
+            "needs_us": bool(requests or others or codex_open or to_resolve or handoff or final)
             or not step.startswith(PASSIVE_STEPS)}
 
 
@@ -1287,8 +1370,9 @@ def summary_line(row):
         return f"#{row['number']:<6} {row['state']:<8} {row['title'][:70]}"
     label = "draft" if row["draft"] else (row["rank"] or "no rank")
     flags = f"[{', '.join(row['flags'])}] " if row["flags"] else ""
-    tag = "hand-off" if row["handed"] else "pre-hand-off"
-    items = "".join(f"\n         {tag} {HANDOFF_SHOWN[i['kind']]}: {i['url']}" for i in row["handoff"])
+    tag = "hand-off" if row["handed"] else "final-push" if row.get("final") else "pre-hand-off"
+    items = "".join(f"\n         {tag} {FINAL_SHOWN if row.get('final') else HANDOFF_SHOWN[i['kind']]}: {i['url']}"
+                    for i in row["handoff"])
     return (f"#{row['number']:<6} {label:<7} {row['age_days']:>3}d  {row['title'][:64]:<64}  {flags}-> {row['next']}"
             + items)
 
@@ -1342,8 +1426,9 @@ def post_merge_row(m):
 
 
 def summarize(numbers, days, prs, rules, manifest, named=(), as_json=False, fetch_error=None):
-    notes, pairs = queue_notes(manifest), queue_pairs(manifest)
-    rows = [summary_row(n, prs, rules, notes.get(n, ""), n in named, pairs.get(n, ())) for n in numbers]
+    notes, pairs, holds = queue_notes(manifest), queue_pairs(manifest), queue_holds(manifest)
+    rows = [summary_row(n, prs, rules, notes.get(n, ""), n in named, pairs.get(n, ()), holds.get(n, ""))
+            for n in numbers]
     merges, since = recent_merges(days)
     # The queue watcher's record (`pr-queue watch`), fetched from the fork for this run.
     record = manifest.get("watch")
@@ -1460,9 +1545,9 @@ def main(argv):
     if args.summary:
         summarize(sorted(numbers), args.since, prs, rules, manifest, set(args.numbers), args.json, fetch_error)
         return
-    trees, notes = worktrees(), queue_notes(manifest)
+    trees, notes, holds = worktrees(), queue_notes(manifest), queue_holds(manifest)
     for n in sorted(numbers):
-        trace(n, trees, prs, rules, notes.get(n, ""))
+        trace(n, trees, prs, rules, notes.get(n, ""), holds.get(n, ""))
 
 
 if __name__ == "__main__":

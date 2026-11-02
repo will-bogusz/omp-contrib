@@ -583,23 +583,66 @@ class HandoffTest(unittest.TestCase):
                 mock.patch.object(PT, "review_state", return_value=("approve", "approve")):
             return PT.summary_row(1, {}, {}, **kw)
 
-    def test_old_deferred_replies_need_us_only_once_handed_off(self):
-        quiet = self.summary()
-        self.assertFalse(quiet["needs_us"], quiet)
-        self.assertEqual(quiet["handoff"], [])
-        handed = self.summary(note="Sent to the maintainer 2026-10-15.")
+    @staticmethod
+    def made(data):
+        """`data` after the final push: our `Not fixed yet` on T3 edited in place to `Fixed in`."""
+        data["reviewThreads"]["nodes"][2]["all"]["nodes"][-1]["lastEditedAt"] = "2026-10-13T12:00:00Z"
+        return data
+
+    def test_settled_deferred_replies_need_one_final_push_then_wait_for_hand_off(self):
+        """The maintainer merges within hours without a hand-off (#17492, e6eba3dc43)."""
+        due = self.summary()
+        self.assertTrue(due["needs_us"], due)
+        self.assertIn("final push x2", due["flags"])
+        self.assertEqual(due["next"], "Codex rounds settled")
+        self.assertIn("edit each `Not fixed yet` reply in place to `Fixed in <sha>", due["next_full"])
+        line = PT.summary_line(due)
+        self.assertIn("final-push deferred Codex finding: fix it in the final push", line)
+        self.assertIn("https://x/T1#r", line)
+        after = self.summary(self.made(self.data()))
+        self.assertFalse(after["needs_us"], after)
+        self.assertEqual(after["handoff"], [])
+        self.assertIn("final push made abc1234", after["flags"])
+        self.assertEqual(after["codex"], "budget", "past-budget rules after the final push")
+        handed = self.summary(self.made(self.data()), note="Sent to the maintainer 2026-10-15.")
         self.assertTrue(handed["needs_us"])
         self.assertIn("hand-off x2", handed["flags"])
         self.assertTrue(handed["next"].startswith("handed off"), handed["next"])
 
-    def test_a_named_pr_lists_pre_hand_off_items_without_needing_us(self):
-        named = self.summary(named=True)
+    def test_no_final_push_while_held_drafted_or_a_pass_is_due(self):
+        held = PT.queue_holds({"entries": [
+            {"pr": 15128, "state": "open", "hold": "redesign first"},
+            {"pr": 15130, "state": "queued", "hold": "waiting on #15128"},
+            {"pr": 15131, "state": "open", "note": "Sent to the maintainer; hold the release note"}]})
+        self.assertEqual(sorted(held), [15128, 15130])
+        row = self.summary(held=held[15128])
+        self.assertFalse(row["needs_us"], row)
+        self.assertIn("held", row["flags"])
+        self.assertNotIn("final push x2", row["flags"])
+        args = dict(settle="settled", codex=None, waiting=[], p2=[])
+        self.assertEqual(len(PT.final_push_due(pr(OLD), self.data(), **args)), 2)
+        self.assertEqual(PT.final_push_due(pr(OLD), self.data(), **{**args, "codex": "due"}), [])
+        self.assertEqual(PT.final_push_due({**pr(OLD), "isDraft": True}, self.data(), **args), [])
+        self.assertEqual(PT.final_push_due(pr(OLD), self.data(), **{**args, "settle": "fix"}), [])
+        self.assertEqual(PT.final_push_due(pr(OLD), self.data(), **{**args, "p2": ["x"]}), [])
+        self.assertEqual(len(PT.final_push_due(pr(OLD), self.data(), **{**args, "settle": "budget"})), 2)
+
+    def test_a_named_pr_after_the_final_push_lists_pre_hand_off_items_without_needing_us(self):
+        named = self.summary(self.made(self.data()), named=True)
         self.assertFalse(named["handed"])
         self.assertFalse(named["needs_us"], named)
         self.assertIn("pre-hand-off x2", named["flags"])
         self.assertNotIn("hand-off x2", named["flags"])
         self.assertIn("pre-hand-off deferred Codex finding", PT.summary_line(named))
         self.assertIn("https://x/T1#r", PT.summary_line(named))
+
+    def test_the_final_push_is_an_edited_fixed_in_reply_of_ours(self):
+        self.assertIsNone(PT.final_push(pr(OLD), self.data()), "a fresh `Fixed in` reply is a normal fix")
+        sha, at = PT.final_push(pr(OLD), self.made(self.data()))
+        self.assertEqual((sha, at), ("abc1234", PT.stamp("2026-10-13T12:00:00Z")))
+        head = pr("abc1234" + "0" * 33, pushed="2026-10-13T11:40:00Z")
+        self.assertEqual(PT.final_push(head, self.made(self.data()))[1], PT.stamp("2026-10-13T11:40:00Z"),
+                         "the pushed commit's time when the PR has it")
 
     def test_naming_a_pr_keeps_the_round_budget(self):
         data = rounds(PT.CODEX_ROUND_BUDGET)
@@ -622,10 +665,11 @@ class CodexOwnRegressionTest(unittest.TestCase):
             git("commit", "-q", "--no-gpg-sign", "--date", when, "-m", when)
         self.head = git("rev-parse", "HEAD")
 
-    def found(self, n, line):
+    def found(self, n, line, final_at=None):
         data = rounds(n, sha=self.head)  # reviews at 10:00, 11:00, ...: the one before the last at 13:00 for n=5
         data["reviewThreads"]["nodes"][-1]["latest"]["nodes"][0]["line"] = line
-        return PT.codex_own_regressions(pr(self.head), data, cwd=self.root)
+        return PT.codex_own_regressions(pr(self.head), data, cwd=self.root,
+                                        final_at=final_at and PT.stamp(final_at))
 
     def test_a_line_written_after_the_previous_review_is_ours(self):
         self.assertEqual(self.found(PT.CODEX_ROUND_BUDGET, 2), [f"https://x/T{PT.CODEX_ROUND_BUDGET - 1}"])
@@ -635,6 +679,12 @@ class CodexOwnRegressionTest(unittest.TestCase):
 
     def test_only_once_the_pass_after_that_push_ends_it(self):
         self.assertEqual(self.found(PT.CODEX_ROUND_BUDGET + 1, 2), [])
+
+    def test_after_the_final_push_the_one_pass_on_it_gets_one_more_push(self):
+        """Reviews at 10:00 and 11:00, the final push between them at 10:30; line 2 was written at 15:30."""
+        self.assertEqual(self.found(2, 2, "2026-10-13T10:30:00Z"), ["https://x/T1"])
+        self.assertEqual(self.found(2, 1, "2026-10-13T10:30:00Z"), [])
+        self.assertEqual(self.found(3, 2, "2026-10-13T10:30:00Z"), [], "a second pass after it ends it")
 
 
 def git_repo():
