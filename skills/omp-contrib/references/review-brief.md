@@ -24,7 +24,14 @@ patch in scratch, never `git stash`.
    neighbouring paths: other providers, other credential or pin kinds, retry and failure branches,
    concurrent sessions or processes, the window between a value's capture and its use, consumers of
    a changed exit code, payload or log. For each, state what `origin/main` does and whether the head
-   keeps it. Flag any outcome changed beyond what the PR title promises.
+   keeps it. Flag any outcome changed beyond what the PR title promises. Then the off sides: with
+   the feature's setting unset, on every other backend or browser kind, and on teardown or close
+   paths that call a changed helper, the head must do exactly what `main` does, down to which hooks
+   it registers, with a test of that side (`code-style.md`, *New behaviour stays inside its
+   feature*). A comment, body line or test that names a new side effect as acceptable, or pins a
+   bug of `main` as expected, is a finding unless a stated policy allows it, and a test asserting
+   that something did not happen must listen everywhere it could happen (*A side effect we call
+   accepted…*).
 2. Persisted state: if the diff adds or changes a saved session entry, custom entry or record, what
    happens to it on rewind, branching (`branchWithSummary`), forking, compaction, tree navigation and
    resume? An entry that stays on the old branch while the reply it describes moves is the miss the
@@ -43,10 +50,14 @@ patch in scratch, never `git stash`.
 6. Every claim about an outside service's behaviour (API counting rules, token semantics, CLI exit
    codes) is backed by vendor docs or a live probe; check the citation.
 7. Tests: each behaviour fix has a test that fails with the fix reverted (re-run that check where
-   cheap); no full-string assertions unless bytes are the contract; no ambient env leakage; every
-   `test.each` row is a distinct case; fixtures match the scenario; no test passes or fails by how
-   fast the machine runs (sleeps, clock reads, elapsed-time bounds, timer races): fake timers or an
-   injected clock, and await the event itself.
+   cheap). List each test the PR adds with the branch only it reaches; a test with none is a finding
+   (fold it into the test that reaches that branch, or delete it), and so is a test of debug-log
+   wording, of prompt or tool-description wording (testing that a new branch adds or omits a
+   section is fine), of catalog or registry rows read back, of a cache-key version, or of a
+   mechanism the PR did not change (`code-style.md`, *Count tests by code path*). No
+   full-string assertions unless bytes are the contract; no ambient env leakage; fixtures match the
+   scenario; no test passes or fails by how fast the machine runs (sleeps, clock reads,
+   elapsed-time bounds, timer races): fake timers or an injected clock, and await the event itself.
 8. CHANGELOG: each entry of this PR sits under `## [Unreleased]` after merging `origin/main`, brief
    and user-facing. Docs that state a changed contract are updated.
 9. Model-visible text: a settings, env or request value the diff renders into a prompt template,

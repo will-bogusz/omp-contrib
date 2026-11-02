@@ -60,7 +60,8 @@ maintainer sign-off.
 2. Check it against the code at the PR head (a finding may predate an amend), against
    precedent in sibling providers or tools, and against a live run when the claim is
    about external behavior.
-3. Valid: fix it with a regression test that fails without the fix, batching every fix of a pass
+3. Valid: fix it, with a regression test that fails without the fix when the test reaches a branch
+   no other test does (`code-style.md`, *Count tests by code path*), batching every fix of a pass
    into one push (each push reruns CI and wakes another Codex pass). Which Codex findings get a fix
    (every cheap one, P2s included) and when to stop pushing for Codex: workflow step 7.
 4. Invalid: keep the code, reply with the evidence, and add a test or a short code comment where

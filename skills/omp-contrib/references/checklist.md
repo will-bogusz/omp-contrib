@@ -19,15 +19,18 @@ Part of the `omp-contrib` skill; phase names in *italics* are listed in `../SKIL
 - [ ] Code checked against *Write the code the way the maintainers do*: nothing beyond the
       title, no side-channel state, stored state no larger than its readers use, error causes the
       failing signal shows and an arm for each input a message was not written for, comments sized
-      to their neighbours with no provenance, a test that fails without the fix and none that only
-      restates a hand-off to native or a required-names list, no test that depends on wall-clock
-      time, no churn.
+      to their neighbours with no provenance, new behaviour off where its feature is off (with a
+      test of that side), no side effect the PR calls accepted, a test that fails without the fix
+      and each other test reaching a branch no other test reaches (none that only restates a
+      hand-off to native, a required-names list, log or prompt wording, or data rows), no test that
+      depends on wall-clock time, no churn.
 - [ ] `../scripts/precheck` prints no FIX (CHANGELOG placement after merging `origin/main`
       included, no other open PR's commits or code conflict with an open ready PR of ours,
       shaping.md, and a `rust-check` recorded for every platform a Rust diff builds on); each NOTE
-      (casts, test shapes, signatures, docs, unclosed issue mentions, removed calls, out-of-scope
-      commits, tests on script text, field readers missing a new field, credential-shaped values
-      rendered into a prompt, a platform placed `none`) decided.
+      (casts, test shapes, test volume, logger or prompt-wording tests, signatures, docs, unclosed
+      issue mentions, removed calls, out-of-scope commits, tests on script text, field readers
+      missing a new field, credential-shaped values rendered into a prompt, a platform placed
+      `none`) decided.
 - [ ] The sentence after the own-words line gives the headline number as before → after. Each idea
       takes the one form framing.md *Visuals* picks for it (drawn, never Mermaid), and no number
       is drawn twice. Composites (`../scripts/compose-shots`) checked with `read`; a chart or

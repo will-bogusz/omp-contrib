@@ -78,7 +78,8 @@ refuses a branch until the steps before it are done.
     peer-supplied guards, cited outside-service claims, tests that fail without the fix. Record the
     verdict (`../scripts/review-stamp ready|needs-changes --by <agent> --sha <reviewed commit>`),
     then fix or answer each finding, giving each behaviour fix a test that fails with the fix
-    reverted, and move on: **the fixes are not reviewed again**, and nothing after this step
+    reverted (extending the test that already reaches its branch: `code-style.md`, *Count tests by
+    code path*), and move on: **the fixes are not reviewed again**, and nothing after this step
     spawns another reviewer. roboomp reviews the PR next, and the bots (step 7) catch what is left.
     A `needs-changes` verdict with nothing committed after it holds the queue until the fixes are
     committed, or `contrib record review-answered --evidence "<why>"` says why each finding needs
@@ -152,7 +153,8 @@ refuses a branch until the steps before it are done.
    model-family constants or id matching outside the catalog's KDL rules, a URL, token or env
    value rendered unredacted into a prompt, open issues mentioned but
    not closed, generated-file overlaps, open ready PRs in the same crate or package (build the
-   merged tree), no review recorded, and the preparation checks of
+   merged tree), no review recorded, test volume past its thresholds and tests of logger output
+   or prompt wording (`tests`, `log-test`, `prompt-test`), and the preparation checks of
    `code-style.md`: removed calls, commits scoped outside the title, tests asserting on script
    text, readers of a type's fields that miss a new one). A CHANGELOG FIX or a real conflict
    with `main` is cleared by `pr-queue advance` or a rebase onto `origin/main` (*Cadence*); a
@@ -233,7 +235,9 @@ refuses a branch until the steps before it are done.
      a protocol, new persisted state), an outcome outside the title's promise, or reversing a
      decision the body states and argues. Reply in one line naming that change, then resolve the
      thread: `Not fixing here: needs <the design change>, beyond what this PR <promises>.` A finding
-     that is wrong is not declined but disproved (Invalid, below).
+     that is wrong is not declined but disproved (Invalid, below). Exporting an existing function
+     from a sibling package so the fix can call it is reuse, not a design change (H4vC did it for
+     #17492's request-size estimate, `442231fc2a`).
    - **Stop pushing for Codex at the first of:** (a) its last pass on the head is clean; (b) every
      finding of that pass is declined as design-level or disproved (Codex settled); (c) before
      hand-off, the PR has had 5 rounds (the budget). Past the budget only a P0/P1 gets a push,
@@ -244,20 +248,35 @@ refuses a branch until the steps before it are done.
      to after Codex's previous review). On #15418 the round-5 push made an idle close always sent,
      and Codex's round-5 finding was that the close could now block every later write. Reply to
      each other P2 `Not fixed yet: <the fix in one line>; Codex round budget
-     spent.` and resolve it: the fix stays on record as ours, cleared at hand-off (next bullet). A
+     spent.` and resolve it: the fix stays on record as ours, made in the final push once the
+     rounds settle (next bullet). A
      later push (a maintainer request, a real conflict with `main`, a real bug) still waits for its
      pass, and that pass's findings are handled by these same rules. `pr-trace` shows `Codex
      clean`, `Codex settled`, `Codex budget spent`, `Codex findings` (fix or decline), `Codex fixes
      pushed`, and `maintainer pushed` (a head a maintainer committed: its findings are theirs).
+   - **Once the rounds settle, the deferred fixes go out in one final push.** Settled: Codex's last
+     pass on the head is clean, or every finding is declined or disproved, or the budget is spent
+     with no pass pending. Make each `Not fixed yet` fix then, as at hand-off (with a test only
+     where *Count tests by code path* asks for one), push once, and edit each reply in place to
+     `Fixed in <sha>: <what changed>.` Once per PR: the final push's own pass follows the budget
+     rule above (a regression on lines it wrote gets one more push; anything else is a `Not fixed
+     yet` that waits for hand-off). Why: the maintainer merges most of our PRs within hours and
+     without a comment (75 of them 10-24..11-02), so hand-off never comes and he makes the deferred
+     fixes himself; on #17492 H4vC made exactly our four, on our branch, before merging
+     (`e6eba3dc43`), as on #15496 (`3b60ccd8a5`). `pr-trace` lists such a PR under Needs us with
+     its deferred items (`final push xN`); a PR whose queue entry is on hold (`pr-queue set
+     --hold`) is skipped.
    - **At hand-off the budget ends: every valid Codex finding is ours.** A PR is
      handed off when the user sends it to a maintainer (a tag or message: *Asking a maintainer*),
      or once a maintainer reviews, comments on or asks for changes on it, and stays so until it
      merges or closes. Before it goes, and on every pass while the maintainer has it, fix each open
-     finding, the ones the budget skipped included, with a test that fails without the fix; or
+     finding, the ones the budget skipped included, with a test that fails without the fix where
+     *Count tests by code path* asks for one; or
      disprove it with evidence, or decline it in our words (`Not fixing here: …`, above). Then edit
      each `Not fixed yet` reply in place
      (`gh api -X PATCH repos/can1357/oh-my-pi/pulls/comments/<id>`) to
-     `Fixed in <sha>: <what changed>. Test: <name>.` or the decline or disproof, and edit any
+     `Fixed in <sha>: <what changed>.` (adding `Test: <name>.` when it has one) or the decline or
+     disproof, and edit any
      comment of ours that leaves work to the maintainer (`left for review`, `left for you`, `for
      the maintainer`), changing only those sentences. Each fix push waits for its pass, handled
      the same way, until a pass is clean or settled. Why: under the budget, replies saying `Left
@@ -290,7 +309,8 @@ refuses a branch until the steps before it are done.
      #14247, #14251, #14277, #14338, #14485, where the maintainer's fix was the mechanism roboomp
      had proposed), and pasting roboomp's suggested patch as is (#14420, #14425, #14431, where its
      patch was too broad, mis-ordered or broke a neighbour). Answer every clause, make each input
-     or path it names a test case, and run the blast-radius list above over whatever fix you
+     or path it names a case in the test that reaches its branch (`code-style.md`, *Count tests by
+     code path*), and run the blast-radius list above over whatever fix you
      adopt, including a guard you add only because it asked. When roboomp asks whether invalid
      input should fail and a sibling backend already fails, make it fail rather than list it as a
      non-goal. Our other open PRs are never a reason to decline or bend what a reviewer asks: each
@@ -300,7 +320,7 @@ refuses a branch until the steps before it are done.
    - Valid: fix it, and batch all fixes into one push per round: each push wakes another Codex
      pass (#10648 grew to +939/-67 over 10 Codex rounds) and reruns CI. No reviewer for bot fixes
      (step 3's one round was the review): each behaviour fix carries a test that fails with it
-     reverted, and the targeted tests run before the push.
+     reverted, counted by code path as above, and the targeted tests run before the push.
    - The same kind of finding a second time, on one PR or across our PRs in one area, means the
      code lets it keep happening: fix that cause (one check, type or helper every path must go
      through), not just the second line it names. #15293 took five Codex rounds,
@@ -351,7 +371,8 @@ refuses a branch until the steps before it are done.
 9. **Merged or closed:** remove the worktree, in whichever session notices first (including a
    `pr-trace` resume): copy anything uncommitted worth keeping (scratch notes, fixtures) out of
    it, then `git worktree remove <paths.worktrees>/<topic>`; the branch ref stays. For a merge,
-   do the *Learn from each merge* review (in *Write the code the way the maintainers do*) first;
+   do the *Learn from each merge* review (in *Write the code the way the maintainers do*;
+   `../scripts/pr-trace --learn N`) first;
    it reads the merge from the canonical repo, not the worktree. Never remove a worktree whose
    `git rev-list --count HEAD --not --remotes` is nonzero without the user's go-ahead.
 10. **Post-merge sweep, every session and every merge round** (standing step, not optional): Codex

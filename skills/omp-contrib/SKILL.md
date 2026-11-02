@@ -73,9 +73,11 @@ This file routes: open the reference for the phase you are in. Each rule's sourc
   (one line naming it, then resolved); pushing for Codex stops at a clean pass, a pass whose
   findings are all declined or disproved, or the 5-round budget, past which a cheap finding on
   lines our latest push wrote still gets one push, once, and its other findings get a
-  `Not fixed yet: <fix>` reply. At hand-off (the PR goes to a maintainer, or a maintainer reviews
-  it) the budget ends: every valid finding is ours, fixed with a test, disproved, or declined in
-  our words, and no comment of ours leaves work to the maintainer. A push that fixes nothing never
+  `Not fixed yet: <fix>` reply; once the rounds settle, those deferred fixes go out in one final
+  push, since the maintainer usually merges before any hand-off (workflow step 7). At hand-off (the
+  PR goes to a maintainer, or a maintainer reviews it) the budget ends: every valid finding is
+  ours, fixed, disproved, or declined in our words, and no comment of ours leaves work to the
+  maintainer. A push that fixes nothing never
   goes out, except one CHANGELOG-only push per release once a PR's bot rounds have settled
   (*Cadence*). Every roboomp thread gets a reply in its thread; a top-level comment carries only
   body content that has no thread (workflow step 7).
@@ -137,7 +139,8 @@ records: `start`, `record`, `body`, `stop`, `next`, `status`), `scripts/doctor` 
 upstream-document drift; `--json` for `/contribute`), `scripts/pr-trace` (start every status scan
 with `--summary --open --fetch`; after a push, `--wait-codex N` waits out Codex's pass; waiting on
 PRs for anything, `--wait-change N... --state FILE` returns on the first merge, push, person's
-comment, Codex pass end or conflict change), `scripts/pr-queue`, `scripts/pr-body N FILE` (edit a
+comment, Codex pass end or conflict change; after a merge, `--learn [N ...]` lists what
+maintainers changed before, inside and after it), `scripts/pr-queue`, `scripts/pr-body N FILE` (edit a
 live PR body, refuse queued entries, normalize read-back newlines; `--dry-run` previews without
 editing), `scripts/gh-cost -- <command>` (the GraphQL points a command spends; cadence.md),
 `scripts/post-status` (a series post's status block; queue.md *Series posts*), `scripts/precheck`,

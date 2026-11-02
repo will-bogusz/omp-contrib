@@ -98,6 +98,26 @@ this list, which holds only where our code has differed from theirs.
   only a deciding answer and runs under its own deadline, not the wait it precedes: on #15489 only
   a token read or `Not allowed` fixes the upload route, and a timeout, navigation or busy page
   sends contents once and checks again (`830a9b82eb`).
+- **New behaviour stays inside its feature.** With an opt-in setting off, the session behaves
+  exactly as on `main`, down to which hooks are registered; a workaround for one backend's
+  behaviour runs only on that backend; a teardown or close path never starts or replaces a
+  resource. Each such gate gets a test of its off side asserting `main`'s outcome: our tests had
+  run only the on side each time. #16803 registered its cost-cap model-call hook with no cap set,
+  so a user abort before the next request ended cleanly and `/retry` found nothing to retry
+  (`f5f47678bc`, registered only while capped); #17768 waited for a relay detach report in
+  launched and headless browsers too (`1c45a9113c`, gated on `#userDriven`); #17751's
+  close-after-keep path called `acquireBrowser`, which can start a relay (`a47a579ff1`,
+  `startRelay: false`).
+- **A side effect we call accepted is a finding against the PR.** A comment, body line or test
+  that names a new side effect as acceptable ("Chrome fires the click on the document root
+  instead"), or pins a bug of `main` as expected ("subagents … rediscover additional roots"), marks
+  a defect to remove, unless the subsystem's stated policy allows it (cite it). A test asserting
+  that something did not happen listens everywhere it could happen (a `window` capture listener,
+  not one on the target). #17778 released a cancelled press at `(-1,-1)` and its test listened only
+  on `#target`, so the root click H4vC removed was invisible to it (`89833d37f4`); #16768's test
+  asserted AGENTS.md leaking into subagents, and H4vC inverted it (`dcafcef642`); #17745's fix kept
+  an extension's summary by dropping the template's guide, trading one loss for another
+  (`921f5562ca`).
 - **Platform code we can't run** (Windows UIA, Linux AT-SPI from the Mac): read the wrapper
   crate's source for who owns returned resources (`39ed781676`: `get_runtime_id` leaked a
   SAFEARRAY), reuse the access path the file already uses, and model the platform's documented
@@ -107,6 +127,26 @@ this list, which holds only where our code has differed from theirs.
   captures, CLI versions, issue or reviewer numbers, "used to" history and pointers to other
   files go in the commit body or PR, where they cannot go stale. A comment defending a cast
   means the type should change. Our open PRs carried about twice the maintainers' doc-block rate.
+- **Count tests by code path, not by scenario.** Before adding a test, name the branch it reaches
+  that no other test in the PR reaches. Another trigger (idle, pre-prompt, `/compact`), another
+  input of the same class (a fractional cap beside an integer one) or another environment that
+  reaches the same branch is the same test: keep the case most likely to break, or extend the
+  existing test, rather than add one; a loop of starting points inside one test counts as several.
+  A bot finding's fix gets a test of its own only when a user would notice the failure at normal
+  input; hardening for input nobody sends (a clock step, a non-multiple interval, a BigInt or
+  cyclic value, a name containing a separator) is fixed in code without one. Never test debug-log
+  wording, prompt or tool-description wording (a test that a branch the PR adds puts a section in
+  or leaves it out is fine; a whole session built to find a prompt line in its request is not:
+  H4vC kept #16918's renderer test and deleted its SDK one, `4b13432524`), catalog, KDL or
+  registry rows read back through their builder, a cache-key version, or a mechanism the PR did
+  not change. Why: between 10-29 and 11-02 H4vC pared the tests of 7 of our PRs to their distinct
+  branches and kept every fix (`642fce6b03` kept 3 of #17490's 7 cases, `3587ec7f14` cut 347
+  lines from #17510, `0fa4a8a570` "pare merged PR tests to behavior that can regress" on five),
+  and cut about 210 more lines in post-merge cleanups (#16297, #16579, #16918, #17351, #17391,
+  #17393). AGENTS.md Testing Guidance already bans these ("duplicate rows", "static echo", prompt
+  boilerplate); our test lines ran 1.0–3.6× source lines on those PRs, against H4vC's 1.0.
+  precheck NOTEs logger and prompt-text assertions and test volume past its thresholds (`tests`,
+  `log-test`, `prompt-test`).
 - **One regression test that fails without the fix, through the real path, asserting the exact
   outcome.** Put it in the nearest existing test file and reuse its fixtures. No wall-clock time,
   no internals exported for tests, no generators the bug doesn't need. Maintainers delete tests
@@ -147,9 +187,14 @@ this list, which holds only where our code has differed from theirs.
   that sleep, read a clock or race a timer (TS and Rust).
 - **No incidental churn.** Touch only the lines the change needs: no reformatting, comment
   reflow, reordering or renames elsewhere. Maintainers revert it (`8a9660df00`, `9311adf9b7`).
-- **Learn from each merge.** After a PR merges, list the maintainer commits on our branch
-  (`git log --format='%h %an %s' <merge>^1..<merge>^2`), read their diffs, and record each new
-  lesson in `code-style.md`.
+- **Learn from each merge.** Maintainer feedback on a merged PR lands in three places: commits
+  on our branch before the merge, edits inside the merge commit, and commits on `main` after it
+  ("chore: post-merge cleanup for #N", "fixup! Merge PR #N", "fixup(#N): …", or unlabelled
+  follow-ups that rewrite our lines). In the 10-24..11-02 rounds 8 of the 13 instructive commits
+  were in the third place, which reading `<merge>^1..<merge>^2` misses. `pr-trace --learn [N …]`
+  lists all three per merged PR; read each diff and record what is new here (a table row, a rule
+  once it repeats). Repo-wide sweeps it marks as such teach nothing about our code unless they
+  recur.
 
 ## Evidence behind the rules above
 
@@ -184,10 +229,12 @@ taste sources at `origin/main` before relying on the quotes below; they win.
 Inline review is roboomp's and Codex's (about 3,700 inline comments since 08-29 against 14 by
 maintainers). Maintainers act by pushing fixup commits onto the contributor's branch before
 merging: 154 such commits on 103 of 883 external merges since 08-15, 144 of them by H4vC. 36 of
-the 154 fix CHANGELOG entries. Post-merge rewrites are rare. Until 2026-10-07 no maintainer had
+the 154 fix CHANGELOG entries. Until 2026-10-07 no maintainer had
 written a review comment on any of our 58 PRs; on 2026-10-08 H4vC wrote seven change requests on
-PRs he did not merge that round, each a concrete regression with a suggested fix. So the
-feedback is the fixups on our merged branches plus those requests.
+PRs he did not merge that round, each a concrete regression with a suggested fix. Since 10-24 most
+of his feedback on ours lands on `main` after the merge, as post-merge cleanups, fixups and
+follow-ups (*Learn from each merge*). So the feedback is his commits, before and after the merge,
+plus those requests.
 
 ## Fixups on our PRs (before → after)
 
@@ -257,6 +304,23 @@ feedback is the fixups on our merged branches plus those requests.
 | `914654c252` H4vC | #16390 | the relay guidance block rendered `browser.cdpUrl` verbatim (`cdpUrl: fallback.cdpUrl` into `prompt.render`), so a URL's userinfo or token query went to the model provider in the system prompt | `redactUrlForLog(fallback.cdpUrl)`; the test's URL carries `user:pw@` and `?token=` and expects them redacted | Text rendered into a prompt leaves the machine: a settings or env value that can carry a credential is redacted at the render site (as `6e8bc4c9c2` did for logs); precheck NOTEs (`secret`) such a value passed to `prompt.render` or a template placeholder, review-brief criterion 9 |
 | `9b481c53bd` H4vC | #16433 | a test of two concurrent `rm -f` runs on one tree ran everywhere; on Windows a file another process is deleting (delete pending) reads as access denied, not gone, so the race still fails there | `#[cfg(unix)]` with a comment saying why | A test of filesystem or process semantics runs only where those semantics hold: no CI job runs Windows or macOS tests and H4vC does, so gate it to its platforms (checklist, CI item) |
 | `1f6d9ee075` H4vC | #16252 | role-name matching that five Codex rounds kept extending case by case (each round a new way a name is computed) | hidden `aria-labelledby` targets read whole, ARIA range values, nested `aria-labelledby`, from the accessible-name rules themselves | A third Codex round in one function means the model is wrong (workflow step 7): implement the spec's algorithm (here accname) or ask the browser for the computed value, not the case the finding names |
+| `642fce6b03`, `3587ec7f14`, `0fa4a8a570` H4vC | #17490, #17510, #16309, #16552, #16595, #17766, #17772 | seven snapcompact cases that each start another way (context notes, `/compact`, idle, pre-prompt) and end in the same frame-count check; eight text-reader session tests re-proving "marker text, no images" from other starts; a 3×4 `/proc` × install-start matrix; KDL credit rows read back through the registry; a cache-key version bump tested | three cases; two tests; `if (procfs !== "cannot be listed") continue` ("every unusable /proc routes to the same guarded installer"); the echoes deleted; every fix kept | Count tests by code path: a test exists for a branch no other test reaches |
+| `3000d4e84d` H4vC | #17391 | `try { JSON.stringify(wait) } catch` for unserializable waits; a selector type test re-run on every poll; one test per Codex finding (a non-whole interval, a wall-clock jump, BigInt and cyclic rows) | `typeof wait === "number" ? String(wait) : describeArgument(wait)`; the id computed once before the loop; the fixes kept, their 4 tests deleted | Rare input is handled by the construct that covers it by construction; hardening nobody hits at normal input needs no test |
+| `93adeecffb` H4vC | #17393 | a 7-line doc on a private helper; quoting of meta names containing `,;"`; a second `stripDataUriImages` pass; a test of `:raw` behaviour the PR did not change | 3 lines; no quoting; one pass ("`renderHtmlToText` already stripped data-URI images"); the test deleted | Defend against input the pipeline can deliver, once per transform |
+| `f5f47678bc` H4vC | #16803 | the cost-cap gate registered on every session (`addBeforeModelCall`), so an abort before the next request stopped cleanly and `/retry` found no interrupted turn | `syncCostCapGate()` registers it only while a cap is set | With the feature off, nothing of it runs: test the off side |
+| `1c45a9113c` H4vC | #17768, #17778 | the relay detach wait ran in launched and headless browsers too; our own RPC timeout recognised by a regex on its message, with a comment defending the coupling | `this.#userDriven &&`; `class RpcTimeoutError` and `instanceof` | A backend's workaround runs only on that backend; our own error is a type, not a message match |
+| `89833d37f4` H4vC | #17778 | a cancelled press released at `(-1,-1)`; doc and body accepting that Chrome then clicks the document root; the test listened on `#target` only | released at `CANCELLED_RELEASE_POINT`, the root `click`/`auxclick` swallowed by a document-start capture guard; the test logs clicks on `window` | A side effect we call accepted is a finding; a "did not happen" test listens everywhere |
+| `e6eba3dc43` H4vC | #17492 | four Codex findings on the request-size estimate left `Not fixed yet` under the round budget | those four fixes on our branch, merged 5 h after the PR opened | Deferred fixes go out in one final push once the rounds settle (workflow step 7) |
+| `7f1d03d333`, `8a0bc691f8` H4vC | #16925, #17349 | a new instruction spliced into a maintainer's prompt bullet as a parenthetical; a `//!` paragraph left ragged by an insertion | his bullet restored word for word plus a bullet of ours; the paragraph rewrapped | A new instruction gets its own sentence or bullet; rewrapping a paragraph we inserted into is part of the change, not churn |
+
+**2026-10-24..11-02 rounds.** H4vC merged 75 of our PRs with no comment or review on any; #16910 he
+squash-landed verbatim as his own commit in an 88-PR batch. His feedback moved after the merge: 10
+targeted cleanups or fixups on `main` and about 9 behaviour follow-ups, against one commit on a
+branch (#17492), most of them paring our tests. Can's 10-29 sweep (`6469ddbe4d`, `20a20268d6`)
+rewrote, then deleted, about 710 of our test lines on 8 PRs, mostly real-time browser, LSP and
+OAuth tests. What changed: *Count tests by code path*, *New behaviour stays inside its feature*,
+*A side effect we call accepted…*, the final push of deferred Codex fixes (workflow step 7),
+`pr-trace --learn`, and precheck's test NOTEs.
 
 **2026-10-18..20 rounds.** H4vC merged 78 of our PRs (median 15.8 h after opening, p90 36 h). No
 human comment or review came on any of them: his feedback is his commits. Fork CI never ran before
