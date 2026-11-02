@@ -638,6 +638,9 @@ class HandoffTest(unittest.TestCase):
 
     def test_the_final_push_is_an_edited_fixed_in_reply_of_ours(self):
         self.assertIsNone(PT.final_push(pr(OLD), self.data()), "a fresh `Fixed in` reply is a normal fix")
+        refreshed = self.made(self.data())
+        refreshed["reviewThreads"]["nodes"][2]["all"]["nodes"][-1]["body"] = "Fixed in abc1234 (first pushed as 9f9f9f9)."
+        self.assertIsNone(PT.final_push(pr(OLD), refreshed), "re-pointing a reply at a rebased sha is no final push")
         sha, at = PT.final_push(pr(OLD), self.made(self.data()))
         self.assertEqual((sha, at), ("abc1234", PT.stamp("2026-10-13T12:00:00Z")))
         head = pr("abc1234" + "0" * 33, pushed="2026-10-13T11:40:00Z")

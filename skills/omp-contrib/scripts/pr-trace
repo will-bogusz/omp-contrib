@@ -3,6 +3,7 @@
 
 usage: pr-trace [N ...] [--open] [--fetch]
        pr-trace --summary [N ...] [--open] [--fetch] [--since DAYS] [--json]
+       pr-trace --learn [N ...] [--since DAYS]
        pr-trace --issues
        pr-trace --wait-codex N [N ...] [--timeout MIN]
        pr-trace --wait-change N [N ...] [--timeout MIN] [--state FILE]
@@ -16,7 +17,10 @@ usage: pr-trace [N ...] [--open] [--fetch]
             `unreleased`), and under each the bot findings posted after the merge: `post-merge: Codex P1 x2
             open` when no later main commit names the PR or rewrites their lines (also listed in "Needs
             us": fix them as a follow-up off main before the maintainer has to), else the main commit
-            that took them up. Start every "where do
+            that took them up, and a one-line count of what maintainers did after it (`--learn`):
+            `post-merge: H4vC 2 commit(s) rewrote 30 of our lines`, `N sweep(s)`, `edited in merge`
+            (from the --learn cache; at most 4 merges not yet scanned are scanned per run, the rest
+            read `post-merge: not scanned yet`). Start every "where do
             things stand" scan with `--summary --open --fetch`: it selects by activity, not by when a
             PR was opened (2026-10-08: two change requests on PRs opened days earlier sat 23 h).
             --json prints the same as one object (open rows, merges, `pause`, `queue_watch`) for
@@ -30,6 +34,22 @@ usage: pr-trace [N ...] [--open] [--fetch]
             A PR named after --summary that is not handed off also shows its `pre-hand-off` items,
             to check it before it goes to the maintainer (workflow step 7, At hand-off); naming alone keeps
             the budget and does not count as needing us
+  --learn   what maintainers did with our merged PRs (default: every PR of ours closed in the last
+            DAYS, default 7), to learn from each merge. Per PR: `before merge`, maintainer and
+            roboomp commits on our branch before it merged; `in merge`, the merge commit against
+            git's own merge of its parents (CHANGELOGs and generated files left out), each file
+            `resolved` (a conflict settled with lines of either side: resolution against main's
+            concurrent work), `resolved+edited` or `edited` (new lines in neither parent: a real
+            edit), with `git show --remerge-diff <merge>` to read it; `post-merge`, their commits on
+            origin/main in the 7 days after the merge commit that name the PR (`#N`: "post-merge
+            cleanup for #N", "fixup! Merge PR #N", "Follow-up to #N") or rewrite lines git blame
+            gives to the PR's own commits, with how many of our lines, sha, author and subject;
+            `sweep`, the same for commits touching over 50 files. A closed PR a maintainer
+            squash-landed as his own `… (#N)` commit counts as merged by him, through that commit.
+            Maintainers are `github.maintainers` (their login as git author name, or their GitHub
+            noreply address). Results are cached per merge (the omp-contrib cache dir, `learn/`);
+            once its 7 days have passed it never changes, before that only main commits new since
+            the last run are read
   --issues  audit the open issues you filed instead: which a merged PR only referenced
             without closing, which triage labelled duplicate, which have a fix PR pending
   --wait-codex  after a push, block until Codex's pass on each named PR's head has ended (polled
@@ -99,9 +119,10 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from omp_pr import (  # noqa: E402
-    BODY_FINDING, CHECKOUT, CODEX, CONFIG, MAINTAINERS, ME, REPO, Diff, RateLimited, blamed_commits, bot, by_maintainer,
-    changelog_drift, first_release, gh_json, github_changelog_conflicts, has_ref, last_review, merge_conflicts,
-    merged_prs, open_prs, package_of, post_merge_counts, post_merge_review, run,
+    BODY_FINDING, CHECKOUT, CODEX, CONFIG, LEARN_DAYS, MAINTAINERS, ME, REPO, Diff, RateLimited, blamed_commits,
+    bot, by_maintainer, changelog_drift, first_release, gh_json, github_changelog_conflicts, has_ref, landed_commit,
+    last_review, learn_line, merge_conflicts, merge_learning, merged_prs, open_prs, package_of, post_merge_counts,
+    post_merge_review, run,
 )
 from omp_queue import STORE_REMOTE, GitError, GitHub, Queue, Store, opening_pause, pause_line  # noqa: E402
 import omp_poll  # noqa: E402
@@ -815,6 +836,9 @@ HANDOFF_SHOWN = {"deferred": "deferred Codex finding: fix it with a test (or dec
 # A deferral newer than the head would also mark it, but only until the next push, and only when
 # that push left a deferral behind; the edit stays on GitHub for good and needs no extra query.
 FIXED_REPLY = re.compile(r"^\s*Fixed in ([0-9a-f]{7,40})\b", re.I)
+# A `Fixed in` reply re-pointed at the rebased sha ("Fixed in <new> (first pushed as <old>)", #15282)
+# was edited without ever deferring anything.
+SHA_REFRESH = re.compile(r"\(first pushed as\b", re.I)
 FINAL_SHOWN = ("deferred Codex finding: fix it in the final push (a test where the fix changes user-visible "
                "behaviour), then edit this reply in place to `Fixed in <sha>: …`")
 
@@ -826,7 +850,8 @@ def final_push(pr, pull):
     edited = [(c["lastEditedAt"], FIXED_REPLY.match(c.get("body") or "").group(1))
               for t in pull["reviewThreads"]["nodes"] if bot((t["opener"]["nodes"] or [{}])[0]) == CODEX
               for c in (t.get("all") or {}).get("nodes") or []
-              if bot(c) == ME and c.get("lastEditedAt") and FIXED_REPLY.match(c.get("body") or "")]
+              if bot(c) == ME and c.get("lastEditedAt") and FIXED_REPLY.match(c.get("body") or "")
+              and not SHA_REFRESH.search(c.get("body") or "")]
     if not edited:
         return None
     at, sha = max(edited)
@@ -1391,6 +1416,7 @@ def recent_merges(days):
     for m in out:
         m["release"] = first_release(m["merge_commit"]) or "unknown"
     post_merge_review(out)
+    learn_counts(out)
     return out, since
 
 
@@ -1412,7 +1438,101 @@ def merge_line(m):
     if done:
         shas = ", ".join(dict.fromkeys(f["taken_up"] for f in done))
         line += f"\n         post-merge: {post_merge_counts(done)} taken up on main in {shas}"
+    if m.get("learn"):
+        line += f"\n         {m['learn']}"
     return line
+
+
+# --summary scans at most this many merges it has no --learn cache for, so a first run stays fast;
+# the rest say so and fill in on later runs (or with `pr-trace --learn`).
+LEARN_SUMMARY_CAP = 4
+
+
+def learn_counts(merges, cap=LEARN_SUMMARY_CAP):
+    """Adds `learn` to each merge: omp_pr.learn_line of its --learn result, from the cache when the
+    merge's window has closed, else updated for main commits new since the last scan."""
+    fresh = 0
+    for m in merges:
+        if not m.get("merge_commit"):
+            continue
+        got = merge_learning(m["number"], m["merge_commit"], scan=False)
+        if got is None and fresh >= cap:
+            m["learn"] = f"post-merge: not scanned yet (pr-trace --learn {m['number']})"
+            continue
+        fresh += got is None
+        got = got if got and got["final"] else merge_learning(m["number"], m["merge_commit"])
+        m["learn"] = learn_line(got) if got else ""
+
+
+def learn_targets(numbers, days):
+    """[(pr, merge or landed commit, landed)] for our PRs `numbers`, or else every PR of ours closed in
+    the last `days`: merged ones by their merge commit, closed ones a maintainer squash-landed as his
+    own `(#N)` commit (omp_pr.landed_commit) by that commit. Others are left out."""
+    fields = "number,title,url,state,mergedAt,mergedBy,mergeCommit,closedAt,createdAt,headRefOid"
+    if numbers:
+        prs = [gh_json("pr", "view", str(n), "-R", REPO, "--json", fields) for n in numbers]
+    else:
+        since = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)).date()
+        # `closed:>=` misses some closed PRs (2026-11-02: #16910, closed 10-26, absent from
+        # `closed:>=2026-10-23` yet found by `updated:`); a PR is updated when it closes, so filter here.
+        prs = [p for p in gh_json("pr", "list", "-R", REPO, "--author", ME, "--state", "closed", "--limit", "300",
+                                  "--search", f"updated:>={since.isoformat()}", "--json", fields)
+               if (p.get("closedAt") or "")[:10] >= since.isoformat()]
+    found = []
+    for pr in sorted(prs, key=lambda p: p.get("mergedAt") or p.get("closedAt") or ""):
+        if pr.get("mergedAt") and (pr.get("mergeCommit") or {}).get("oid"):
+            found.append((pr, pr["mergeCommit"]["oid"], False))
+        elif pr.get("state") == "CLOSED":
+            sha = landed_commit(pr["number"], pr["createdAt"])
+            if sha:
+                found.append((pr, sha, True))
+            elif numbers:
+                print(f"#{pr['number']} closed without a merge, and no maintainer commit on main ends `(#{pr['number']})`")
+        elif numbers:
+            print(f"#{pr['number']} is {pr['state'].lower()}: nothing merged to learn from")
+    return found
+
+
+def learn_report(pr, got):
+    """--learn's block for one merged (or squash-landed) PR."""
+    when = got["merged_at"][:16].replace("T", " ")
+    if got["landed"]:
+        head = f"#{pr['number']} closed, squash-landed by {got.get('by') or 'a maintainer'} as {got['merge'][:10]} {when}"
+    else:
+        by = (pr.get("mergedBy") or {}).get("login", "?")
+        head = f"#{pr['number']} merged {when} by {by} (merge {got['merge'][:10]})"
+    window = "" if got["final"] else f"  [window open: {LEARN_DAYS} days from the merge]"
+    lines = [f"\n{head}  {pr['title'][:70]}{window}"]
+    lines += [f"  before merge  {c['sha'][:10]} {c['author']:<8} {c['subject'][:80]}" for c in got["before"]]
+    if got["landed"] and pr.get("headRefOid"):
+        lines.append(f"  landed        his commit against our last head: git diff {pr['headRefOid'][:10]} "
+                     f"{got['merge'][:10]} (fetch the fork's branch first if the head is missing)")
+    if got["in_merge"]:
+        what = "; ".join(f"{e['kind']} {e['path']}" + (f" ({e['new']} new line(s))" if e["new"] else "")
+                         for e in got["in_merge"])
+        pure = all(e["kind"] == "resolved" for e in got["in_merge"])
+        lines.append(f"  in merge      {'conflict resolution only' if pure else 'maintainer edits'}: {what}  "
+                     f"(git show --remerge-diff {got['merge'][:10]})")
+    for heading, sweep in (("post-merge", False), ("sweep", True)):
+        for c in (c for c in got["after"] if c["sweep"] == sweep):
+            why = ", ".join(([f"rewrote {c['lines']} of our lines"] if c["lines"] else [])
+                            + ([f"names #{pr['number']}"] if c["named"] else [])
+                            + ([f"{c['files']} files"] if sweep else []))
+            lines.append(f"  {heading:<13} {c['sha'][:10]} {c['author']:<8} {why}: {c['subject'][:80]}")
+    if len(lines) == 1:
+        lines.append("  nothing: merged as sent, and no maintainer commit on main names it or rewrote our lines")
+    return "\n".join(lines)
+
+
+def learn(numbers, days):
+    """`pr-trace --learn`: what maintainers did with our merged PRs, to learn from each."""
+    run("git", "fetch", "-q", "origin", "main", cwd=CHECKOUT)
+    targets = learn_targets(numbers, days)
+    print(f"Maintainer work on our PRs {'named' if numbers else f'closed in the last {days} day(s)'}: before the "
+          f"merge, inside the merge commit, and on main in the {LEARN_DAYS} days after it. Read each commit.")
+    for pr, sha, landed in targets:
+        got = merge_learning(pr["number"], sha, landed=landed)
+        print(learn_report(pr, got) if got else f"\n#{pr['number']}: {sha[:10]} is not in the checkout; fetch origin")
 
 
 def post_merge_row(m):
@@ -1502,15 +1622,22 @@ def main(argv):
     parser.add_argument("--fetch", action="store_true")
     parser.add_argument("--issues", action="store_true")
     parser.add_argument("--summary", action="store_true")
-    parser.add_argument("--since", type=int, default=2, metavar="DAYS")
+    parser.add_argument("--learn", action="store_true")
+    parser.add_argument("--since", type=int, metavar="DAYS")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--wait-codex", action="store_true")
     parser.add_argument("--wait-change", action="store_true")
     parser.add_argument("--timeout", type=float, metavar="MIN")
     parser.add_argument("--state", metavar="FILE")
     args = parser.parse_args(argv)
-    if args.since < 0:
+    if args.since is not None and args.since < 0:
         parser.error("--since takes a number of days, 0 or more")
+    if args.learn:
+        if args.summary or args.open or args.issues or args.wait_codex or args.wait_change:
+            parser.error("--learn takes PR numbers or --since, alone")
+        learn(args.numbers, LEARN_DAYS if args.since is None else args.since)
+        return
+    args.since = 2 if args.since is None else args.since
     for flag, wait, default in (("--wait-codex", args.wait_codex, CODEX_WAIT_DEFAULT),
                                 ("--wait-change", args.wait_change, CHANGE_WAIT_DEFAULT)):
         if wait:

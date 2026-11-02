@@ -366,6 +366,196 @@ def post_merge_counts(findings):
     return ", ".join(f"{k} x{v}" for k, v in sorted(counts.items(), key=lambda kv: kv[0].split()[-1]))
 
 
+# --- What maintainers did with a merged PR of ours (pr-trace --learn) ----------------------------------
+# Reading only <merge>^1..<merge>^2 misses most of it: in the week to 2026-11-02, 8 of 13 instructive
+# maintainer commits on our PRs landed on main after the merge ("chore: post-merge cleanup for #N",
+# "fixup! Merge PR #N", unlabelled rewrites of our lines), some edits sat inside the merge commit, and
+# #16910 was closed and squash-landed by H4vC as his own `c80715be71 … (#16910)`.
+LEARN_CACHE = omp_config.cache_dir("learn")
+LEARN_VERSION = 1
+LEARN_DAYS = 7
+# A commit touching more files is a repo-wide sweep (H4vC's `0fa4a8a570` touched 3; Can's 10-29 test
+# sweep `20a20268d6` dozens): listed apart.
+SWEEP_FILES = 50
+# Generated or merged-by-union files: a merge's edits there say nothing about our code.
+LEARN_SKIP = re.compile(r"(^|/)(CHANGELOG\.md|models\.json|rules\.json|index\.d\.ts)$|(^|/)native/index\.js$")
+# Maintainers (`github.maintainers`) as git records them: an author name equal to the login (can1357
+# commits as `can1357`), or the login's GitHub noreply address (H4vC commits under another name as
+# `…+H4vC@users.noreply.github.com`); roboomp, their bot, as `roboomp`.
+_LOGINS = "|".join(map(re.escape, MAINTAINERS)) or "(?!)"
+MAINTAINER_NAMES = re.compile(rf"^(?:{_LOGINS})$", re.I)
+MAINTAINER_EMAILS = re.compile(rf"^(?:\d+\+)?({_LOGINS})@users\.noreply\.github\.com$", re.I)
+BOT_GIT = re.compile(r"^roboomp$", re.I)
+
+
+def git_author_kind(name, email):
+    """"maintainer", "bot" (roboomp) or None for a git author."""
+    if MAINTAINER_NAMES.match(name or "") or MAINTAINER_EMAILS.search(email or ""):
+        return "maintainer"
+    if BOT_GIT.match(name or ""):
+        return "bot"
+    return None
+
+
+def git_author_label(name, email):
+    """The name --learn shows for a git author: the maintainer's login when the address is their
+    GitHub noreply one (a commit under another display name), else the git name."""
+    m = MAINTAINER_EMAILS.search(email or "")
+    return m.group(1) if m else name
+
+
+def git_commits(*args, cwd=CHECKOUT):
+    """[{sha, name, email, who, at, subject, body, files}] of `git log --no-merges ARGS`; `who` is
+    git_author_label's."""
+    out = run("git", "log", "--no-merges", "--format=%x00%H%x1f%an%x1f%ae%x1f%cI%x1f%s%x1f%b%x1e", "--name-only",
+              *args, cwd=cwd).stdout
+    found = []
+    for chunk in out.split("\x00")[1:]:
+        head, _, files = chunk.partition("\x1e")
+        sha, name, email, at, subject, body = (head.split("\x1f", 5) + [""] * 6)[:6]
+        found.append({"sha": sha, "name": name, "email": email, "who": git_author_label(name, email), "at": at,
+                      "subject": subject, "body": body, "files": [f for f in files.splitlines() if f.strip()]})
+    return found
+
+
+def merge_edits(merge, p1, p2, cwd=CHECKOUT):
+    """What the merge commit changed beyond git's own merge of its parents: [{path, kind, new}], from
+    `git merge-tree --write-tree p1 p2` against the merge, LEARN_SKIP files left out. `new` counts
+    the merge's lines found in neither parent. kind "resolved": a conflicted file settled with lines
+    of either side (a resolution against main's concurrent work); "resolved+edited": a conflicted
+    file with new lines too; "edited": a file that merged cleanly and was changed anyway."""
+    out = run("git", "merge-tree", "--write-tree", "--name-only", "--no-messages", p1, p2, cwd=cwd)
+    lines = out.stdout.splitlines()
+    if not lines:
+        return []
+    conflicted = set(lines[1:]) if out.returncode == 1 else set()
+    edits = []
+    for path in run("git", "diff", "--name-only", "--no-renames", lines[0], merge, cwd=cwd).stdout.split():
+        if LEARN_SKIP.search(path):
+            continue
+        sides = set()
+        for parent in (p1, p2):
+            sides |= set(run("git", "show", f"{parent}:{path}", cwd=cwd).stdout.splitlines())
+        new = [l for l in run("git", "show", f"{merge}:{path}", cwd=cwd).stdout.splitlines()
+               if l.strip() and l not in sides]
+        kind = ("resolved+edited" if new else "resolved") if path in conflicted else "edited"
+        edits.append({"path": path, "kind": kind, "new": len(new)})
+    return edits
+
+
+def rewritten_lines(sha, paths, own, cwd=CHECKOUT):
+    """How many lines commit `sha` removed or rewrote in `paths` that `git blame` at its parent
+    assigns to a commit in `own`."""
+    total = 0
+    for path in paths:
+        diff = run("git", "diff", "-U0", "--no-color", "--no-renames", f"{sha}^", sha, "--", path, cwd=cwd).stdout
+        ranges = [["-L", f"{a},+{b or 1}"] for a, b in re.findall(r"^@@ -(\d+)(?:,(\d+))? \+", diff, re.M)
+                  if b != "0"]
+        if not ranges:
+            continue
+        out = run("git", "blame", "--porcelain", *[x for r in ranges for x in r], f"{sha}^", "--", path,
+                  cwd=cwd).stdout
+        total += sum(1 for m in re.finditer(r"^([0-9a-f]{40}) \d+ \d+", out, re.M) if m.group(1) in own)
+    return total
+
+
+def landed_commit(number, since, cwd=CHECKOUT):
+    """The maintainer commit on origin/main whose subject ends `(#number)`, committed on or after the
+    time `since`: a closed PR of ours a maintainer squash-landed as his own (#16910, `c80715be71`)."""
+    for c in git_commits("-F", f"--grep=(#{number})", f"--since={since}", "origin/main", cwd=cwd):
+        if c["subject"].rstrip().endswith(f"(#{number})") and git_author_kind(c["name"], c["email"]):
+            return c["sha"]
+    return None
+
+
+def merge_learning(number, merge, landed=False, cwd=CHECKOUT, cache=None, now=None, scan=True):
+    """What maintainers did with merged PR `number` (merge commit, or with `landed` the commit a
+    maintainer squash-landed it as): {number, merge, merged_at, landed, before, in_merge, after,
+    final}. `before`: maintainer and roboomp commits on our branch before the merge; `in_merge`:
+    merge_edits (None for a squash); `after`: their commits on origin/main within LEARN_DAYS of the
+    merge (its commit time: maintainers merge locally and push hours later) that name the PR (`#N`
+    in the message: "post-merge cleanup for #N", "fixup! Merge PR #N", "Follow-up to #N") or rewrite
+    lines `git blame` gives to the PR's own commits, as {sha, author, kind, at, subject, lines,
+    named, files, sweep}. Cached per merge under LEARN_CACHE; a result whose window has closed is
+    final, otherwise the next call scans only main commits new since the last. `scan=False` returns
+    the cached result or None without touching git. None when the merge is not in the checkout."""
+    cache = cache or LEARN_CACHE
+    path = os.path.join(cache, f"{merge}.json")
+    try:
+        with open(path) as f:
+            got = json.load(f)
+        if got.get("version") != LEARN_VERSION:
+            got = None
+    except (OSError, ValueError):
+        got = None
+    if got and (got["final"] or not scan):
+        return got
+    if not scan or not has_ref(f"{merge}^{{commit}}", cwd=cwd):
+        return got
+    if not got:
+        parents = run("git", "rev-list", "--parents", "-n1", merge, cwd=cwd).stdout.split()[1:]
+        merged_at, name, email = (run("git", "log", "-1", "--format=%cI%x1f%an%x1f%ae", merge, cwd=cwd).stdout.strip()
+                                  .split("\x1f") + ["", ""])[:3]
+        by = git_author_label(name, email)
+        got = {"version": LEARN_VERSION, "number": number, "merge": merge, "merged_at": merged_at, "by": by,
+               "landed": landed, "before": [], "in_merge": None, "after": [], "scanned": None, "final": False}
+        if len(parents) >= 2 and not landed:
+            p1, p2 = parents[:2]
+            branch = git_commits(f"{p1}..{p2}", cwd=cwd)
+            got["own"] = [c["sha"] for c in branch if not git_author_kind(c["name"], c["email"])]
+            got["before"] = [{"sha": c["sha"], "author": c["who"], "subject": c["subject"]} for c in branch
+                             if git_author_kind(c["name"], c["email"])]
+            got["files"] = run("git", "diff", "--name-only", "--no-renames", f"{p1}...{p2}", cwd=cwd).stdout.split()
+            got["in_merge"] = merge_edits(merge, p1, p2, cwd=cwd)
+        else:
+            got["own"] = [merge]
+            got["files"] = run("git", "diff", "--name-only", "--no-renames", f"{merge}^", merge, cwd=cwd).stdout.split()
+    start = datetime.datetime.fromisoformat(got["merged_at"])
+    end = start + datetime.timedelta(days=LEARN_DAYS)
+    tip = run("git", "rev-parse", "origin/main", cwd=cwd).stdout.strip()
+    own, files = set(got["own"]), set(got["files"])
+    named = re.compile(rf"#{number}(?!\d)")
+    span = [f"{merge}..{tip}"] + ([f"^{got['scanned']}"] if got["scanned"] else [])
+    for c in reversed(git_commits(*span, f"--since={start.isoformat()}", f"--until={end.isoformat()}", cwd=cwd)):
+        kind = git_author_kind(c["name"], c["email"])
+        if not kind or c["sha"] in own:
+            continue
+        lines = rewritten_lines(c["sha"], [f for f in c["files"] if f in files and not LEARN_SKIP.search(f)], own,
+                                cwd=cwd)
+        says = bool(named.search(c["subject"] + "\n" + c["body"]))
+        if lines or says:
+            got["after"].append({"sha": c["sha"], "author": c["who"], "kind": kind, "at": c["at"],
+                                 "subject": c["subject"], "lines": lines, "named": says, "files": len(c["files"]),
+                                 "sweep": len(c["files"]) > SWEEP_FILES})
+    got["scanned"] = tip
+    got["final"] = (now or now_utc()) > end
+    try:
+        os.makedirs(cache, exist_ok=True)
+        with open(path + ".tmp", "w") as f:
+            json.dump(got, f)
+        os.replace(path + ".tmp", path)
+    except OSError:
+        pass
+    return got
+
+
+def learn_line(got):
+    """The one-line count --summary prints under a merge: "post-merge: H4vC 2 commit(s) rewrote 30 of
+    our lines; roboomp 1 commit(s) rewrote 4 of our lines; 1 sweep; edited in merge", or "" when
+    nothing applies."""
+    parts, by = [], {}
+    for c in got["after"]:
+        if not c["sweep"]:
+            n, lines = by.get(c["author"], (0, 0))
+            by[c["author"]] = (n + 1, lines + c["lines"])
+    parts += [f"{who} {n} commit(s) rewrote {lines} of our lines" for who, (n, lines) in sorted(by.items())]
+    sweeps = sum(1 for c in got["after"] if c["sweep"])
+    parts += [f"{sweeps} sweep(s)"] if sweeps else []
+    parts += ["edited in merge"] if any(e["kind"] != "resolved" for e in got.get("in_merge") or []) else []
+    return "post-merge: " + "; ".join(parts) if parts else ""
+
+
+
 TS = (".ts", ".tsx", ".mts", ".cts")
 CODE = TS + (".js", ".mjs", ".cjs", ".rs", ".py", ".swift", ".go")
 
