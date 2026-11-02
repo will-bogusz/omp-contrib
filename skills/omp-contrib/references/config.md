@@ -41,7 +41,11 @@ macos   = ""                          # default: "local" on macOS, else "ci"
 windows = ""                          # default: "ci"
 
 [models]
-reviewer   = ""                       # default: the reviewer-family extension picks a model of another family than the session's
+# Reviewers in order: at spawn the reviewer-family extension takes the first that resolves to an available model of
+# another family than the session's. Typical: the strongest OpenAI then the strongest Anthropic model you can use,
+# e.g. ["openai-codex/gpt-6.1-sol", "anthropic/claude-opus-5-5"] (doctor recommends the list from your logins).
+# Empty or no match: the extension ranks the available models itself, the other of Anthropic and OpenAI first.
+reviewers  = []
 behaviour  = []                       # two models of different families for behaviour runs of prompt changes; default: derived by doctor
 cold_read  = ""                       # model for charts/cold-read.py; default: omp's @smol role
 

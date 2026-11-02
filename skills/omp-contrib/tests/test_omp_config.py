@@ -132,7 +132,7 @@ class ForkTest(ConfigTest):
 class HostTest(ConfigTest):
     def test_host_label_names_no_hostname_unless_configured(self):
         self.load("")
-        with mock.patch("socket.gethostname", return_value="Wills-MacBook.local"):
+        with mock.patch("socket.gethostname", return_value="dev-laptop.local"):
             label = omp_config.host_label()
             self.assertRegex(label, r"^host-[0-9a-f]{6}$")
             self.assertNotIn("will", label.lower())

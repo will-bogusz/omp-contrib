@@ -28,7 +28,7 @@ Config (every value resolved; derived ones looked up lazily on first access, the
     upstream_repo, maintainers (tuple), fork_owner, fork_remote, fork_repo ("owner/name" of the fork: the
     fork remote's URL, else "<fork_owner>/<upstream name>"), queue_branch, branch_prefix,
     checkout, worktrees, scratch_roots (list of expanded paths), build ({"linux", "macos", "windows"}),
-    reviewer_model, behaviour_models (list), cold_read_model, image_upload, open_p2, supervised_opens
+    reviewers (list), behaviour_models (list), cold_read_model, image_upload, open_p2, supervised_opens
     (int), watch_enabled (bool), host_label
 
 Derived defaults:
@@ -67,7 +67,7 @@ DEFAULTS = {
     "build.linux": "",
     "build.macos": "",
     "build.windows": "",
-    "models.reviewer": "",
+    "models.reviewers": [],
     "models.behaviour": [],
     "models.cold_read": "",
     "images.upload": "relay",
@@ -241,7 +241,7 @@ class Config:
     worktrees = property(lambda self: self.get("paths.worktrees"))
     scratch_roots = property(lambda self: self.get("paths.scratch_roots"))
     build = property(lambda self: {p: self.get(f"build.{p}") for p in ("linux", "macos", "windows")})
-    reviewer_model = property(lambda self: self.get("models.reviewer"))
+    reviewers = property(lambda self: list(self.get("models.reviewers")))
     behaviour_models = property(lambda self: list(self.get("models.behaviour")))
     cold_read_model = property(lambda self: self.get("models.cold_read"))
     image_upload = property(lambda self: self.get("images.upload"))

@@ -4,17 +4,22 @@
  * wrote it.
  *
  * On `before_subagent_spawn` for `reviewer`, in order:
- *   1. `models.reviewer` from the omp-contrib config file, when set and it resolves.
- *   2. The spawn's own patterns (the reviewer's `@slow` role chain) — first one
- *      whose family differs from the session model's.
- *   3. The user's configured roles (`@slow`, `@plan`, `@advisor`, `@default`) —
- *      first one resolving to another family.
- *   4. The strongest other-family model in `ctx.models.list()` (see `strength`), served by a
- *      provider the user already runs a model on (the session's, or one a configured role
- *      resolves to) before any other: `list()` holds every model a login can name, including
- *      ones that login's plan cannot serve or an aggregator has retired.
- * When no other family is available the spawn keeps its models and carries a
- * same-family note; the PR's Testing section must say so. The hook never blocks.
+ *   1. `models.reviewers` from the omp-contrib config file: the first entry that
+ *      resolves to an available model of another family than the session's.
+ *   2. Otherwise the candidates below, Anthropic/OpenAI cross first (`labRank`): a
+ *      Claude session gets an OpenAI model, a GPT session an Anthropic one, any other
+ *      session either; other labs only after them. Within a rank, in source order:
+ *      a. the spawn's own patterns (the reviewer's `@slow` role chain);
+ *      b. the user's configured roles (`@slow`, `@plan`, `@advisor`, `@default`);
+ *      c. every model in `ctx.models.list()`, served by a provider the user already
+ *         runs a model on (the session's, or one a configured role resolves to) before
+ *         any other: `list()` holds every model a login can name, including ones that
+ *         login's plan cannot serve or an aggregator has retired; then the lab's own
+ *         provider before a reseller, `pro` serving variants last, the strongest tier
+ *         (`TIERS`), then `strength`.
+ * When no other family is available the spawn keeps its models (the first resolving
+ * `models.reviewers` entry, else its own patterns) and carries a same-family note; the
+ * PR's Testing section must say so. The hook never blocks.
  */
 import type { Model } from "@oh-my-pi/pi-ai";
 import type {
@@ -43,16 +48,71 @@ const PROVEN_ROLES = [...PREFERRED_ROLES, "@smol", "@task", "@commit", "@tiny"] 
 /** Other-family models appended after the pick as the child's retry fallback chain. */
 const FALLBACK_DEPTH = 2;
 
-/** `models.reviewer` from the omp-contrib config; undefined when unset or empty. Throws on a malformed file. */
-export function readConfiguredReviewer(
+/**
+ * The labs paired first: their frontier models are the strongest code reviewers on consumer
+ * subscriptions, and the flow was measured end to end on Opus and Sol. Other labs are the fallback.
+ */
+const PRIORITY_LABS = ["anthropic", "openai"] as const;
+
+/** Each priority lab's own providers; anything else serving its models is a reseller. */
+const OWN_PROVIDERS: Record<string, readonly string[]> = {
+	anthropic: ["anthropic"],
+	openai: ["openai", "openai-codex"],
+};
+
+/**
+ * Tier tokens in a model id, strongest first, for the labs whose tiers rank by name rather
+ * than price (a lab's unreleased or premium-priced lines must not outrank the reviewed
+ * flagship). Ids with none of them rank between the two groups. Same table as doctor's `TIERS`.
+ */
+const TIERS: Record<string, readonly [readonly string[], readonly string[]]> = {
+	anthropic: [["opus", "sonnet"], ["haiku"]],
+	openai: [["sol", "terra"], ["luna", "mini", "nano"]],
+};
+
+/** `models.reviewers` from the omp-contrib config, in order; [] when unset. Throws on a malformed file. */
+export function readConfiguredReviewers(
 	env: Record<string, string | undefined> = process.env,
-): string | undefined {
-	const value: unknown = get(loadConfig(env), "models.reviewer", undefined);
-	return typeof value === "string" && value.trim() ? value.trim() : undefined;
+): string[] {
+	const value: unknown = get(loadConfig(env), "models.reviewers", undefined);
+	if (!Array.isArray(value)) return [];
+	return value
+		.filter((entry): entry is string => typeof entry === "string")
+		.map((entry) => entry.trim())
+		.filter(Boolean);
 }
 
 function selector(model: Model): string {
 	return `${model.provider}/${model.id}`;
+}
+
+/**
+ * The model's lab. `identity.class` is the catalog's vendor lineage, classified centrally from
+ * provider and id, so a reseller's copy (`openrouter/anthropic/claude-opus-4.7`,
+ * `cursor/claude-opus-4-7-fast`) carries the lab's class while `provider` names only the
+ * reseller. `ctx.models.family()` stays the same-family test: docs/extensions.md defines it
+ * as an opaque token to compare, never to read.
+ */
+function lab(model: Model): string {
+	return model.identity?.class ?? "unknown";
+}
+
+/** 0: the Anthropic/OpenAI cross for this session's lab; 1: any other lab. */
+function labRank(model: Model, sessionLab: string): number {
+	const l = lab(model);
+	return (PRIORITY_LABS as readonly string[]).includes(l) && l !== sessionLab ? 0 : 1;
+}
+
+/** Rank of the id's tier token within its lab (`TIERS`); 0 for labs without a table. */
+function tier(model: Model): number {
+	const table = TIERS[lab(model)];
+	if (!table) return 0;
+	const [strong, cheap] = table;
+	const tokens = new Set(model.id.split("/").pop()!.toLowerCase().split(/[-._]/));
+	const s = strong.findIndex((t) => tokens.has(t));
+	if (s >= 0) return s;
+	const c = cheap.findIndex((t) => tokens.has(t));
+	return c >= 0 ? strong.length + 1 + c : strong.length;
 }
 
 /** Numeric `major.minor.patch` comparison; missing parts count as 0. */
@@ -89,32 +149,27 @@ export function strength(a: Model, b: Model): number {
 export function chooseReviewer(
 	event: Pick<BeforeSubagentSpawnEvent, "agent" | "patterns">,
 	models: ExtensionModelQuery,
-	configured: string | undefined,
+	configured: readonly string[],
 ): BeforeSubagentSpawnEventResult | undefined {
 	if (event.agent !== REVIEWER_AGENT) return undefined;
 
-	let configNote = "";
-	if (configured) {
-		const model = models.resolve(configured);
-		if (model)
-			return {
-				model: configured,
-				note: `reviewer: ${selector(model)} (models.reviewer)`,
-			};
-		configNote = ` (models.reviewer "${configured}" did not resolve to an available model)`;
-	}
-
 	const parent = models.current();
-	if (!parent) return undefined;
+	if (!parent) {
+		// No session model to compare against: honour the list as written.
+		const first = configured.find((spec) => models.resolve(spec));
+		return first ? { model: first, note: `reviewer: ${first} (models.reviewers)` } : undefined;
+	}
 	const parentFamily = models.family(parent);
+	const parentLab = lab(parent);
 	// A reviewer must be a chat model that can drive the agent's tools.
-	const otherFamily = (model: Model | undefined): model is Model =>
+	const usable = (model: Model | undefined): model is Model =>
 		model !== undefined &&
 		(model.kind ?? "chat") === "chat" &&
-		model.supportsTools !== false &&
-		models.family(model) !== parentFamily;
+		model.supportsTools !== false;
+	const otherFamily = (model: Model | undefined): model is Model =>
+		usable(model) && models.family(model) !== parentFamily;
 
-	// Ordered candidates: spawn patterns, then roles, then the ranked catalog.
+	// Ordered candidates: models.reviewers as written, then the ranked automatic picks.
 	const picks: Array<{ spec: string; model: Model; source: string }> = [];
 	const seen = new Set<string>();
 	const add = (spec: string, model: Model, source: string): void => {
@@ -123,33 +178,59 @@ export function chooseReviewer(
 		seen.add(key);
 		picks.push({ spec, model, source });
 	};
+
+	const unavailable: string[] = [];
+	let sameFamilyConfigured: string | undefined;
+	for (const spec of configured) {
+		const model = models.resolve(spec);
+		if (!usable(model)) unavailable.push(spec);
+		else if (otherFamily(model)) add(spec, model, "models.reviewers");
+		else sameFamilyConfigured ??= spec;
+	}
+	const configNote = unavailable.length
+		? ` (models.reviewers: ${unavailable.map((s) => `"${s}"`).join(", ")} not available)`
+		: "";
+
+	const auto: Array<{ spec: string; model: Model; source: string }> = [];
 	for (const pattern of event.patterns) {
 		const model = models.resolve(pattern);
-		if (otherFamily(model)) add(pattern, model, "agent model");
+		if (otherFamily(model)) auto.push({ spec: pattern, model, source: "agent model" });
 	}
 	for (const role of PREFERRED_ROLES) {
 		const model = models.resolve(role);
-		if (otherFamily(model)) add(selector(model), model, role);
+		if (otherFamily(model)) auto.push({ spec: selector(model), model, source: role });
 	}
 	const proven = new Set<string>([parent.provider]);
 	for (const role of PROVEN_ROLES) {
 		const model = models.resolve(role);
 		if (model) proven.add(model.provider);
 	}
+	const own = (model: Model): boolean =>
+		(OWN_PROVIDERS[lab(model)] ?? []).includes(model.provider);
 	const ranked = models
 		.list()
 		.filter(otherFamily)
 		.sort(
 			(a, b) =>
 				Number(proven.has(b.provider)) - Number(proven.has(a.provider)) ||
+				Number(own(b)) - Number(own(a)) ||
+				Number(a.reasoningMode === "pro") - Number(b.reasoningMode === "pro") ||
+				tier(a) - tier(b) ||
 				strength(a, b),
 		);
-	for (const model of ranked) add(selector(model), model, "strongest available");
+	for (const model of ranked)
+		auto.push({ spec: selector(model), model, source: "strongest available" });
+	// Stable: the Anthropic/OpenAI cross first, source order kept within each rank.
+	auto.sort((a, b) => labRank(a.model, parentLab) - labRank(b.model, parentLab));
+	for (const pick of auto) add(pick.spec, pick.model, pick.source);
 
 	const [first, ...rest] = picks;
 	if (!first) {
-		const keep =
-			event.patterns.length > 0 ? event.patterns : [selector(parent)];
+		const keep = sameFamilyConfigured
+			? [sameFamilyConfigured]
+			: event.patterns.length > 0
+				? event.patterns
+				: [selector(parent)];
 		return {
 			model: keep,
 			note: `same-family review: no available model outside the session's family (${parentFamily})${configNote}; say so in the PR's Testing section`,
@@ -183,9 +264,9 @@ export function recordRoute(
 export default function reviewerFamily(pi: ExtensionAPI): void {
 	pi.on("before_subagent_spawn", (event, ctx) => {
 		if (event.agent !== REVIEWER_AGENT) return undefined;
-		let configured: string | undefined;
+		let configured: string[] = [];
 		try {
-			configured = readConfiguredReviewer();
+			configured = readConfiguredReviewers();
 		} catch (error) {
 			// A malformed config must not block the review; doctor reports the parse error.
 			pi.logger.warn("reviewer-family: could not read omp-contrib config", {

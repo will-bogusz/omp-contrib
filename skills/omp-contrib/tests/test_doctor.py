@@ -26,7 +26,8 @@ class ValidateConfigTest(unittest.TestCase):
                            "queue_branch": "omp-queue"},
                 "paths": {"checkout": "~/src/oh-my-pi", "scratch_roots": []},
                 "build": {"linux": "ssh:box", "macos": "local", "windows": "ci"},
-                "models": {"reviewer": "", "behaviour": ["a/claude-haiku-5-5", "b/gpt-6-luna"]},
+                "models": {"reviewers": ["openai-codex/gpt-6.1-sol", "anthropic/claude-opus-5-5"],
+                           "behaviour": ["a/claude-haiku-5-5", "b/gpt-6-luna"]},
                 "images": {"upload": "relay"}, "autonomy": {"open_p2": "hold", "supervised_opens": 3},
                 "watch": {"enabled": False},
                 "choices": {"image-upload": {"value": "relay", "reason": "relay connected", "at": "2026-10-30"}}}
@@ -34,11 +35,12 @@ class ValidateConfigTest(unittest.TestCase):
 
     def test_reports_each_problem(self):
         data = {"build": {"linux": "buildbox", "freebsd": "local"}, "images": {"upload": "imgur"},
-                "autonomy": {"supervised_opens": True, "open_p2": "maybe"}, "models": {"behaviour": ["one"]},
+                "autonomy": {"supervised_opens": True, "open_p2": "maybe"}, "models": {"behaviour": ["one"], "reviewers": "x/y"},
                 "extra": {}, "choices": {"image-upload": {"value": "fork-links"}, "nonsense": {"value": 1, "reason": "x"}}}
         errors = "\n".join(D.validate_config(data))
         for needle in ("build.linux: 'buildbox' is not local", "build.freebsd: unknown key", "images.upload: 'imgur'",
                        "autonomy.supervised_opens: expected an integer", "autonomy.open_p2: 'maybe'", "models.behaviour: two models",
+                       "models.reviewers: expected list",
                        "[extra]: unknown section", "[choices.image-upload]: no `reason`", "[choices.nonsense]: unknown decision"):
             self.assertIn(needle, errors)
 
@@ -177,8 +179,9 @@ class PlacementTest(unittest.TestCase):
 
 class ModelsTest(unittest.TestCase):
     @staticmethod
-    def m(provider, id, cost, reasoning=True, ctx=200_000):
-        return {"provider": provider, "id": id, "selector": f"{provider}/{id}", "cost": {"input": cost},
+    def m(provider, id, cost, reasoning=True, ctx=200_000, output=None, kind="chat"):
+        return {"provider": provider, "id": id, "selector": f"{provider}/{id}", "kind": kind,
+                "cost": {"input": cost, "output": cost * 5 if output is None else output},
                 "reasoning": reasoning, "contextWindow": ctx}
 
     def test_family(self):
@@ -199,6 +202,76 @@ class ModelsTest(unittest.TestCase):
         self.assertEqual(D.behaviour_pair([self.m("anthropic", "claude-haiku-5-5", 1), self.m("anthropic", "claude-opus-5-5", 4)]), [])
         self.assertEqual(D.behaviour_pair([self.m("openrouter", "z-ai/glm-5", 1), self.m("openrouter", "qwen/qwen3", 1)]),
                          ["openrouter/z-ai/glm-5", "openrouter/qwen/qwen3"])
+
+    def test_behaviour_pair_prefers_anthropic_and_openai_even_through_a_reseller(self):
+        models = [self.m("anthropic", "claude-haiku-5-5", 0.1), self.m("google", "gemini-3.8-flash", 0.05),
+                  self.m("openrouter", "openai/gpt-6-luna", 0.1)]
+        self.assertEqual(D.behaviour_pair(models), ["anthropic/claude-haiku-5-5", "openrouter/openai/gpt-6-luna"])
+
+    # The catalog shape that matters: pricier untiered lines (mythos, astra) and newer cheap tiers (haiku 5.5)
+    # beside the flagships, and resellers listing the same labs.
+    CATALOG = [("anthropic", "claude-haiku-5-5", 0.1), ("anthropic", "claude-opus-4-8", 5), ("anthropic", "claude-opus-5-5", 4),
+               ("anthropic", "claude-sonnet-5-5", 2), ("anthropic", "claude-mythos-5", 10),
+               ("openai-codex", "gpt-6-luna", 0.1), ("openai-codex", "gpt-6-astra", 10), ("openai-codex", "gpt-6-sol", 2),
+               ("openai-codex", "gpt-6.1-sol", 2), ("openai-codex", "gpt-6.1-terra", 1),
+               ("google", "gemini-3.8-flash", 0.75), ("cursor", "claude-opus-4-7-fast", 30), ("openrouter", "openai/gpt-6.1-sol", 2)]
+
+    def models(self, *skip):
+        return [self.m(p, i, c) for p, i, c in self.CATALOG if p not in skip and not any(s in i for s in skip)]
+
+    def test_reviewer_ranking_by_tier_then_revision_on_the_labs_own_provider(self):
+        rank = lambda fam: [m["selector"] for m in D.reviewer_ranking(fam, D.families(self.models())[fam])]
+        self.assertEqual(rank("anthropic")[:3], ["anthropic/claude-opus-5-5", "anthropic/claude-opus-4-8", "anthropic/claude-sonnet-5-5"])
+        self.assertEqual(rank("anthropic")[-1], "cursor/claude-opus-4-7-fast")
+        self.assertEqual(rank("openai")[:3], ["openai-codex/gpt-6.1-sol", "openai-codex/gpt-6-sol", "openai-codex/gpt-6.1-terra"])
+        self.assertLess(rank("openai").index("openai-codex/gpt-6-astra"), rank("openai").index("openai-codex/gpt-6-luna"))
+
+    def test_reviewer_plan_pairs_openai_and_anthropic(self):
+        plan = D.reviewer_plan(self.models())
+        self.assertEqual(plan["recommended"], ["openai-codex/gpt-6.1-sol", "anthropic/claude-opus-5-5"])
+        self.assertEqual(plan["missing"], [])
+        self.assertEqual(plan["labs"]["google"], {"best": "google/gemini-3.8-flash", "own": True})
+
+    def test_reviewer_plan_without_openai_falls_back_to_another_lab_and_names_the_login(self):
+        plan = D.reviewer_plan(self.models("openai-codex", "openai/"))
+        self.assertEqual(plan["recommended"], ["anthropic/claude-opus-5-5", "google/gemini-3.8-flash"])
+        self.assertEqual(len(plan["missing"]), 1)
+        self.assertIn("no OpenAI login: reviews of Anthropic sessions go to google/gemini-3.8-flash", plan["missing"][0])
+        self.assertIn("/login", plan["missing"][0])
+
+    def test_reviewer_plan_with_anthropic_only_stays_same_family(self):
+        plan = D.reviewer_plan(self.models("openai-codex", "openai/", "google"))
+        self.assertEqual(plan["recommended"], ["anthropic/claude-opus-5-5"])
+        self.assertIn("reviews of Anthropic sessions stay same-family", plan["missing"][0])
+
+    def test_reviewer_plan_flags_a_lab_only_through_a_reseller(self):
+        plan = D.reviewer_plan(self.models("openai-codex"))
+        self.assertEqual(plan["recommended"][0], "openrouter/openai/gpt-6.1-sol")
+        self.assertIn("OpenAI only through a reseller", plan["missing"][0])
+
+    def test_reviewers_row_flags_a_one_lab_list_and_reoffers_a_new_lab(self):
+        text = ('[models]\nreviewers = ["anthropic/claude-opus-5-5", "google/gemini-3.8-flash"]\n'
+                '[choices.reviewer]\nvalue = "anthropic/claude-opus-5-5, google/gemini-3.8-flash"\nreason = "no ChatGPT"\n')
+        with tempfile.TemporaryDirectory() as tmp:
+            path = contrib_env.write_config(os.path.join(tmp, "c.toml"), text)
+            with mock.patch.dict(os.environ, {"OMP_CONTRIB_CONFIG": path}):
+                omp_config.load(reload=True)
+                doctor = D.Doctor()
+                doctor.reviewers(self.models())
+                contrib_env.write_config(path, text.replace("google/gemini-3.8-flash", "gone/model", 1))
+                omp_config.load(reload=True)
+                gone = D.Doctor()
+                gone.reviewers(self.models())
+        omp_config.load(reload=True)
+        row = next(c for c in doctor.checks if c["id"] == "models.reviewers")
+        self.assertEqual(row["status"], "ok")
+        self.assertTrue(row["reoffer"])
+        self.assertEqual(row["recommended"], 'models.reviewers = ["openai-codex/gpt-6.1-sol", "anthropic/claude-opus-5-5"]')
+        self.assertIn("Claude sessions are reviewed by the OpenAI entry", row["notes"][0])
+        row = next(c for c in gone.checks if c["id"] == "models.reviewers")
+        self.assertEqual(row["status"], "degraded")
+        self.assertIn("not available: gone/model", row["detail"])
+        self.assertIn("--set models.reviewers", row["fix"])
 
 
 class ChoiceTest(unittest.TestCase):

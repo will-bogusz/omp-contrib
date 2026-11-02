@@ -15,12 +15,26 @@ defaults.
    or `reoffer: true`. A rerun of `/contribute setup` with everything recorded asks which record
    the user wants to change.
 2. Walk the records below in order (later ones depend on earlier: `ci` builds need the fork, so
-   apply the github record before asking build-hosts). For
-   each: say in a sentence what it protects, state what the probe found, recommend the best
-   option this machine supports **with its reason and the cost of each lower option**, and let
-   the user tweak. Group records whose probes all came back ideal into one confirmation; spend
-   the user's attention on the ones that need a choice. autonomy is always explained and asked,
-   never recorded as a default the user did not see.
+   apply the github record before asking build-hosts). For each: say in a sentence what it
+   protects, state what the probe found, recommend the best option this machine supports **with
+   its reason and the cost of each lower option**, and let the user tweak. Every question the user
+   sees, in prose or in an `ask` form, meets all of these:
+   - **Intent in the question.** The question text says in plain words what the record is for
+     and what goes wrong without it, not only the config key.
+   - **A reason and a cost on every option.** Each `ask` option's `description` carries why
+     someone picks it and what it costs or gives up; the user reads a form option by option, so a
+     reason only in prose above the form does not count. Options name the user's actual
+     choices from the probe (their logins and models, hosts, tools), not generic ones.
+   - **Recommended option first** (`recommended: 0`).
+   - **Batching** several records into one `ask` is fine only when each question meets the
+     above on its own. Records whose probes all came back ideal share one question in the same
+     form ("already set up: omp settings (depth 3, …), chart tools, session reader; keep?") that
+     names what each one confirms.
+   - **Never record a choice the user did not see and answer**, ideal ones included: a record
+     is written only after its question was answered. An answer marked
+     `(auto-selected after timeout)`, a cancelled question, or a record left out of the form
+     stays undecided (doctor keeps listing it); reviewer and autonomy are always asked, never
+     recorded as a default.
 3. Write each outcome with `scripts/doctor --set KEY VALUE` (e.g. `--set build.linux ci`) and
    `scripts/doctor --record <id> VALUE REASON` (`[choices.<id>]` with `value`, `reason`: the user's
    reason, or the probe fact that made the recommendation stick, and today's `at`). Both edit the
@@ -43,8 +57,8 @@ as one line in the status card.
 
 ## Decision records
 
-Each: **Intent** (what it protects) · **Ideal** · **Probe** (doctor check ids) · **Alternatives**
-(ranked, with cost) · **Ask** · **Re-offer when**.
+Each: **Intent** (what it protects) · **Ideal** · **Probe** (doctor check ids) · **Cost** (where
+the ideal itself costs something) · **Alternatives** (ranked, with cost) · **Ask** · **Re-offer when**.
 
 ### github: identity, fork, remotes, hook
 
@@ -95,34 +109,64 @@ Each: **Intent** (what it protects) · **Ideal** · **Probe** (doctor check ids)
 - **Re-offer when.** doctor's `recommended` beats the recorded value (a new ssh host of that OS,
   cargo-xwin installed) and the choice did not say `reoffer = false`.
 
-### reviewer: model family of the independent review
+### reviewer: who reviews the diff
 
-- **Intent.** One independent review per PR, before roboomp sees it once ever. A reviewer from
-  the author's model lineage shares its blind spots; a different family catches what the author
-  cannot.
-- **Ideal.** Leave `models.reviewer` empty: the plugin's reviewer-family extension moves omp's
-  bundled `reviewer` agent to a model of another family than the session's at spawn time, so it
-  stays right when the user switches driver models.
-- **Probe.** `models.available` (families logged in), `models.reviewer`.
-- **Alternatives.** Pin `models.reviewer` (costs: the pin can be the driver's own family after a
-  model switch; doctor does not know the driver). One family only: the review still runs, and the
-  PR's Testing section says it was same-family; recommend a second subscription (`/login` in omp)
-  as the fix, not as a requirement.
-- **Ask.** Only when one family is available, or the user wants a specific reviewer.
-- **Re-offer when.** A second family becomes available while the choice records "one family".
+- **Intent** (say it in these plain words). The model that wrote a fix cannot see its own blind
+  spots, and a model from the same lab tends to share them. So before roboomp reviews the PR
+  (once ever, on the head it first sees), one model from another lab reads the diff once,
+  against review-brief.md, and its findings are fixed first.
+- **Ideal.** `models.reviewers` = doctor's `recommended` list: the strongest OpenAI model the
+  user can use, then the strongest Anthropic one, e.g. `["openai-codex/gpt-6.1-sol",
+  "anthropic/claude-opus-5-5"]`. At spawn the reviewer-family extension takes the first entry
+  from another lab than the session's: a Claude session gets the OpenAI reviewer, a GPT session
+  the Anthropic one, a session on any other lab the first entry. It stays right when the user
+  switches driver models. Why these two labs: their frontier models are the strongest code
+  reviewers available on consumer subscriptions, and the whole flow was measured on Opus and Sol.
+- **Probe.** `models.labs` (per lab the user is logged in to, its best reviewer; resellers
+  marked), `models.reviewers` (current value, `recommended`, and `notes`: the reason, plus one
+  line per gap, e.g. "no OpenAI login: reviews of Anthropic sessions go to google/…; `/login`
+  ChatGPT Plus/Pro (Codex) adds GPT Sol").
+- **Cost.** One review per PR, never repeated. The last measured reviewer run (on Sol) came to
+  about $1–2 at list price; on a subscription login it spends quota, not money.
+- **Alternatives**, best first: the recommended list → empty (the extension ranks at spawn with
+  the same Anthropic/OpenAI preference; costs: the user never sees which model reviews) → models
+  the user names (another lab they trust, a cheaper tier; costs: unmeasured with this flow) →
+  one lab only (every review of that lab's sessions is same-family and the PR's Testing section
+  says so; name the `/login` that adds the missing lab, as a fix, not a requirement). A lab
+  reached only through a reseller works but may serve the model differently; doctor's `notes`
+  say so.
+- **Ask.** Always, even when the recommendation is obvious. In the question: the intent above,
+  the labs doctor found with each one's best model (`models.labs`), and how to change it later
+  (`/contribute setup` and pick reviewer, or the same `--set`). In the recommended option's
+  description: which model reviews which sessions, why those two labs, the cost. The
+  alternatives with their costs; when a lab is missing, what that means for this user's sessions
+  and the login that adds it (`notes`). Write the answer with
+  `scripts/doctor --set models.reviewers '<json list>'` (nothing for "empty") and
+  `scripts/doctor --record reviewer '<the list, or "unset">' '<their reason>'`.
+- **Re-offer when.** doctor marks `reoffer` (the recommendation now covers Anthropic or OpenAI and
+  the choice did not), or an entry stops resolving (`models.reviewers` degraded with a `fix`).
 
 ### behaviour-models: the pair for prompt and tool-text changes
 
-- **Intent.** A change to a prompt, tool description or rule changes model behaviour; precheck
-  asks for a before/after run on two models of different families, cheap ones, so the claim
-  holds beyond the model that wrote it.
-- **Ideal.** The derived pair: per family the cheapest priced reasoning model with ≥128k context
-  from the lab's own provider, the two most-used families first (doctor `models.behaviour`).
-- **Probe.** `models.behaviour`.
-- **Alternatives.** Set `models.behaviour` to two explicit selectors (costs: goes stale as
-  catalogs move). One family: the run uses one model and the PR says so.
-- **Ask.** Show the derived pair; ask only if the user prefers other models.
-- **Re-offer when.** The derived pair changes family composition (a second family appears).
+- **Intent** (plain words). A change to a prompt, tool description or rule changes what models
+  do, and two labs' models read the same line differently (#15402: a GPT model ignored a todo rule
+  Opus kept). precheck asks for a before/after run of a small sample set on two cheap models from
+  different labs, so the claim holds beyond the model that wrote it.
+- **Ideal.** Leave `models.behaviour` empty: doctor derives the pair per lab as the cheapest
+  priced reasoning model with ≥128k context on the lab's own provider, Anthropic and OpenAI first
+  (most omp users drive with them, so a change is checked where it lands most), e.g. Haiku + GPT
+  Luna; it follows the catalog as models change.
+- **Probe.** `models.behaviour` (the pair and, in `notes`, why), `models.labs`.
+- **Cost.** Only PRs that change agent-facing text: one sample set per model on `main` and on the
+  branch, cheap tier, on subscription quota.
+- **Alternatives.** The derived pair → two explicit selectors (costs: goes stale as catalogs
+  move) → one lab only (the run uses one model and the PR says so; name the login that adds a
+  second lab).
+- **Ask.** Always, and it may share a form with reviewer: the intent, the derived pair by name,
+  why cheap models of those two labs, the cost, the alternatives. Record with
+  `scripts/doctor --record behaviour-models derived '<their reason>'` (or `--set models.behaviour
+  a,b` for an explicit pair).
+- **Re-offer when.** The derived pair changes lab composition (a second lab appears).
 
 ### omp-settings: three settings the flow relies on
 

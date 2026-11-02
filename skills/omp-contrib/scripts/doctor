@@ -6,9 +6,10 @@ usage: doctor [--json] [--probe-hosts] [--area AREA ...]
        doctor [--set KEY VALUE ...] [--record DECISION VALUE REASON [--no-reoffer]]
        doctor --record-validated [--ref REF]
   --json          one JSON object: {configured, config_path, checks: [{area, id, status, detail, fix?,
-                  decision?, reoffer?}], summary, ...}. status is ok | missing | degraded | unknown;
+                  decision?, reoffer?, notes?}], summary, ...}. status is ok | missing | degraded | unknown;
                   `fix` is the command or step that resolves it; `decision` names the setup.md record
-                  that owns the choice; `reoffer` marks a recorded choice whose ideal became available
+                  that owns the choice; `reoffer` marks a recorded choice whose ideal became available;
+                  `notes` are the reasons and gaps the wizard shows with the choice
   --probe-hosts   also ssh to every concrete Host in ~/.ssh/config (BatchMode, 4 s timeout) for
                   reachability and OS; without it hosts are listed, not contacted
   --area AREA     only these areas (config system tools repo github omp models browser hosts build
@@ -21,7 +22,7 @@ usage: doctor [--json] [--probe-hosts] [--area AREA ...]
                   nothing here installs system packages: the agent proposes those to the user
   --dry-run       with --fix: print the steps, run none
   --set KEY VALUE write one config key (e.g. `--set build.linux ci`, `--set watch.enabled false`,
-                  `--set models.behaviour a/x,b/y`); repeatable
+                  `--set models.reviewers a/x,b/y`); repeatable
   --record DECISION VALUE REASON
                   write [choices.DECISION] with value, reason and today's date; with --no-reoffer the
                   choice holds regardless (doctor never re-offers the ideal)
@@ -80,7 +81,7 @@ SCHEMA = {
                "queue_branch": str, "branch_prefix": str},
     "paths": {"checkout": str, "worktrees": str, "scratch_roots": list},
     "build": {"linux": str, "macos": str, "windows": str},
-    "models": {"reviewer": str, "behaviour": list, "cold_read": str},
+    "models": {"reviewers": list, "behaviour": list, "cold_read": str},
     "images": {"upload": str},
     "autonomy": {"open_p2": str, "supervised_opens": int},
     "watch": {"enabled": bool},
@@ -254,6 +255,17 @@ OWN_PROVIDERS = {
 }
 # Families most omp users drive with, first: a behaviour check is worth most on the models people run.
 FAMILY_ORDER = ("anthropic", "openai", "google", "xai", "moonshot", "zhipu", "deepseek", "qwen", "minimax", "mistral", "meta")
+# The two labs the reviewer and behaviour picks pair first: their frontier models are the strongest code reviewers on
+# consumer subscriptions, and the flow was measured end to end on Opus and Sol. Other labs are the fallback.
+PRIORITY_FAMILIES = ("openai", "anthropic")
+# Tier tokens in a model id, strongest first, for the labs whose tiers rank by name rather than by price or
+# revision (a newer Haiku must not outrank an older Opus). An id with none of them ranks between the two groups.
+TIERS = {"anthropic": (("opus", "sonnet"), ("haiku",)), "openai": (("sol", "terra"), ("luna", "mini", "nano"))}
+LABS = {"anthropic": "Anthropic", "openai": "OpenAI", "google": "Google", "xai": "xAI", "moonshot": "Moonshot",
+        "zhipu": "Zhipu", "deepseek": "DeepSeek", "qwen": "Qwen", "minimax": "MiniMax", "mistral": "Mistral", "meta": "Meta"}
+# What adds the lab to omp on a consumer subscription.
+LOGIN = {"anthropic": "`/login` Anthropic (Claude Pro/Max) adds Claude Opus",
+         "openai": "`/login` ChatGPT Plus/Pro (Codex) adds GPT Sol"}
 
 
 def model_family(model_id):
@@ -275,20 +287,80 @@ def families(models):
     return out
 
 
+def _selector(m):
+    return m.get("selector") or f"{m['provider']}/{m['id']}"
+
+
+def _tier(fam, model_id):
+    """Rank of the id's tier token within its lab (TIERS); 0 for every model of a lab without one."""
+    strong, cheap = TIERS.get(fam, ((), ()))
+    tokens = set(re.split(r"[-._]", model_id.rsplit("/", 1)[-1].lower()))
+    for i, token in enumerate(strong):
+        if token in tokens:
+            return i
+    for i, token in enumerate(cheap):
+        if token in tokens:
+            return len(strong) + 1 + i
+    return len(strong) if strong else 0
+
+
+def _revision(model_id):
+    """The id's version numbers, newest-first sortable (`gpt-6.1-sol` → (-6, -1, 0, 0)); dates are skipped."""
+    nums = [int(n) for n in re.findall(r"\d+", model_id.rsplit("/", 1)[-1]) if len(n) < 4]
+    return tuple(-n for n in (nums + [0] * 4)[:4])
+
+
+def reviewer_ranking(fam, models):
+    """One family's chat models, best reviewer first: reasoning models; the lab's own provider before a
+    reseller (which can list models it serves differently or not at all); the strongest tier (TIERS); the
+    newest revision; the highest output price."""
+    chat = [m for m in models if (m.get("kind") or "chat") == "chat"]
+    usable = [m for m in chat if m.get("reasoning")] or chat
+    return sorted(usable, key=lambda m: (m.get("provider") not in OWN_PROVIDERS.get(fam, ()), _tier(fam, m["id"]),
+                                         _revision(m["id"]), -((m.get("cost") or {}).get("output") or 0), _selector(m)))
+
+
+def reviewer_plan(models):
+    """What the wizard offers for `models.reviewers`: per lab its best reviewer (`labs`: {family: {"best",
+    "own"}}), the recommended ordered list (`recommended`: OpenAI then Anthropic; a missing one replaced by
+    the best other lab), and one line per gap in that pairing (`missing`)."""
+    labs = {}
+    for fam, ms in families(models).items():
+        ranked = reviewer_ranking(fam, ms)
+        if ranked:
+            labs[fam] = {"best": _selector(ranked[0]), "own": ranked[0].get("provider") in OWN_PROVIDERS.get(fam, ())}
+    others = sorted((f for f in labs if f not in PRIORITY_FAMILIES),
+                    key=lambda f: (not labs[f]["own"], FAMILY_ORDER.index(f) if f in FAMILY_ORDER else 99))
+    have = [f for f in PRIORITY_FAMILIES if f in labs]
+    recommended = [labs[f]["best"] for f in have + others[:max(0, 2 - len(have))]]
+    missing = []
+    for fam in PRIORITY_FAMILIES:
+        other = next(f for f in PRIORITY_FAMILIES if f != fam)
+        fallback = next((labs[f]["best"] for f in others), None)
+        if fam not in labs:
+            where = f"go to {fallback} ({LABS.get(model_family(fallback), '?')})" if fallback else "stay same-family"
+            missing.append(f"no {LABS[fam]} login: reviews of {LABS[other]} sessions {where}; {LOGIN[fam]}")
+        elif not labs[fam]["own"]:
+            missing.append(f"{LABS[fam]} only through a reseller ({labs[fam]['best']}): it may serve a model differently "
+                           f"or not at all; {LOGIN[fam]}")
+    return {"labs": labs, "recommended": recommended, "missing": missing}
+
+
 def behaviour_pair(models):
     """Two selectors of different families for behaviour runs of prompt changes: per family the cheapest
-    priced reasoning model with >= 128k context, the lab's own provider before resellers; families with an
-    own provider first, then FAMILY_ORDER. [] with fewer than two families."""
+    priced reasoning model with >= 128k context, the lab's own provider before resellers; Anthropic and
+    OpenAI first (PRIORITY_FAMILIES), then families with an own provider, then FAMILY_ORDER. [] with fewer
+    than two families."""
     picks = []
     for fam, ms in families(models).items():
         price = lambda m: (m.get("cost") or {}).get("input") or 0
         usable = [m for m in ms if m.get("reasoning") and (m.get("contextWindow") or 0) >= 128_000 and price(m) > 0] or ms
         own = [m for m in usable if m.get("provider") in OWN_PROVIDERS.get(fam, ())]
         best = min(own or usable, key=lambda m: (price(m), m.get("selector", "")))
-        picks.append((not own, FAMILY_ORDER.index(fam) if fam in FAMILY_ORDER else 99,
-                      best.get("selector") or f"{best['provider']}/{best['id']}"))
+        picks.append((fam not in PRIORITY_FAMILIES, not own, FAMILY_ORDER.index(fam) if fam in FAMILY_ORDER else 99,
+                      _selector(best)))
     picks.sort()
-    return [p[2] for p in picks[:2]] if len(picks) >= 2 else []
+    return [p[3] for p in picks[:2]] if len(picks) >= 2 else []
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -629,30 +701,69 @@ class Doctor:
                      "omp then /login (or set a provider API key)")
             return
         self.add("models", "models.available", "ok", f"{len(models)} models; families: {', '.join(sorted(fams)) or 'none recognised'}")
+        self.reviewers(models)
         cfg = self.cfg
-        ids = {m.get("selector") or f"{m['provider']}/{m['id']}" for m in models}
-        if cfg.reviewer_model:
-            fam = model_family(cfg.reviewer_model)
-            status = "ok" if cfg.reviewer_model.split(":")[0] in ids or any(i.endswith("/" + cfg.reviewer_model.split(":")[0]) for i in ids) else "degraded"
-            self.add("models", "models.reviewer", status,
-                     f"models.reviewer = {cfg.reviewer_model} ({fam or 'unknown family'})" + ("" if status == "ok" else ": not among the available models"),
-                     None if status == "ok" else "pick another with `omp models`", decision="reviewer")
-        elif len(fams) >= 2:
-            self.add("models", "models.reviewer", "ok",
-                     "unset: the reviewer-family extension picks a model of another family than the session's at spawn", decision="reviewer")
-        else:
-            self.add("models", "models.reviewer", "degraded",
-                     f"one family available ({', '.join(fams) or 'none'}): the reviewer shares the author's lineage; the PR's Testing section says so",
-                     "log in to a second provider family (omp /login)", decision="reviewer")
         pair = cfg.behaviour_models or behaviour_pair(models)
         self.facts["behaviour_pair"] = pair
         if len(pair) == 2 and len({model_family(p) for p in pair}) == 2:
             self.add("models", "models.behaviour", "ok", ("models.behaviour = " if cfg.behaviour_models else "derived pair: ") + " + ".join(pair),
-                     decision="behaviour-models")
+                     decision="behaviour-models", notes=[] if cfg.behaviour_models else [
+                         "derived: per lab the cheapest priced reasoning model with >= 128k context on the lab's own provider, "
+                         "Anthropic and OpenAI first (the labs most omp users drive with); one before/after sample set per "
+                         "prompt or tool-text change"])
         else:
             self.add("models", "models.behaviour", "degraded",
                      "no pair of different families for behaviour runs of prompt changes: precheck's behaviour NOTE runs one model",
                      "log in to a second provider family, or set models.behaviour", decision="behaviour-models")
+
+    def reviewers(self, models):
+        """`models.reviewers` against the inventory: the best reviewer per lab, the recommended list, and what
+        the Anthropic/OpenAI pairing is missing (setup.md, reviewer record)."""
+        cfg, plan = self.cfg, reviewer_plan(models)
+        labs, rec = plan["labs"], plan["recommended"]
+        self.facts["reviewers"] = {**plan, "current": cfg.reviewers}
+        lab_order = sorted(labs, key=lambda f: (f not in PRIORITY_FAMILIES, FAMILY_ORDER.index(f) if f in FAMILY_ORDER else 99))
+        # Other labs only through a reseller are counted, not named: they are the last fallback.
+        shown = [f for f in lab_order if f in PRIORITY_FAMILIES or labs[f]["own"]]
+        rest = len(lab_order) - len(shown)
+        self.add("models", "models.labs", "ok" if labs else "degraded", "best reviewer per lab: " + "; ".join(
+            f"{LABS.get(f, f)} {labs[f]['best']}" + ("" if labs[f]["own"] else " (reseller)") for f in shown)
+            + (f"; {rest} more lab(s) through resellers only" if rest else "") if labs
+            else "no model of a known lab", decision="reviewer")
+        ids = {_selector(m) for m in models}
+        available = lambda spec: spec.startswith("@") or spec.split(":")[0] in ids or any(i.endswith("/" + spec.split(":")[0]) for i in ids)
+        both = all(f in labs for f in PRIORITY_FAMILIES)
+        why = ("Claude sessions are reviewed by the OpenAI entry, GPT sessions by the Anthropic one, any other lab's by "
+               "the first; the strongest code reviewers on consumer subscriptions, and the pair the flow was measured on "
+               "(Opus, Sol)" if both else "each session is reviewed by the first entry from another lab than its own")
+        notes = [f"recommended models.reviewers = {json.dumps(rec)}: {why}"] + plan["missing"] if rec else plan["missing"]
+        current_fams = {model_family(s) for s in cfg.reviewers} - {None}
+        login = "; ".join(LOGIN[f] for f in PRIORITY_FAMILIES if f not in labs) or "log in to a second lab (omp /login)"
+        set_rec = f"scripts/doctor --set models.reviewers '{json.dumps(rec)}'"
+        if cfg.reviewers:
+            gone = [s for s in cfg.reviewers if not available(s)]
+            detail = f"models.reviewers = {json.dumps(cfg.reviewers)}"
+            if gone:
+                status, fix, detail = "degraded", set_rec, detail + f"; not available: {', '.join(gone)}"
+            elif len(current_fams) >= 2:
+                status, fix = "ok", None
+            elif len(labs) >= 2:
+                status, fix, detail = "degraded", set_rec, detail + ": one lab only, so its own sessions get a same-family review"
+            else:
+                status, fix = "degraded", login
+        elif len(labs) >= 2:
+            status, fix = "ok", None
+            detail = "unset: the reviewer-family extension ranks at spawn (the other of Anthropic and OpenAI first)"
+        else:
+            status, fix = "degraded", login
+            detail = f"one lab available ({', '.join(labs) or 'none'}): every review is same-family; the PR's Testing section says so"
+        # Re-offer once the recommendation gains Anthropic or OpenAI over what the recorded choice covers.
+        choice = self.choice("reviewer")
+        basis = current_fams if cfg.reviewers else {model_family(t) for t in re.findall(r"[\w.:/-]+", str((choice or {}).get("value", "")))} - {None}
+        gained = ({model_family(s) for s in rec} - basis) & set(PRIORITY_FAMILIES)
+        reoffer = bool(choice and choice.get("reoffer", True) is not False and gained)
+        self.add("models", "models.reviewers", status, detail, fix, decision="reviewer", notes=notes,
+                 recommended=f"models.reviewers = {json.dumps(rec)}", **({"reoffer": True} if reoffer else {}))
 
     def browser(self):
         cfg = self.cfg
@@ -1073,6 +1184,8 @@ def render(report):
         lines.append(f"{mark[c['status']]} {c['id']:<36} {c['detail']}")
         if c.get("fix") and c["status"] != "ok":
             lines.append(f"     {'':<36} fix: {c['fix']}")
+        for note in c.get("notes", ()):
+            lines.append(f"     {'':<36} - {note}")
         if c.get("reoffer"):
             better = f"{c['recommended']} is possible now" if c.get("recommended") else "the ideal is available now"
             lines.append(f"     {'':<36} re-offer: {better} (setup.md, {c.get('decision')})")
