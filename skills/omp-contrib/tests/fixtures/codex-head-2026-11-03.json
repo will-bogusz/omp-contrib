@@ -1,0 +1,254 @@
+{
+  "18012": {
+    "commits": [
+      {
+        "sha": "d22e3c6cb9b32b952cb961d3d03d7d6e17f7cdec",
+        "commit": {
+          "committer": {
+            "name": "Will",
+            "email": "will@bogusz.co",
+            "date": "2026-11-03T20:17:07Z"
+          }
+        }
+      },
+      {
+        "sha": "5a7f8d1fdc21005196665c5412401e3736b01b0f",
+        "commit": {
+          "committer": {
+            "name": "Will",
+            "email": "will@bogusz.co",
+            "date": "2026-11-03T20:17:24Z"
+          }
+        }
+      },
+      {
+        "sha": "31ec9d6f86d1a141de913f9fb7d3e3d8aebb2065",
+        "commit": {
+          "committer": {
+            "name": "Will",
+            "email": "will@bogusz.co",
+            "date": "2026-11-03T20:17:24Z"
+          }
+        }
+      },
+      {
+        "sha": "e3f9bcc756f3e35d5029df619e2f06f0545a391c",
+        "commit": {
+          "committer": {
+            "name": "Will",
+            "email": "will@bogusz.co",
+            "date": "2026-11-03T20:17:41Z"
+          }
+        }
+      },
+      {
+        "sha": "ac7920caf4304c8eb44dc29f3406f01f043025e2",
+        "commit": {
+          "committer": {
+            "name": "Will",
+            "email": "will@bogusz.co",
+            "date": "2026-11-03T20:17:41Z"
+          }
+        }
+      },
+      {
+        "sha": "58abc98ebc0f1992502d1775cf563c10c604ed05",
+        "commit": {
+          "committer": {
+            "name": "Will",
+            "email": "will@bogusz.co",
+            "date": "2026-11-03T21:25:42Z"
+          }
+        }
+      },
+      {
+        "sha": "0fa3f336b6d590c3d37c091335d8e6b5fd4ec902",
+        "commit": {
+          "committer": {
+            "name": "Will",
+            "email": "will@bogusz.co",
+            "date": "2026-11-03T22:42:07Z"
+          }
+        }
+      },
+      {
+        "sha": "71b1f499197ef4ed59c254abac1f76a5092eeb93",
+        "commit": {
+          "committer": {
+            "name": "Will",
+            "email": "will@bogusz.co",
+            "date": "2026-11-03T22:54:37Z"
+          }
+        }
+      }
+    ],
+    "reviews": [
+      {
+        "id": 5760561101,
+        "user": {
+          "login": "roboomp"
+        },
+        "submitted_at": "2026-11-03T22:45:50Z",
+        "commit_id": "0fa3f336b6d590c3d37c091335d8e6b5fd4ec902"
+      },
+      {
+        "id": 5760569545,
+        "user": {
+          "login": "chatgpt-codex-connector[bot]"
+        },
+        "submitted_at": "2026-11-03T22:46:44Z",
+        "commit_id": "0fa3f336b6d590c3d37c091335d8e6b5fd4ec902"
+      },
+      {
+        "id": 5760736567,
+        "user": {
+          "login": "will-bogusz"
+        },
+        "submitted_at": "2026-11-03T23:04:00Z",
+        "commit_id": "71b1f499197ef4ed59c254abac1f76a5092eeb93"
+      },
+      {
+        "id": 5760736812,
+        "user": {
+          "login": "will-bogusz"
+        },
+        "submitted_at": "2026-11-03T23:04:02Z",
+        "commit_id": "71b1f499197ef4ed59c254abac1f76a5092eeb93"
+      },
+      {
+        "id": 5760737009,
+        "user": {
+          "login": "will-bogusz"
+        },
+        "submitted_at": "2026-11-03T23:04:03Z",
+        "commit_id": "71b1f499197ef4ed59c254abac1f76a5092eeb93"
+      }
+    ],
+    "summary_edits": [
+      {
+        "editedAt": "2026-11-03T22:58:33Z",
+        "body": "<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 {\"code_review\":{\"commit_sha\":\"71b1f499197ef4ed59c254abac1f76a5092eeb93\",\"has_any_findings\":true,\"has_unresolved_findings\":true,\"status\":\"completed\"},\"security_review\":{\"commit_sha\":null,\"has_any_findings\":null,\"has_unresolved_findings\":null,\"status\":null}} -->\n\n## Codex Review Summary\n\nThis comment shows the latest Codex review activity on this pull request.\n\n| Review | Status | Commit | Review trigger |\n| --- | --- | --- | --- |\n| \ud83d\udcdd **Code Review** | \u2705 **Completed** <relative-time datetime=\"2026-11-03T22:58:32.026608Z\">2026-11-03T22:58:32.026608Z</relative-time> | `71b1f49` | New commits |\n\n\n\n<details> <summary>\u2139\ufe0f About Codex in GitHub</summary>\n<br/>\n\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\" or \"@codex security review\".\n\nCodex reacts with \ud83d\udc40 while any review is running, comments if it has suggestions, and reacts with \ud83d\udc4d once all reviews finish with no findings.\n\n</details>"
+      },
+      {
+        "editedAt": "2026-11-03T22:54:54Z",
+        "body": "<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 {\"code_review\":{\"commit_sha\":\"71b1f499197ef4ed59c254abac1f76a5092eeb93\",\"has_any_findings\":null,\"has_unresolved_findings\":null,\"status\":\"running\"},\"security_review\":{\"commit_sha\":null,\"has_any_findings\":null,\"has_unresolved_findings\":null,\"status\":null}} -->\n\n## Codex Review Summary\n\nThis comment shows the latest Codex review activity on this pull request.\n\n| Review | Status | Commit | Review trigger |\n| --- | --- | --- | --- |\n| \ud83d\udcdd **Code Review** | \ud83d\udd04 **Running** since <relative-time datetime=\"2026-11-03T22:54:52.798942Z\">2026-11-03T22:54:52.798942Z</relative-time> | `71b1f49` | New commits |\n\n\n\n<details> <summary>\u2139\ufe0f About Codex in GitHub</summary>\n<br/>\n\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\" or \"@codex security review\".\n\nCodex reacts with \ud83d\udc40 while any review is running, comments if it has suggestions, and reacts with \ud83d\udc4d once all reviews finish with no findings.\n\n</details>"
+      },
+      {
+        "editedAt": "2026-11-03T22:46:47Z",
+        "body": "<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 {\"code_review\":{\"commit_sha\":\"0fa3f336b6d590c3d37c091335d8e6b5fd4ec902\",\"has_any_findings\":true,\"has_unresolved_findings\":true,\"status\":\"completed\"},\"security_review\":{\"commit_sha\":null,\"has_any_findings\":null,\"has_unresolved_findings\":null,\"status\":null}} -->\n\n## Codex Review Summary\n\nThis comment shows the latest Codex review activity on this pull request.\n\n| Review | Status | Commit | Review trigger |\n| --- | --- | --- | --- |\n| \ud83d\udcdd **Code Review** | \u2705 **Completed** <relative-time datetime=\"2026-11-03T22:46:46.857067Z\">2026-11-03T22:46:46.857067Z</relative-time> | `0fa3f33` | Draft marked ready |\n\n\n\n<details> <summary>\u2139\ufe0f About Codex in GitHub</summary>\n<br/>\n\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\" or \"@codex security review\".\n\nCodex reacts with \ud83d\udc40 while any review is running, comments if it has suggestions, and reacts with \ud83d\udc4d once all reviews finish with no findings.\n\n</details>"
+      },
+      {
+        "editedAt": "2026-11-03T22:42:35Z",
+        "body": "<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 {\"code_review\":{\"commit_sha\":\"0fa3f336b6d590c3d37c091335d8e6b5fd4ec902\",\"has_any_findings\":null,\"has_unresolved_findings\":null,\"status\":\"running\"},\"security_review\":{\"commit_sha\":null,\"has_any_findings\":null,\"has_unresolved_findings\":null,\"status\":null}} -->\n\n## Codex Review Summary\n\nThis comment shows the latest Codex review activity on this pull request.\n\n| Review | Status | Commit | Review trigger |\n| --- | --- | --- | --- |\n| \ud83d\udcdd **Code Review** | \ud83d\udd04 **Running** since <relative-time datetime=\"2026-11-03T22:42:34.020788Z\">2026-11-03T22:42:34.020788Z</relative-time> | `0fa3f33` | Draft marked ready |\n\n\n\n<details> <summary>\u2139\ufe0f About Codex in GitHub</summary>\n<br/>\n\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\" or \"@codex security review\".\n\nCodex reacts with \ud83d\udc40 while any review is running, comments if it has suggestions, and reacts with \ud83d\udc4d once all reviews finish with no findings.\n\n</details>"
+      }
+    ],
+    "reactions": []
+  },
+  "18013": {
+    "commits": [
+      {
+        "sha": "f1073eeb15436e79189e0f8519aba7910cd6e5c5",
+        "commit": {
+          "committer": {
+            "name": "Will",
+            "email": "will@bogusz.co",
+            "date": "2026-11-03T21:25:02Z"
+          }
+        }
+      },
+      {
+        "sha": "1b446605817cdcef7d13b2ed88cb330d0d1587b9",
+        "commit": {
+          "committer": {
+            "name": "Will",
+            "email": "will@bogusz.co",
+            "date": "2026-11-03T22:44:11Z"
+          }
+        }
+      },
+      {
+        "sha": "1d67b429bed935e1f7a5e56a2e793c3ddd466b09",
+        "commit": {
+          "committer": {
+            "name": "Will",
+            "email": "will@bogusz.co",
+            "date": "2026-11-03T22:55:21Z"
+          }
+        }
+      },
+      {
+        "sha": "d119101934370ff3d06deda1fbe0a668a332cd0b",
+        "commit": {
+          "committer": {
+            "name": "Will",
+            "email": "will@bogusz.co",
+            "date": "2026-11-03T22:57:05Z"
+          }
+        }
+      },
+      {
+        "sha": "189868ab642afe0c57029b9dbadd80f1cde5b7ab",
+        "commit": {
+          "committer": {
+            "name": "Will",
+            "email": "will@bogusz.co",
+            "date": "2026-11-03T23:01:34Z"
+          }
+        }
+      }
+    ],
+    "reviews": [
+      {
+        "id": 5760575837,
+        "user": {
+          "login": "roboomp"
+        },
+        "submitted_at": "2026-11-03T22:47:22Z",
+        "commit_id": "1b446605817cdcef7d13b2ed88cb330d0d1587b9"
+      },
+      {
+        "id": 5760746685,
+        "user": {
+          "login": "will-bogusz"
+        },
+        "submitted_at": "2026-11-03T23:05:08Z",
+        "commit_id": "189868ab642afe0c57029b9dbadd80f1cde5b7ab"
+      },
+      {
+        "id": 5760747092,
+        "user": {
+          "login": "will-bogusz"
+        },
+        "submitted_at": "2026-11-03T23:05:10Z",
+        "commit_id": "189868ab642afe0c57029b9dbadd80f1cde5b7ab"
+      }
+    ],
+    "summary_edits": [
+      {
+        "editedAt": "2026-11-03T23:10:45Z",
+        "body": "<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 {\"code_review\":{\"commit_sha\":\"189868ab642afe0c57029b9dbadd80f1cde5b7ab\",\"has_any_findings\":false,\"has_unresolved_findings\":false,\"status\":\"completed\"},\"security_review\":{\"commit_sha\":null,\"has_any_findings\":null,\"has_unresolved_findings\":null,\"status\":null}} -->\n\n## Codex Review Summary\n\nThis comment shows the latest Codex review activity on this pull request.\n\n| Review | Status | Commit | Review trigger |\n| --- | --- | --- | --- |\n| \ud83d\udcdd **Code Review** | \u2705 **Completed** <relative-time datetime=\"2026-11-03T23:10:45.240841Z\">2026-11-03T23:10:45.240841Z</relative-time> | `189868a` | New commits |\n\n\n\n<details> <summary>\u2139\ufe0f About Codex in GitHub</summary>\n<br/>\n\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\" or \"@codex security review\".\n\nCodex reacts with \ud83d\udc40 while any review is running, comments if it has suggestions, and reacts with \ud83d\udc4d once all reviews finish with no findings.\n\n</details>"
+      },
+      {
+        "editedAt": "2026-11-03T23:05:14Z",
+        "body": "<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 {\"code_review\":{\"commit_sha\":\"189868ab642afe0c57029b9dbadd80f1cde5b7ab\",\"has_any_findings\":null,\"has_unresolved_findings\":null,\"status\":\"running\"},\"security_review\":{\"commit_sha\":null,\"has_any_findings\":null,\"has_unresolved_findings\":null,\"status\":null}} -->\n\n## Codex Review Summary\n\nThis comment shows the latest Codex review activity on this pull request.\n\n| Review | Status | Commit | Review trigger |\n| --- | --- | --- | --- |\n| \ud83d\udcdd **Code Review** | \ud83d\udd04 **Running** since <relative-time datetime=\"2026-11-03T23:05:12.737269Z\">2026-11-03T23:05:12.737269Z</relative-time> | `189868a` | New commits |\n\n\n\n<details> <summary>\u2139\ufe0f About Codex in GitHub</summary>\n<br/>\n\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\" or \"@codex security review\".\n\nCodex reacts with \ud83d\udc40 while any review is running, comments if it has suggestions, and reacts with \ud83d\udc4d once all reviews finish with no findings.\n\n</details>"
+      },
+      {
+        "editedAt": "2026-11-03T22:52:00Z",
+        "body": "<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 {\"code_review\":{\"commit_sha\":\"1b446605817cdcef7d13b2ed88cb330d0d1587b9\",\"has_any_findings\":false,\"has_unresolved_findings\":false,\"status\":\"completed\"},\"security_review\":{\"commit_sha\":null,\"has_any_findings\":null,\"has_unresolved_findings\":null,\"status\":null}} -->\n\n## Codex Review Summary\n\nThis comment shows the latest Codex review activity on this pull request.\n\n| Review | Status | Commit | Review trigger |\n| --- | --- | --- | --- |\n| \ud83d\udcdd **Code Review** | \u2705 **Completed** <relative-time datetime=\"2026-11-03T22:51:59.483057Z\">2026-11-03T22:51:59.483057Z</relative-time> | `1b44660` | Draft marked ready |\n\n\n\n<details> <summary>\u2139\ufe0f About Codex in GitHub</summary>\n<br/>\n\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\" or \"@codex security review\".\n\nCodex reacts with \ud83d\udc40 while any review is running, comments if it has suggestions, and reacts with \ud83d\udc4d once all reviews finish with no findings.\n\n</details>"
+      },
+      {
+        "editedAt": "2026-11-03T22:44:41Z",
+        "body": "<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 {\"code_review\":{\"commit_sha\":\"1b446605817cdcef7d13b2ed88cb330d0d1587b9\",\"has_any_findings\":null,\"has_unresolved_findings\":null,\"status\":\"running\"},\"security_review\":{\"commit_sha\":null,\"has_any_findings\":null,\"has_unresolved_findings\":null,\"status\":null}} -->\n\n## Codex Review Summary\n\nThis comment shows the latest Codex review activity on this pull request.\n\n| Review | Status | Commit | Review trigger |\n| --- | --- | --- | --- |\n| \ud83d\udcdd **Code Review** | \ud83d\udd04 **Running** since <relative-time datetime=\"2026-11-03T22:44:40.129995Z\">2026-11-03T22:44:40.129995Z</relative-time> | `1b44660` | Draft marked ready |\n\n\n\n<details> <summary>\u2139\ufe0f About Codex in GitHub</summary>\n<br/>\n\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\" or \"@codex security review\".\n\nCodex reacts with \ud83d\udc40 while any review is running, comments if it has suggestions, and reacts with \ud83d\udc4d once all reviews finish with no findings.\n\n</details>"
+      }
+    ],
+    "reactions": [
+      {
+        "user": {
+          "login": "chatgpt-codex-connector[bot]"
+        },
+        "content": "+1",
+        "created_at": "2026-11-03T23:10:48Z"
+      }
+    ]
+  }
+}

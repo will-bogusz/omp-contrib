@@ -4,7 +4,9 @@ import atexit
 import importlib.machinery
 import importlib.util
 import io
+import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -90,7 +92,8 @@ class CodexSettleTest(unittest.TestCase):
         self.assertEqual(PT.codex_settle(pr(OLD), data), "settled")
 
     def test_thumbs_up_is_clean_and_a_later_finding_reopens(self):
-        self.assertEqual(PT.codex_settle(pr(OLD), pull(thumbs=["2026-10-13T09:00:00Z"])), "clean")
+        observed = {**pr(OLD), "observedAt": "2026-10-13T08:00:00Z"}
+        self.assertEqual(PT.codex_settle(observed, pull(thumbs=["2026-10-13T09:00:00Z"])), "clean")
         later = pull([review("R2", "2026-10-13T12:00:00Z", NEW)], [thread("T2", "R2", "P2")],
                      thumbs=["2026-10-13T09:00:00Z"])
         self.assertEqual(PT.codex_settle(pr(NEW), later), "fix")
@@ -209,10 +212,17 @@ class CodexHeadTest(unittest.TestCase):
 class WaitCodexTest(unittest.TestCase):
     """`pr-trace --wait-codex`: returns once every pass ended; exit 4 on findings, 3 on timeout."""
 
+    def setUp(self):
+        # No fork/ reflog: the host's real checkout must not hold these waits (unseen_push).
+        patcher = mock.patch.object(PT, "CHECKOUT", tempfile.mkdtemp(prefix="pr-trace-nogit-"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def run_wait(self, nodes, minutes=60):
         polls = iter(nodes)
         out = io.StringIO()
-        with mock.patch.object(PT, "poll_prs", side_effect=lambda *a: ("m1", {1: next(polls)}, None)), \
+        last = nodes[-1]
+        with mock.patch.object(PT, "poll_prs", side_effect=lambda *a: ("m1", {1: next(polls, last)}, None)), \
              mock.patch.object(PT.time, "sleep"), mock.patch("sys.stdout", out):
             code = PT.wait_codex([1], minutes)
         return code, out.getvalue()
@@ -254,6 +264,109 @@ class WaitCodexTest(unittest.TestCase):
         code, text = self.run_wait([gnode(state="CLOSED")])
         self.assertEqual(code, 0)
         self.assertIn("closed: closed: nothing to wait for", text)
+
+    def test_recorded_post_push_wait_refreshes_previous_head(self):
+        """#18013 returned 1b44660581 after pushing 189868ab64; #18012 had the same cache risk.
+        REST commit/review/reaction fields and GraphQL summary edit bodies recorded 2026-11-03.
+        The old code reuses the recent cached node, sees Completed on that old head, and exits."""
+        with open(os.path.join(os.path.dirname(__file__), "fixtures", "codex-head-2026-11-03.json")) as f:
+            recorded = json.load(f)
+        for number, payload in recorded.items():
+            with self.subTest(pr=number):
+                old_summary = payload["summary_edits"][2]["body"]
+                short = PT.CODEX_SUMMARY_ROW.search(old_summary).group(2)
+                old_commit = next(c for c in payload["commits"] if c["sha"].startswith(short))
+                head_commit = payload["commits"][-1]
+                cached = gnode(head=old_commit["sha"], comments=[{"body": old_summary}])
+                fresh = gnode(head=head_commit["sha"],
+                              comments=[{"body": payload["summary_edits"][0]["body"]}])
+                calls = []
+
+                def poll(numbers, max_age):
+                    calls.append(max_age)
+                    return "main", {int(number): fresh if max_age == 0 else cached}, None
+
+                out = io.StringIO()
+                with mock.patch.object(PT, "poll_prs", side_effect=poll), mock.patch("sys.stdout", out):
+                    code = PT.wait_codex([int(number)], 0)
+                self.assertEqual(code, 0)
+                self.assertIn(f"#{number} {head_commit['sha'][:10]} clean:", out.getvalue())
+                self.assertEqual(calls, [0, 0])
+
+    def test_terminal_result_is_rechecked_if_head_moves_during_wait(self):
+        at = PT.datetime.datetime.now(PT.datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        cached = gnode(head=OLD, comments=[summary("Completed", OLD, at)])
+        running = gnode(head=NEW, comments=[summary("Running", NEW, at)])
+        done = gnode(head=NEW, comments=[summary("Completed", NEW, at)])
+        code, text = self.run_wait([cached, running, done])
+        self.assertEqual(code, 0)
+        self.assertEqual(text, f"#1 {NEW[:10]} clean: clean pass on the head\n")
+
+    def test_clean_summary_on_previous_head_is_not_clean_after_push(self):
+        with open(os.path.join(os.path.dirname(__file__), "fixtures", "codex-head-2026-11-03.json")) as f:
+            payload = json.load(f)["18013"]
+        p = pr(payload["commits"][-1]["sha"], [{"body": payload["summary_edits"][2]["body"]}],
+               pushed=payload["commits"][-1]["commit"]["committer"]["date"])
+        self.assertEqual(PT.codex_settle(p, pull()), "pushed")
+        self.assertIsNone(PT.codex_outcome(p, pull(), PT.stamp("2026-11-03T23:05:11Z")))
+
+    def test_sha_less_reaction_needs_observed_head_boundary(self):
+        p = pr(NEW, pushed="2026-10-13T08:00:00Z")
+        data = pull(thumbs=["2026-10-13T09:00:00Z"])
+        self.assertFalse(PT.codex_clean(p, data))  # commit time cannot establish a push
+        p["observedAt"] = "2026-10-13T09:00:00Z"
+        self.assertFalse(PT.codex_clean(p, data))  # same-second race is ambiguous
+        p["observedAt"] = "2026-10-13T08:59:59Z"
+        self.assertTrue(PT.codex_clean(p, data))
+        p["comments"] = [summary("Completed", OLD, "2026-10-13T09:00:00Z")]
+        self.assertFalse(PT.codex_clean(p, data))  # explicit different-head evidence wins
+
+    def pushed_repo(self):
+        """A checkout that pushed octo-fork/x twice to a bare `fork`: (root, git, first sha, second sha)."""
+        root, git = git_repo()
+        bare = tempfile.mkdtemp(prefix="pr-trace-fork-")
+        atexit.register(shutil.rmtree, bare, ignore_errors=True)
+        subprocess.run(["git", "init", "-q", "--bare", bare], check=True)
+        git("remote", "add", "fork", bare)
+        git("checkout", "-q", "-b", "octo-fork/x")
+        old = commit(root, git, "src/a.ts", "one\n", "fix: one")
+        git("push", "-q", "fork", "octo-fork/x")
+        new = commit(root, git, "src/a.ts", "two\n", "fix: two")
+        git("push", "-q", "fork", "octo-fork/x")
+        return root, git, old, new
+
+    def test_recorded_wait_right_after_a_push_holds_until_github_shows_it(self):
+        """#18013 (2026-11-03): after pushing 1b44660581..189868ab64 the wait returned 1b44660581's
+        clean pass in 5 s. Until GitHub shows a push, a fresh poll serves the old head and its
+        Completed row as well as a cached one does; only this host's fork remote reflog knows."""
+        with open(os.path.join(os.path.dirname(__file__), "fixtures", "codex-head-2026-11-03.json")) as f:
+            edits = json.load(f)["18013"]["summary_edits"]
+        root, _, old, new = self.pushed_repo()
+
+        def body(edit, sha):  # the recorded row, on this repo's commits
+            got = re.search(r'"commit_sha":"([0-9a-f]{40})"', edit["body"]).group(1)
+            return {"body": edit["body"].replace(got, sha).replace(got[:7], sha[:7])}
+
+        lagging = gnode(head=old, comments=[body(edits[2], old)])
+        done = gnode(head=new, commits=[(old, "octo-fork", "fix: one"), (new, "octo-fork", "fix: two")],
+                     comments=[body(edits[0], new)])
+        with mock.patch.object(PT, "CHECKOUT", root):
+            code, text = self.run_wait([lagging, lagging, lagging, done])
+        self.assertEqual(code, 0)
+        self.assertEqual(text, f"#1 {new[:10]} clean: clean pass on the head\n")
+
+    def test_a_push_github_never_shows_holds_until_the_timeout_and_then_lapses(self):
+        root, _, old, new = self.pushed_repo()
+        lagging = gnode(head=old, comments=[summary("Completed", old, "2026-11-03T22:52:00Z")])
+        with mock.patch.object(PT, "CHECKOUT", root):
+            code, text = self.run_wait([lagging], minutes=1e-9)
+            self.assertEqual(code, 3)
+            self.assertEqual(text, f"#1 {new[:10]} timeout: GitHub does not show this push yet\n")
+            later = PT.datetime.datetime.now(PT.datetime.timezone.utc) + PT.PUSH_LAG
+            self.assertIsNone(PT.unseen_push(lagging, later))
+        self.assertIsNone(PT.unseen_push({**lagging, "headRefName": "octo-fork/other"}, cwd=root))
+        shown = gnode(head="c" * 40, commits=[(new, "octo-fork", "fix: two"), ("c" * 40, "H4vC", "fix: theirs")])
+        self.assertIsNone(PT.unseen_push(shown, cwd=root))  # a maintainer pushed on top of ours
 
 
 def gnode(head=NEW, state="OPEN", draft=False, mergeable="MERGEABLE", commits=None, comments=(), reviews=(),

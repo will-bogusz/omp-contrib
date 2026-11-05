@@ -207,6 +207,14 @@ refuses a branch until the steps before it are done.
    measured in `bots.md` (Latency). Before
    Codex has reviewed a PR (out of usage, or not started), don't wait for it. A review landing
    after the wait goes to whichever session next sees it in `pr-trace`.
+   `--wait-codex` refreshes GitHub's head before waiting and before accepting a terminal result;
+   a cached pass from before the push does not count, and until GitHub shows this host's push (the
+   fork remote's `<remote>/<branch>` reflog, at most 10 min) the wait holds. A review must name the
+   full head SHA, or a Completed summary must name its SHA prefix. A SHA-less 👍 counts only when
+   posted strictly after this wait first observed the head, with no summary naming a different
+   head; same-second reactions are ambiguous and do not count. A scan without that observation
+   boundary requires the SHA-bearing summary, not a reaction dated after the commit (commit time
+   is not push time).
    **Codex findings** (a pass is one completed Codex review of one head, a
    clean 👍 included; a round is a pass with findings). **Aim: the head the maintainer gets has a
    clean Codex pass, or only findings we declined as design-level.** The maintainer loops on

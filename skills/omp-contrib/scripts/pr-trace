@@ -57,7 +57,9 @@ usage: pr-trace [N ...] [--open] [--fetch]
             with no review, or 👍), `findings` (its review on the head, with the count), `failed`
             (Failed, a row left Running with no 👀, or 👀 up past 45 min), `never` (no 👀 within
             30 min of the push: the later of the head's commit time and when the wait first saw
-            it, so run it right after the push), `closed`. --timeout bounds the whole wait (default 60 min).
+            it, so run it right after the push), `closed`. A PR whose push from this host (the fork
+            remote's `<remote>/<branch>` reflog) GitHub does not show yet is held until it does, at most 10 min
+            after the push. --timeout bounds the whole wait (default 60 min).
             Exit 0: every pass ended, none with findings; 4: every pass ended, findings on at
             least one head; 3: timeout, the PRs still pending listed; 2: usage error
   --wait-change  block until any named PR changes, then print one `#N kind: text` line per change
@@ -376,6 +378,19 @@ def codex_eyes(pull):
                 if bot(x) == CODEX and x.get("content") == "EYES"), default=None)
 
 
+def codex_clean(pr, pull):
+    """A clean pass tied to this head, never just to its commit date. A SHA-less 👍 counts only
+    after this wait first observed the head (strictly later, since GitHub rounds to seconds), and
+    only with no summary naming a different head. Scans with no observation boundary require a
+    Completed summary on the head; commit dates are not push times."""
+    status, sha = codex_summary(pr) or ("", "")
+    on_head = bool(sha) and pr["headRefOid"].startswith(sha)
+    thumbs = bool(pr.get("observedAt")) and not (sha and not on_head) and any(
+        bot(x) == CODEX and x.get("content") == "THUMBS_UP"
+        and stamp(x["createdAt"]) > stamp(pr["observedAt"]) for x in pull["reactions"]["nodes"])
+    return bool(on_head and "Completed" in status) or thumbs
+
+
 def pushed_at(pr):
     """The head's commit time, standing in for its push time (a rebase or amend renews it), or when a
     wait first saw the head (`seenAt`) if later: a commit made before its tests ran is pushed minutes
@@ -412,7 +427,7 @@ def codex_head(pr, pull, now=None):
 def codex_outcome(pr, pull, now=None):
     """How Codex's pass on the head ended, as (kind, text), or None while it runs or may still
     start. Kinds: "findings" (a Codex review on the head; text counts its threads), "clean" (the row
-    on the head `Completed` with no review, or a 👍 since the push), "failed" (`Failed`, a row left
+    on the head `Completed` with no review, or a 👍 qualified by codex_clean), "failed" (`Failed`, a row left
     `Running` without 👀, or 👀 past CODEX_STUCK), "never" (no pass within CODEX_START_WINDOW of the
     push)."""
     now = now or datetime.datetime.now(datetime.timezone.utc)
@@ -430,7 +445,7 @@ def codex_outcome(pr, pull, now=None):
     status, sha = codex_summary(pr) or ("", "")
     thumbs = [stamp(x["createdAt"]) for x in pull["reactions"]["nodes"]
               if bot(x) == CODEX and x.get("content") == "THUMBS_UP"]
-    if (sha and head.startswith(sha) and "Completed" in status) or any(t >= pushed for t in thumbs):
+    if codex_clean(pr, pull):
         return "clean", "clean pass on the head" + (" (👍)" if thumbs else "")
     if state == "stuck":
         eyes = codex_eyes(pull)
@@ -444,14 +459,44 @@ def codex_outcome(pr, pull, now=None):
                      f"({pushed:%Y-%m-%d %H:%MZ})")
 
 
+# `git push` returns before GitHub shows the push on the PR: for some seconds GraphQL still serves the
+# previous head with its finished pass, and a wait started right after the push read that pass as
+# the head's (4 waits, 2026-10-24 to 11-03). A push GitHub never shows (a
+# force-push over it, a push to another PR's branch) holds a wait at most PUSH_LAG.
+PUSH_LAG = datetime.timedelta(minutes=10)
+PUSH_AT = re.compile(r"@\{(\d+)\}$")
+
+
+def unseen_push(node, now=None, cwd=None):
+    """The SHA this host last pushed to the PR's fork branch (the `update by push` entry on the
+    `<STORE_REMOTE>/<branch>` reflog) while GitHub's PR does not show it, neither as head nor among its
+    commits, and under PUSH_LAG ago; else None."""
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    try:
+        got = run("git", "log", "-g", "-1", "--date=unix", "--format=%H%x00%gs%x00%gd",
+                  f"refs/remotes/{STORE_REMOTE}/{node['headRefName']}", cwd=cwd or CHECKOUT)
+    except OSError:
+        return None
+    parts = got.stdout.strip().split("\0") if got.returncode == 0 else []
+    at = PUSH_AT.search(parts[2]) if len(parts) == 3 and parts[1] == "update by push" else None
+    if not at or now - datetime.datetime.fromtimestamp(int(at.group(1)), datetime.timezone.utc) >= PUSH_LAG:
+        return None
+    shown = {node["headRefOid"], *(c["commit"]["oid"] for c in node["commits"]["nodes"])}
+    return None if parts[0] in shown else parts[0]
+
+
 def wait_codex(numbers, minutes):
     """Block until Codex's pass on each PR's head has ended, printing each outcome as it lands;
-    the exit status as documented in --help. Polls through the host's shared poll (poll_prs)."""
+    the exit status as documented in --help. Polls through the host's shared poll (poll_prs). A PR
+    this host has just pushed is held until GitHub shows the push (unseen_push)."""
     deadline = time.monotonic() + minutes * 60
     pending, kinds, seen, first = list(dict.fromkeys(numbers)), set(), {}, {}
+    initial = True
     while True:
         try:
-            _, nodes, rate = poll_prs(pending, CODEX_POLL - 5)
+            # A post-push wait must not adopt a shared snapshot of the previous head (#18013).
+            _, nodes, rate = poll_prs(pending, 0 if initial else CODEX_POLL - 5)
+            initial = False
         except (RuntimeError, OSError) as err:  # a gh blip should not end the wait
             print(f"gh failed, retrying: {err}", file=sys.stderr)
             nodes, rate = {}, spent_rate(err)
@@ -459,11 +504,27 @@ def wait_codex(numbers, minutes):
             node = nodes.get(number)
             if not node:
                 continue
+            pushed = unseen_push(node) if node["state"] == "OPEN" else None
+            if pushed:
+                seen[number] = (pushed[:10], "push")
+                continue
             pr, pull = as_trace(node)
             first.setdefault(pr["headRefOid"], omp_watch.fmt(datetime.datetime.now(datetime.timezone.utc)))
             pr["seenAt"] = first[pr["headRefOid"]]
+            pr["observedAt"] = pr["seenAt"]
             out = (codex_outcome(pr, pull) if node["state"] == "OPEN"
                    else ("closed", f"{node['state'].lower()}: nothing to wait for"))
+            if out:
+                # A terminal result from the shared cache may predate a push during this wait.
+                # Refresh the gate before accepting it, and evaluate the refreshed head next time.
+                try:
+                    _, fresh, rate = poll_prs([number], 0)
+                except (RuntimeError, OSError) as err:
+                    print(f"gh failed, retrying: {err}", file=sys.stderr)
+                    rate = spent_rate(err)
+                    continue
+                if fresh.get(number) != node:
+                    continue
             if out:
                 kinds.add(out[0])
                 print(f"#{number} {pr['headRefOid'][:10]} {out[0]}: {out[1]}", flush=True)
@@ -476,6 +537,7 @@ def wait_codex(numbers, minutes):
             for number in pending:
                 head, state = seen.get(number, ("?", "gh"))
                 print(f"#{number} {head} timeout: " + {"running": "still reviewing (👀 up)",
+                                                       "push": "GitHub does not show this push yet",
                                                        "gh": "gh never answered"}.get(state, "Codex not started yet"))
             return 3
         time.sleep(max(1, min(pause_for(rate, CODEX_POLL), deadline - time.monotonic())))
@@ -595,8 +657,12 @@ def change_snapshot(node, main, prev=None, now=None):
     else:
         seen = prev.get("head_seen") or omp_watch.fmt(pushed_at(pr))
     pr["seenAt"] = seen
+    # Unlike head_seen on an initial snapshot, this is an observation, never a commit date.
+    observed = prev.get("head_observed") if prev.get("head") == head else None
+    pr["observedAt"] = observed or omp_watch.fmt(now)
     outcome = codex_outcome(pr, pull, now) if ready else None
     snap = {"state": node["state"], "draft": node["isDraft"], "head": head, "head_seen": seen,
+            "head_observed": pr["observedAt"],
             "branch": node["headRefName"], "commits": [c["oid"] for c in pr["commits"]],
             "people": sorted(people_items(node)), "codex": [head, *outcome] if outcome else None,
             "mergeable": None, "conflict": None, "conflict_at": None}
@@ -698,8 +764,8 @@ def stamp(at):
 def codex_settle(pr, pull, handed=False, spent=False):
     """Where Codex's review of the PR stands (workflow step 7), from its
     latest completed pass on any head. None when Codex has completed no pass; else "maintainer"
-    when a maintainer wrote the head commit (he is working the PR); "clean" when that pass found
-    nothing; when it had findings: "pushed" if we have pushed since (its next pass is pending),
+    when a maintainer wrote the head commit (he is working the PR); "clean" when a clean pass is
+    tied to this head by codex_clean; "pushed" when the last pass belongs to an older head;
     "budget" once the PR has had CODEX_ROUND_BUDGET rounds and is not `handed` off (at hand-off
     every valid finding is ours), "fix" while a Codex thread waits on our
     reply, else "settled" (every finding answered: fixed, or declined as design-level). A pass is a
@@ -723,7 +789,7 @@ def codex_settle(pr, pull, handed=False, spent=False):
         return None
     _, sha, findings = max(passes, key=lambda p: p[0])
     if not findings:
-        return "clean"
+        return "clean" if codex_clean(pr, pull) else "pushed"
     if not (sha and pr["headRefOid"].startswith(sha)):
         return "pushed"
     if (len(reviews) >= CODEX_ROUND_BUDGET or spent) and not handed:
