@@ -66,7 +66,8 @@ usage: pr-trace [N ...] [--open] [--fetch]
             and exit 0. Kinds: `state` (merged, closed, reopened), `ready`/`draft`, `head` (new SHA,
             with the commit count; a `maintainer-commit` line per new commit someone else wrote),
             `person` (a comment, review or review-thread comment by anyone but us and the bots),
-            `codex` (its pass on the head ended: clean, findings, failed or never, as --wait-codex),
+            `roboomp` (a review or top-level comment by roboomp: wait on a fresh PR's roboomp review
+            with this), `codex` (its pass on the head ended: clean, findings, failed or never, as --wait-codex),
             and on ready PRs `mergeable` (GitHub's MERGEABLE/CONFLICTING; UNKNOWN keeps the last) and
             `vs-main` (the merge-tree class: real conflict with its files, GitHub's CHANGELOG-only
             conflict, or clean; recomputed when main or the head moves). Polls every 2 min. Both waits
@@ -625,6 +626,27 @@ def people_items(node):
     return items
 
 
+def roboomp_items(node):
+    """{id: line} for each review and top-level comment roboomp wrote: is_person leaves it out, yet a
+    PR worker waits on its review (without this kind, waits slept 40 min past roboomp's reviews). A
+    review that carries only threads counts once, its gist from its first thread comment."""
+    def mine(c):
+        return (c.get("author") or {}).get("login", "").removesuffix("[bot]") == "roboomp"
+    opener = {}
+    for t in node["reviewThreads"]["nodes"]:
+        for c in t["comments"]["nodes"]:
+            opener.setdefault((c.get("pullRequestReview") or {}).get("id"), c.get("body") or "")
+    items = {}
+    for kind, rows in (("comment", node["comments"]["nodes"]), ("review", node["reviews"]["nodes"])):
+        for c in rows:
+            if mine(c):
+                at = c.get("createdAt") or c.get("submittedAt") or ""
+                state = f" {c['state'].lower()}" if c.get("state") else ""
+                body = (c.get("body") or "").strip() or opener.get(c["id"], "")
+                items[c["id"]] = f"{kind}{state} {at[5:16]}Z: {gist(body)[:120]} {c.get('url', '')}"
+    return items
+
+
 def conflict_class(branch):
     """What `vs main` says, coarsely: the real conflict with its files, GitHub's CHANGELOG-only
     conflict, or clean; None when the fork ref is missing."""
@@ -664,7 +686,8 @@ def change_snapshot(node, main, prev=None, now=None):
     snap = {"state": node["state"], "draft": node["isDraft"], "head": head, "head_seen": seen,
             "head_observed": pr["observedAt"],
             "branch": node["headRefName"], "commits": [c["oid"] for c in pr["commits"]],
-            "people": sorted(people_items(node)), "codex": [head, *outcome] if outcome else None,
+            "people": sorted(people_items(node)), "roboomp": sorted(roboomp_items(node)),
+            "codex": [head, *outcome] if outcome else None,
             "mergeable": None, "conflict": None, "conflict_at": None}
     if ready:
         known = node["mergeable"] if node["mergeable"] != "UNKNOWN" else None
@@ -699,6 +722,11 @@ def changes(prev, cur, node):
                    + ", ".join(a["login"] or a["name"] or "?" for a in c["authors"])) for c in theirs]
     people = people_items(node)
     found += [("person", people[i]) for i in cur["people"] if i not in set(prev["people"]) and i in people]
+    # A snapshot saved before the roboomp key existed is a baseline, not a change: else every waiter
+    # with an older --state file wakes once on reviews it already handled.
+    if "roboomp" in prev:
+        robo = roboomp_items(node)
+        found += [("roboomp", robo[i]) for i in cur["roboomp"] if i not in set(prev["roboomp"]) and i in robo]
     if cur["codex"] and cur["codex"] != prev["codex"]:
         found.append(("codex", f"{cur['codex'][1]} on {cur['codex'][0][:10]}: {cur['codex'][2]}"))
     # GitHub recomputes mergeability a poll or two after main moves, so a flip to CONFLICTING that

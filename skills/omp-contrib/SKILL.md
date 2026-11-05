@@ -139,7 +139,7 @@ records: `start`, `record`, `body`, `stop`, `next`, `status`), `scripts/doctor` 
 upstream-document drift; `--json` for `/contribute`), `scripts/pr-trace` (start every status scan
 with `--summary --open --fetch`; after a push, `--wait-codex N` waits out Codex's pass; waiting on
 PRs for anything, `--wait-change N... --state FILE` returns on the first merge, push, person's
-comment, Codex pass end or conflict change; after a merge, `--learn [N ...]` lists what
+comment, roboomp review, Codex pass end or conflict change; after a merge, `--learn [N ...]` lists what
 maintainers changed before, inside and after it), `scripts/pr-queue`, `scripts/pr-body N FILE` (edit a
 live PR body, refuse queued entries, normalize read-back newlines; `--dry-run` previews without
 editing), `scripts/gh-cost -- <command>` (the GraphQL points a command spends; cadence.md),

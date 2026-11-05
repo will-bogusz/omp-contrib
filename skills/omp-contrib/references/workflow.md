@@ -194,7 +194,8 @@ refuses a branch until the steps before it are done.
      the queue like any other change. A final PR is never held as a draft to control merge order:
      work that needs another PR waits in the queue (*Open-PR rule*).
 7. **Wait for the bots, then judge** (details in `bots.md`). roboomp posts in about
-   4 min (p90 25 min), once per PR. Codex reviews each new head while its plans have usage
+   4 min (p90 25 min), once per PR; wait for it with `pr-trace --wait-change N --state FILE`, which
+   wakes on its review (kind `roboomp`). Codex reviews each new head while its plans have usage
    (`bots.md`, Availability). **Once Codex has reviewed a PR, every push to it waits for Codex's
    pass on the new head to end: run `pr-trace --wait-codex N` (several PRs at once if you pushed
    several) and handle what it prints**: `clean`, `findings` (handle them,

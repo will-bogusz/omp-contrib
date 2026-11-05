@@ -447,7 +447,7 @@ class WaitChangeTest(unittest.TestCase):
         self.assertIsNone(PT.change_snapshot({**after, "isDraft": True}, "m1", cur)["codex"])
 
     def test_a_person_comment_review_or_thread_reply_wakes_bots_and_ours_do_not(self):
-        quiet = [note("C1", "octo-fork"), note("C2", "roboomp"), note("C3", "chatgpt-codex-connector", kind="Bot")]
+        quiet = [note("C1", "octo-fork"), note("C3", "chatgpt-codex-connector", kind="Bot")]
         self.assertEqual(self.diff(gnode(), gnode(comments=quiet)), [])
         maint = gnode(comments=[note("C4", "H4vC")], reviews=[note("R1", "H4vC", "Rebase please", state="CHANGES_REQUESTED")],
                      threads=[("T1", [note("C5", "chatgpt-codex-connector", kind="Bot"),
@@ -457,6 +457,27 @@ class WaitChangeTest(unittest.TestCase):
         text = " | ".join(t for _, t in found)
         for part in ("comment by H4vC", "review changes_requested by H4vC", "thread by H4vC 10-18T05:00Z on src/a.rs"):
             self.assertIn(part, text)
+
+    def test_a_roboomp_review_or_comment_wakes_as_roboomp_and_a_person_diff_does_not(self):
+        """Three waits slept 40 min past roboomp's reviews (is_person drops it) before this kind existed."""
+        before = gnode(comments=[note("C1", "H4vC")])
+        reviewed = gnode(comments=[note("C1", "H4vC"), note("C2", "roboomp", "one more thing")],
+                         reviews=[note("R1", "roboomp", "lgtm — ready for maintainer merge", state="COMMENTED"),
+                                  note("R2", "roboomp", "", state="COMMENTED")],
+                         threads=[("T1", [note("C3", "roboomp", "null check here", path="src/a.rs",
+                                               pullRequestReview={"id": "R2"})])])
+        found = self.diff(before, reviewed)
+        self.assertEqual([k for k, _ in found], ["roboomp"] * 3)
+        self.assertEqual(found[1][1], "review commented 10-18T05:00Z: lgtm — ready for maintainer merge https://x/R1")
+        self.assertIn("review commented 10-18T05:00Z: null check here https://x/R2", found[2][1])
+        self.assertIn("comment 10-18T05:00Z: one more thing", found[0][1])
+        self.assertEqual([k for k, _ in self.diff(gnode(), gnode(comments=[note("C1", "H4vC")]))], ["person"])
+
+    def test_a_snapshot_saved_before_the_roboomp_key_is_a_baseline(self):
+        reviewed = gnode(reviews=[note("R1", "roboomp", "lgtm", state="COMMENTED")])
+        old = PT.change_snapshot(gnode(), "m1")
+        del old["roboomp"]
+        self.assertEqual(PT.changes(old, PT.change_snapshot(reviewed, "m1", old), reviewed), [])
 
     def test_codex_pass_ending_on_the_head(self):
         at = (PT.datetime.datetime.now(PT.datetime.timezone.utc) - PT.datetime.timedelta(minutes=2)).strftime(
