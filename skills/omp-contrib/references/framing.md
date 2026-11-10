@@ -149,12 +149,14 @@ The rows are in order: take the first that fits the idea.
   - CLI output (`omp usage`, `omp models`): a scenario file, one command per line (`ready`,
     `run "cd <demo dir> && omp usage …"`, `expect "<text on screen>"`, `shot <name>`), then
     `tern shot <scenario> --out <scratch>/shots --size 1500x900 --theme dark`.
-  - The interactive omp app: Tern draws it as native UI, so `expect` can't see its text and a
-    scenario's `wait` doesn't pause in real time. Run `tern serve --control <sock> --out <dir>` as
-    a background service, then send one step at a time with real sleeps between:
-    `tern ctl --control <sock> 'run "cd <demo dir> && omp"'`, `'type "/usage"'`, `key Enter`,
-    `shot <name>`, and `quit` at the end. Quote each command as one argument. `serve` renders the
-    light appearance unless told otherwise.
+  - The interactive omp app: Tern draws it as native UI (the status line becomes the composer's
+    bottom row, context % the gauge above it), so `expect` can't see its text and a scenario's
+    `wait` doesn't pause in real time. Use `../scripts/tern-shot --cwd <demo dir> [--step CMD]...
+    NAME -- omp …`: it serves Tern headless (dark), runs omp, waits for the composer (up to 40 s),
+    runs each step (`'type "/usage"'`, `'key Enter'`, `'sleep 5'`, `'shot mid'`) and shoots NAME.
+    To show a setting without touching your own config, pass `omp --config <overlay.yml>`; for a
+    lived-in status line, resume a copy of a real session file (`--session-dir <scratch> -r
+    <copy>`; its header `cwd` picks the git segment) so nothing is sent.
   Use `omp usage --provider <id> --redact` after `omp usage invalidate --provider <id>` (the report is
   cached), never the `/usage` overview or details (they show emails, org ids and total spend).
   Check each composite with `read` before uploading.

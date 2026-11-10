@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# Screenshot the interactive omp app as Tern draws it, offscreen (no window, your screen untouched).
+#
+#   tern-shot [--out DIR] [--size WxH] [--theme dark|light] [--cwd DIR] [--step CMD]... NAME -- COMMAND...
+#
+# Starts `tern serve`, runs COMMAND (an interactive omp, e.g. `omp --no-session --config v.yml`)
+# in its pane from --cwd, waits until omp's composer status row is drawn, runs each --step
+# (any `tern ctl` command: 'type "/usage"', 'key Enter', 'shot mid'; `sleep N` sleeps here), then
+# shoots NAME and quits. Prints the PNG path (2x, plus a layout JSON beside it).
+#
+# --out DIR    shots land in DIR/serve/ (default: ./shots)
+# --size WxH   viewport in CSS px, rendered at 2x (default 1600x900)
+# --theme      dark (default) or light; serve alone renders light
+# --cwd DIR    working directory for COMMAND (default: current); a git repo shows the git segment
+set -eu
+
+usage() { sed -n '2,15p' "$0" >&2; exit 2; }
+abs() { (cd "$1" && pwd); }
+
+out=$PWD/shots size=1600x900 theme=dark cwd=$PWD name=
+steps=()
+while [ $# -gt 0 ]; do
+	case $1 in
+		--out) mkdir -p "$2"; out=$(abs "$2"); shift 2 ;;
+		--size) size=$2; shift 2 ;;
+		--theme) theme=$2; shift 2 ;;
+		--cwd) cwd=$(abs "$2"); shift 2 ;;
+		--step) steps+=("$2"); shift 2 ;;
+		--) shift; break ;;
+		-*) usage ;;
+		*) name=$1; shift ;;
+	esac
+done
+[ -n "$name" ] && [ $# -gt 0 ] || usage
+
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/tern-shot.XXXXXX")
+sock=$tmp/tern.sock
+# A launcher file keeps COMMAND's quoting out of the control protocol's quoted `run` argument.
+{ printf 'cd %q && exec' "$cwd"; printf ' %q' "$@"; printf '\n'; } >"$tmp/launch"
+chmod +x "$tmp/launch"
+
+tern serve --control "$sock" --out "$out" >"$tmp/serve.log" 2>&1 &
+serve=$!
+cleanup() {
+	tern ctl --control "$sock" quit >/dev/null 2>&1 || true
+	wait "$serve" 2>/dev/null || true
+	pkill -f "$tmp/launch" 2>/dev/null || true
+	rm -rf "$tmp"
+}
+trap cleanup EXIT
+
+c() { tern ctl --control "$sock" "$@" | grep -q '"ok":true' || { echo "tern-shot: ctl $* failed" >&2; exit 1; }; }
+for _ in $(seq 100); do [ -S "$sock" ] && break; sleep 0.1; done
+[ -S "$sock" ] || { cat "$tmp/serve.log" >&2; exit 1; }
+
+c size "${size%x*}" "${size#*x}" 2
+c appearance "$theme"
+c ready
+c "run \"$tmp/launch\""
+
+# omp's native composer draws its status row with class `sf-status`: 4-40 s after launch.
+drawn() { tern ctl --control "$sock" tree 2>/dev/null | grep -q 'sf-status'; }
+for _ in $(seq 90); do drawn && break; sleep 1; done
+if ! drawn; then
+	tern ctl --control "$sock" shot "$name-failed" >/dev/null
+	echo "tern-shot: omp composer never appeared; pane as it was: $out/serve/$name-failed.png" >&2
+	exit 1
+fi
+sleep 2
+
+for s in ${steps[@]+"${steps[@]}"}; do
+	case $s in
+		"sleep "*) sleep "${s#sleep }" ;;
+		*) c "$s" ;;
+	esac
+done
+c shot "$name"
+echo "$out/serve/$name.png"

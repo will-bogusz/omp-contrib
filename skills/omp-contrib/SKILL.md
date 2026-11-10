@@ -125,6 +125,7 @@ Where pushing is not allowed, the chain still runs to `pr-queue --manifest <file
 - **Queue**: when a branch is final, at the start of PR work and after each merge round (`sync`, `advance`, `plan`), to open or requeue a PR, and when `advance` stops on a conflict. [references/queue.md](references/queue.md)
 - **Write the code the way the maintainers do**: while coding and after each merge. [references/code-style.md](references/code-style.md)
 - **Frame the body for the reader**, visuals and the form each idea takes, and **the own-words sentence**: when drafting or rewriting a body. [references/framing.md](references/framing.md); drawing a chart, opening image or diagram: [references/charts.md](references/charts.md)
+- **Show how omp looks** (screenshots for a body, a before/after, a setting or segment as Tern draws it): with Tern installed, render offscreen with `scripts/tern-shot`, never in a window; capture setup in [references/framing.md](references/framing.md) *Capture setup*.
 - **Workflow: a fix we have already patched**: branch, self-review, independent review, queue and open, bots, done, clean up; and **Maintainer change request** when a maintainer sends a PR back. [references/workflow.md](references/workflow.md); bot behavior: [references/bots.md](references/bots.md)
 - **Resume a PR opened in an earlier session**: when asked about hanging PRs. [references/resume.md](references/resume.md)
 - **Linking issues** and **Issues: a problem we have not patched**: closing keywords; filing an issue roboomp can reproduce. [references/issues.md](references/issues.md)
@@ -151,7 +152,8 @@ merge; queue.md *Where builds run*), `scripts/review-stamp`, `scripts/changelog-
 generated-file conflict the generator cannot redo; queue.md *When `advance` stops on a conflict*),
 `scripts/quiet-refs` (after a rebase by hand: replayed messages name PRs as `PR N`),
 `scripts/hooks/install` (the commit-msg hook doing that for new commits, per clone),
-`scripts/compose-shots`, `scripts/pr-images` (upload PR body images, loops and videos through the
+`scripts/tern-shot` (the interactive omp app as Tern draws it, offscreen), `scripts/compose-shots`,
+`scripts/pr-images` (upload PR body images, loops and videos through the
 browser relay, or `images.upload`'s fallback), `charts/run.mjs` and `charts/cold-read.py` (body
 charts and drawn figures: draft, page check, upload, verify; cold read), `charts/loop.py` (GIF
 loops cut from a recording). Tests: `python3 -m unittest discover -s tests`.
